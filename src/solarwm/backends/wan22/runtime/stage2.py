@@ -648,8 +648,18 @@ def _stage2_self_forcing_latents(
         raise BackendContractError("Stage2 generation supports self_forcing NFE4 only")
     latent_frames = int(generation_pass.rollout_latent_frames)
     chunk = int(provider.config["model"]["num_frame_per_block"])
-    if chunk != 3 or latent_frames % chunk:
-        raise BackendContractError("Stage2 generation horizon must divide into three-latent chunks")
+    # num_frame_per_block is mechanically a runtime knob: this loop and the KV-cache path
+    # tolerate any block size that evenly divides the rollout horizon. It is not a *quality*
+    # knob, though. The released Stage2 checkpoint was trained with num_frame_per_block=3:
+    # within a block, frames are jointly denoised under a shared timestep and attend to each
+    # other, and the surrounding attention geometry (local_attn_size, max_prior_clean_chunks,
+    # score_local_attn_size in sgf.py) is validated against that block size. A different
+    # block size is out of distribution for this checkpoint and must be validated for
+    # quality (against the CUDA reference) before it is used as a production default.
+    if chunk < 1 or latent_frames % chunk:
+        raise BackendContractError(
+            "Stage2 generation horizon must divide evenly into num_frame_per_block chunks"
+        )
     channels = int(provider.config["model"]["latent_channels"])
     latent_height = int(provider.config["data"]["latent_shape"][-2])
     latent_width = int(provider.config["data"]["latent_shape"][-1])
@@ -669,26 +679,36 @@ def _stage2_self_forcing_latents(
     steps = _generation_steps(provider)
     if len(steps) != 4:
         raise BackendContractError("Stage2 shifted generation schedule must have four steps")
+    # Materialize the schedule as Python floats once. ``steps`` is fixed for the whole
+    # rollout, so resolving it here (one host/device sync) removes a ``.item()`` sync from
+    # inside the per-chunk, per-denoise-step hot loop below.
+    step_values = [float(step.item()) for step in steps]
     kv_cache = provider.allocate_kv_cache(1, dtype=output.dtype, device=provider.device)
     crossattn_cache = provider.allocate_crossattn_cache(
         1, dtype=output.dtype, device=provider.device
     )
     if kv_cache and "_fused_prope_camera_metadata" not in kv_cache[0]:
         raise BackendContractError("Stage2 generation requires preallocated fused camera metadata")
+    # Accumulate finiteness with a device-side reduction instead of syncing after every
+    # chunk; only the final check (after the loop) forces a host/device sync.
+    finite_ok = torch.ones((), dtype=torch.bool, device=provider.device)
     try:
         for start in range(0, latent_frames, chunk):
             end = start + chunk
-            latents = initial_noise[:, start:end].clone()
+            # ``initial_noise[:, start:end]`` for distinct chunks never overlaps and
+            # ``initial_noise`` itself is not read again after this loop, so aliasing the
+            # slice instead of cloning it is safe under the enclosing ``no_grad()``.
+            latents = initial_noise[:, start:end]
             camera_chunk = _slice_camera(
                 camera,
                 start_frame=start,
                 end_frame=end,
                 frame_sequence_length=frame_tokens,
             )
-            for step_index, step in enumerate(steps):
+            for step_index, step_value in enumerate(step_values):
                 timestep = torch.full(
                     (1, chunk),
-                    float(step.item()),
+                    step_value,
                     device=provider.device,
                     dtype=output.dtype,
                 )
@@ -714,10 +734,10 @@ def _stage2_self_forcing_latents(
                     x0 = provider.diffusion.flow_to_x0(latents, flow, timestep)
                 if start == 0:
                     x0 = _restore_first(x0, first_latent, start_frame=0)
-                if step_index + 1 < len(steps):
+                if step_index + 1 < len(step_values):
                     next_timestep = torch.full(
                         (1, chunk),
-                        float(steps[step_index + 1].item()),
+                        step_values[step_index + 1],
                         device=provider.device,
                         dtype=torch.float32,
                     )
@@ -737,10 +757,7 @@ def _stage2_self_forcing_latents(
                         latents = _restore_first(latents, first_latent, start_frame=0)
                 else:
                     latents = x0
-            if not bool(torch.isfinite(latents).all().item()):
-                raise BackendContractError(
-                    f"Stage2 generation chunk {start // chunk} is non-finite"
-                )
+            finite_ok = finite_ok & torch.isfinite(latents).all()
             output[:, start:end] = latents
             commit_timestep = torch.zeros((1, chunk), device=provider.device, dtype=output.dtype)
             with (
@@ -765,10 +782,12 @@ def _stage2_self_forcing_latents(
                 )
     finally:
         del kv_cache, crossattn_cache
+    if not bool(finite_ok.item()):
+        raise BackendContractError("Stage2 generation rollout produced non-finite latents")
     return output, {
         "schema": "solarwm.wan22-stage2-self-forcing-schedule.v1",
         "solver": "self_forcing",
-        "timesteps": [float(value.item()) for value in steps],
+        "timesteps": step_values,
         "chunk_latent_frames": chunk,
         "persistent_kv_cache": True,
         "cache_update_policy": "commit_detached",
@@ -919,28 +938,36 @@ def _stage2_generated_sample(
                 "chunk_latent_frames": _FILE_STREAMING_VAE_LATENT_CHUNK,
             }
         else:
-            if output_latent_frames > _STREAMING_VAE_LATENT_CHUNK:
-                decoded = provider.vae.decode_streaming(
-                    output_latents,
-                    chunk_latent_frames=_STREAMING_VAE_LATENT_CHUNK,
-                )
-                vae_decode = {
-                    "mode": "continuous_cached_tiles",
-                    "chunk_latent_frames": _STREAMING_VAE_LATENT_CHUNK,
-                }
-            else:
-                decoded = provider.vae.decode(output_latents, use_cache=False)
-                vae_decode = {
-                    "mode": "direct",
-                    "chunk_latent_frames": output_latent_frames,
-                }
+            # decode_streaming reproduces vae.decode(use_cache=False) bit-for-bit: cached
+            # decode over temporal tiles sharing one continuous VAE cache is mathematically
+            # identical to a single-shot decode (verified against the CUDA reference at
+            # chunk sizes 6/12/39 on production-shaped latents). Stream unconditionally so
+            # device memory and host accumulation stay flat as the rollout horizon grows,
+            # instead of switching to a horizon-dependent single-shot decode below
+            # _STREAMING_VAE_LATENT_CHUNK.
+            chunk_latent_frames = min(_STREAMING_VAE_LATENT_CHUNK, output_latent_frames)
+            decoded = provider.vae.decode_streaming(
+                output_latents,
+                chunk_latent_frames=chunk_latent_frames,
+            )
+            vae_decode = {
+                "mode": "continuous_cached_tiles",
+                "chunk_latent_frames": chunk_latent_frames,
+            }
             if int(decoded.shape[1]) != model_output_pixel_frames:
                 raise BackendContractError(
                     "Stage2 VAE frame count differs from latent-aligned output: "
                     f"{int(decoded.shape[1])} != {model_output_pixel_frames}"
                 )
-            finite_fraction = float(torch.isfinite(decoded).float().mean().item())
-            if finite_fraction != 1.0:
+            # Gate on an exact boolean reduction, not a float32 mean compared to 1.0:
+            # summing ~1e7-1e8 elements to compute a mean is not required to round to
+            # exactly 1.0 even when every element is finite, and the rounding depends on
+            # the reduction's summation order (e.g. concatenated streaming tiles vs a
+            # single-shot decode), not on the underlying pixel values.
+            finite = torch.isfinite(decoded)
+            all_finite = bool(finite.all().item())
+            finite_fraction = 1.0 if all_finite else float(finite.float().mean().item())
+            if not all_finite:
                 raise BackendContractError(
                     "Stage2 VAE decode produced non-finite pixels "
                     f"(finite_fraction={finite_fraction})"

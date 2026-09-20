@@ -247,7 +247,10 @@ def test_stage2_generated_sample_preserves_configured_denoising_steps(
             {},
             None,
         ),
-        vae=SimpleNamespace(decode=lambda *_args, **_kwargs: torch.zeros((1, 1, 1, 1, 1))),
+        vae=SimpleNamespace(
+            decode=lambda *_args, **_kwargs: torch.zeros((1, 1, 1, 1, 1)),
+            decode_streaming=lambda *_args, **_kwargs: torch.zeros((1, 1, 1, 1, 1)),
+        ),
         video_encoder=lambda *_args, **_kwargs: b"video",
         _prepared={0: object()},
     )
