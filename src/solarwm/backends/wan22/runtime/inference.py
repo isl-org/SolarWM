@@ -968,19 +968,15 @@ def _encode_stage2_streaming(
 
 
 class CudaWanGenerationAdapter:
-    """CUDA implementation of Wan samplers over logical DP/SP groups."""
+    """Wan sampler implementation over logical DP/SP groups."""
 
     def __init__(self, config: Mapping[str, Any], plan: GenerationPlan) -> None:
         try:
             import torch
         except ImportError as exc:
             raise BackendContractError("Wan inference requires torch") from exc
-        if not torch.cuda.is_available():
-            raise BackendContractError(
-                "Wan inference requires CUDA; inject an adapter for CPU contract tests"
-            )
         from .components import build_online_components
-        from .distributed import initialize_torchrun
+        from .distributed import initialize_torchrun, resolve_device
 
         self.config = config
         self.plan = plan
@@ -988,7 +984,7 @@ class CudaWanGenerationAdapter:
         sp_size = int(config["distributed"]["sequence_parallel_size"])
         self.topology = initialize_torchrun(sp_size)
         self.is_writer = self.topology.sp_rank == 0
-        self.device = torch.device("cuda", self.topology.local_rank)
+        self.device = resolve_device(config, self.topology.local_rank)
         self.checkpoint_path = _checkpoint_file(config)
         self.checkpoint_id = _checkpoint_inventory_id(self.checkpoint_path)
         self.diffusion, self.text_encoder, self.vae, self.base_report = build_online_components(
@@ -1174,7 +1170,9 @@ class CudaWanGenerationAdapter:
             )
         self._loaded_role = role
         del payload, state, normalized
-        torch.cuda.empty_cache()
+        from .distributed import empty_accelerator_cache
+
+        empty_accelerator_cache()
 
     build_cases_returns_partition = True
 
@@ -1598,6 +1596,10 @@ class CudaWanGenerationAdapter:
                 torch.bfloat16
             )
             condition = self.text_encoder([case.prompt])
+            prompt_embeds = condition["prompt_embeds"]
+            if prompt_embeds.device != self.device:
+                prompt_embeds = prompt_embeds.to(device=self.device, dtype=torch.bfloat16)
+                condition = {**condition, "prompt_embeds": prompt_embeds}
             model_y = (
                 build_official_i2v_y(pixels, self.vae) if self.family == "wan22_i2v_a14b" else None
             )
@@ -1688,7 +1690,7 @@ class CudaWanGenerationAdapter:
                 .expand(-1, -1, int(self.config["model"]["frame_sequence_length"]))
                 .reshape(1, sequence)
             )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                 flow = self.diffusion(
                     latents,
                     condition,
@@ -1815,7 +1817,7 @@ class CudaWanGenerationAdapter:
                         .expand(-1, -1, frame_sequence_length)
                         .reshape(1, chunk * frame_sequence_length)
                     )
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                     predicted = self.diffusion.forward_inference_window(
                         latents,
                         clean_history,

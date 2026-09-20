@@ -164,7 +164,7 @@ class Wan22Backend:
         probe_runtime(
             config,
             family=self.family,
-            require_cuda=True,
+            require_cuda=False,
             require_transformer_weights=not stage2,
         ).require_ready()
         if self.family == "wan22_ti2v_5b" and stage2:

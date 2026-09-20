@@ -43,8 +43,69 @@ def apply_wan_activation_checkpointing(module: Any) -> int:
     return len(blocks)
 
 
+def synchronize_accelerator() -> None:
+    """Synchronize the active PyTorch accelerator (CUDA, XPU, or torch.accelerator)."""
+
+    import torch
+
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is not None:
+        try:
+            if accelerator.is_available():
+                accelerator.synchronize()
+                return
+        except (AttributeError, RuntimeError):
+            pass
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.synchronize()
+
+
+def empty_accelerator_cache() -> None:
+    """Release cached blocks on every available device backend."""
+
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+
+
+def resolve_device(config: Mapping[str, Any] | None = None, local_rank: int = 0) -> Any:
+    """Resolve an explicit inference device or the current PyTorch accelerator."""
+
+    import torch
+
+    requested = None
+    if isinstance(config, Mapping):
+        for section_name in ("inference", "runtime"):
+            section = config.get(section_name)
+            if isinstance(section, Mapping) and section.get("device"):
+                requested = str(section["device"])
+                break
+    if requested:
+        return torch.device(requested)
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is not None:
+        try:
+            if accelerator.is_available():
+                current = accelerator.current_accelerator()
+                if current is not None:
+                    return torch.device(current)
+        except (AttributeError, RuntimeError):
+            pass
+    if torch.cuda.is_available():
+        return torch.device("cuda", local_rank)
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        return torch.device("xpu", local_rank)
+    return torch.device("cpu")
+
+
 def initialize_torchrun(sp_size: int) -> Topology:
-    """Initialize NCCL and the model's sequence-parallel group layout."""
+    """Initialize the process layout without requiring CUDA for inference."""
 
     try:
         import torch
@@ -53,19 +114,27 @@ def initialize_torchrun(sp_size: int) -> Topology:
         raise BackendContractError("Wan distributed runtime requires torch") from exc
     from .sequence_parallel import init_sequence_parallel
 
-    if not torch.cuda.is_available():
-        raise BackendContractError("Wan training requires CUDA")
     if "WORLD_SIZE" in os.environ:
         topology = Topology.from_environ(sp_size)
     else:
         topology = Topology(1, 0, 1, 0, int(sp_size))
     if topology.raw_world_size > 1 and not dist.is_initialized():
+        if not torch.cuda.is_available():
+            raise BackendContractError("Wan distributed execution requires CUDA")
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
             timeout=timedelta(hours=1),
         )
-    torch.cuda.set_device(topology.local_rank)
+    device = resolve_device(local_rank=topology.local_rank)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    elif device.type == "xpu":
+        accelerator = getattr(torch, "accelerator", None)
+        if accelerator is not None and hasattr(accelerator, "set_device_index"):
+            accelerator.set_device_index(device.index or topology.local_rank)
+        else:
+            torch.xpu.set_device(device)
     init_sequence_parallel(sp_size=int(sp_size))
     return topology
 
@@ -124,12 +193,10 @@ def wrap_transformer_fsdp(module: Any, config: Mapping[str, Any], topology: Topo
 
 
 def cleanup_torchrun() -> None:
-    import torch
     import torch.distributed as dist
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+    synchronize_accelerator()
+    empty_accelerator_cache()
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -137,6 +204,9 @@ def cleanup_torchrun() -> None:
 __all__ = [
     "apply_wan_activation_checkpointing",
     "cleanup_torchrun",
+    "empty_accelerator_cache",
     "initialize_torchrun",
+    "resolve_device",
+    "synchronize_accelerator",
     "wrap_transformer_fsdp",
 ]

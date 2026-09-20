@@ -1,0 +1,12 @@
+# Wan2.2 Stage2 inference runtime for Intel XPU.
+# Install PyTorch separately from the XPU index in setup_wan22_xpu.sh.
+# Deliberately excludes SolarWM's [wan] extra and standalone flash-attn.
+diffusers==0.38.0
+transformers==5.12.1
+peft==0.20.0
+ftfy>=6.2
+omegaconf>=2.3
+regex>=2024.0
+einops>=0.8
+decord>=0.6
+pytest>=8.0

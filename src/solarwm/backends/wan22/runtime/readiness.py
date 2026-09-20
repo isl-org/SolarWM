@@ -64,7 +64,7 @@ class ReadinessReport:
 
 
 def _dependency_versions(
-    *, online: bool, transformer: bool = True
+    *, online: bool, transformer: bool = True, require_cuda: bool = False
 ) -> tuple[dict[str, str | None], list[ReadinessIssue]]:
     required = [
         ("torch", "torch"),
@@ -108,6 +108,7 @@ def _dependency_versions(
                         "FlashAttention is required for GPU training; "
                         "the PyTorch attention fallback is for diagnostics only"
                     ),
+                    severity="error" if require_cuda else "warning",
                 )
             )
     return versions, issues
@@ -436,7 +437,11 @@ def probe_runtime(
     )
     transformer = str(config.get("action", "")) != "preencode"
     layout = WanAssetLayout.from_config(config)
-    dependencies, dependency_issues = _dependency_versions(online=online, transformer=transformer)
+    dependencies, dependency_issues = _dependency_versions(
+        online=online,
+        transformer=transformer,
+        require_cuda=require_cuda,
+    )
     issues = list(dependency_issues)
     _check_assets(
         layout,

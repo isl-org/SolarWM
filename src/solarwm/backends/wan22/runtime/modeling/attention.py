@@ -25,9 +25,19 @@ except ModuleNotFoundError:
 
 import warnings
 
+
+def wan22_attention_backend() -> str:
+    """Return ``flash`` or ``sdpa`` for the active Wan22 attention implementation."""
+
+    if torch.cuda.is_available() and (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return "flash"
+    return "sdpa"
+
+
 __all__ = [
     "flash_attention",
     "attention",
+    "wan22_attention_backend",
 ]
 
 
@@ -153,7 +163,12 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    use_flash = (
+        wan22_attention_backend() == "flash"
+        and q.device.type == "cuda"
+        and (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE)
+    )
+    if use_flash:
         return flash_attention(
             q=q,
             k=k,

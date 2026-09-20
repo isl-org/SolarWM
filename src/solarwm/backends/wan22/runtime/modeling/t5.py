@@ -493,7 +493,19 @@ class T5EncoderModel:
         shard_fn=None,
     ):
         if device is None:
-            device = torch.cuda.current_device()
+            try:
+                from ..distributed import resolve_device
+
+                device = resolve_device()
+            except Exception:
+                import torch
+
+                if torch.cuda.is_available():
+                    device = torch.device("cuda", torch.cuda.current_device())
+                elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                    device = torch.device("xpu", 0)
+                else:
+                    device = torch.device("cpu")
         self.text_len = text_len
         self.dtype = dtype
         self.device = device

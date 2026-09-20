@@ -303,7 +303,9 @@ def register_sequence_parallel_sequence_length(local_length: int) -> tuple[int, 
         state.sequence_lengths = (local_length,)
         return state.sequence_lengths
     assert state.sp_group is not None
-    value = torch.tensor([local_length], dtype=torch.int64, device="cuda")
+    from .distributed import resolve_device
+
+    value = torch.tensor([local_length], dtype=torch.int64, device=resolve_device())
     gathered = [torch.empty_like(value) for _ in range(state.sp_size)]
     dist.all_gather(gathered, value, group=state.sp_group)
     state.sequence_lengths = tuple(int(item.item()) for item in gathered)

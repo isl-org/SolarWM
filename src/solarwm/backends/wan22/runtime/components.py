@@ -200,6 +200,9 @@ class Wan5BVAE:
     def encode(self, pixels_bcthw: Any) -> Any:
         import torch
 
+        # Cached conv state must not leak across calls (observed on XPU between
+        # repeated inference condition builds).
+        self.module.clear_cache()
         encoded = [
             self.module.encode(clip.unsqueeze(0), self._scale(clip)).float().squeeze(0)
             for clip in pixels_bcthw
@@ -209,6 +212,8 @@ class Wan5BVAE:
     def decode(self, latents_btchw: Any, *, use_cache: bool = False) -> Any:
         import torch
 
+        if not use_cache:
+            self.module.clear_cache()
         clips = latents_btchw.permute(0, 2, 1, 3, 4)
         decode = self.module.cached_decode if use_cache else self.module.decode
         output = []

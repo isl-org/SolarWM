@@ -35,14 +35,36 @@ export SOLAR_OUTPUT_ROOT=/path/to/outputs
 cd "$SOLAR_REPO"
 ```
 
-Download the Wan2.2-5B base model and released stage checkpoints:
+For direct Stage2 inference, download the shared base assets and the Stage2
+checkpoint. The base transformer weights are not needed: the Stage2 checkpoint
+contains the complete trained transformer, and the inference config uses the
+built-in transformer architecture definition.
+
+The Stage2-only inference closure is:
+
+- `SolarWM-5B-base/text_encoder/` for UMT5-XXL.
+- `SolarWM-5B-base/tokenizer/` for UMT5 tokenization.
+- `SolarWM-5B-base/vae/` for Wan2.2 encode/decode.
+- `SolarWM-5B-base/conditioning/` for the released conditioning assets.
+- `SolarWM-5B-sgf-stage2-81f/` for the Stage2 checkpoint and manifests.
 
 ```bash
 python -m pip install --upgrade huggingface_hub
 hf download junchaoh-cs/SolarWM \
-  --include "SolarWM-5B-*/**" \
+  --include "SolarWM-5B-base/LICENSE.txt" \
+  --include "SolarWM-5B-base/UPSTREAM_README.md" \
+  --include "SolarWM-5B-base/assets-manifest.json" \
+  --include "SolarWM-5B-base/conditioning/**" \
+  --include "SolarWM-5B-base/text_encoder/**" \
+  --include "SolarWM-5B-base/tokenizer/**" \
+  --include "SolarWM-5B-base/vae/**" \
+  --include "SolarWM-5B-sgf-stage2-81f/**" \
   --local-dir "$SOLAR_MODEL_ROOT"
 ```
+
+The complete base transformer shards are required for training and for the
+other released stages, but should be omitted from a Stage2-only inference
+machine.
 
 Keep each downloaded checkpoint directory intact. Commands below refer to the
 `model.pt` file when initializing training and to the directory when running
@@ -158,6 +180,16 @@ torchrun --standalone --nproc-per-node=1 -m solarwm infer \
   --set data.transport.root="$SOLAR_DATA_ROOT" \
   --set inference.run_id=my-camera-run \
   --set runtime.output_dir="$SOLAR_OUTPUT_ROOT/wan5-stage2-sgf-infer"
+```
+
+For the one-process Intel B580/XPU deployment, use the checked-in launcher
+after the Stage2 checkpoint and raw test index are available:
+
+```bash
+export SOLAR_MODEL_ROOT=/home/gta/models/SolarWM
+export SOLAR_DATA_ROOT=/home/gta/models/SolarWM-Data/releases-v1
+export SOLAR_OUTPUT_ROOT=/home/gta/code/SolarWM/outputs
+scripts/run_wan22_stage2_xpu.sh
 ```
 
 The Stage2 command loads the checkpoint directory as one model, resolves its

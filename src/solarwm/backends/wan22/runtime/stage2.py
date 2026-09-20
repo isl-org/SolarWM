@@ -57,7 +57,12 @@ from .components import (
     build_diffusion_architecture,
 )
 from .data import build_raw_dataloader
-from .distributed import cleanup_torchrun, initialize_torchrun, wrap_transformer_fsdp
+from .distributed import (
+    cleanup_torchrun,
+    initialize_torchrun,
+    resolve_device,
+    wrap_transformer_fsdp,
+)
 from .readiness import probe_runtime
 from .stage0p5 import expand_timesteps_to_tokens
 
@@ -692,7 +697,7 @@ def _stage2_self_forcing_latents(
                 with torch.autocast(
                     device_type=provider.device.type,
                     dtype=torch.bfloat16,
-                    enabled=provider.device.type == "cuda",
+                    enabled=provider.device.type in ("cuda", "xpu"),
                 ):
                     flow = provider.diffusion(
                         latents,
@@ -743,7 +748,7 @@ def _stage2_self_forcing_latents(
                 torch.autocast(
                     device_type=provider.device.type,
                     dtype=torch.bfloat16,
-                    enabled=provider.device.type == "cuda",
+                    enabled=provider.device.type in ("cuda", "xpu"),
                 ),
             ):
                 provider.diffusion(
@@ -936,7 +941,10 @@ def _stage2_generated_sample(
                 )
             finite_fraction = float(torch.isfinite(decoded).float().mean().item())
             if finite_fraction != 1.0:
-                raise BackendContractError("Stage2 VAE decode produced non-finite pixels")
+                raise BackendContractError(
+                    "Stage2 VAE decode produced non-finite pixels "
+                    f"(finite_fraction={finite_fraction})"
+                )
             trim_frames = max(int(decoded.shape[1]) - target_pixel_frames, 0)
             tail_pad_frames = max(target_pixel_frames - int(decoded.shape[1]), 0)
             if trim_frames:
@@ -2412,8 +2420,6 @@ class CudaWanStage2GenerationAdapter:
             def __init__(self, values: Mapping[str, Any], generation_plan: Any) -> None:
                 import torch
 
-                if not torch.cuda.is_available():
-                    raise BackendContractError("Wan Stage2 inference requires CUDA")
                 self.config = values
                 self.plan = generation_plan
                 self.family = str(values["model"]["family"])
@@ -2425,7 +2431,7 @@ class CudaWanStage2GenerationAdapter:
                     int(values["distributed"]["sequence_parallel_size"])
                 )
                 self.is_writer = int(self.topology.sp_rank) == 0
-                self.device = torch.device("cuda", int(self.topology.local_rank))
+                self.device = resolve_device(values, int(self.topology.local_rank))
                 (
                     self.checkpoint_path,
                     checkpoint_manifest_id,
@@ -2441,14 +2447,21 @@ class CudaWanStage2GenerationAdapter:
                 )
                 self.checkpoint_id = f"manifest:{checkpoint_manifest_id}"
                 layout = WanAssetLayout.from_config(values)
-                self.diffusion = build_diffusion_architecture(values)
-                self.text_encoder = WanTextEncoder(layout.text_encoder, layout.tokenizer)
-                self.vae = Wan5BVAE(layout.vae)
                 inference_dtype = torch.bfloat16
+                encoder_device = self.device
+                encoder_dtype = inference_dtype
+                if self.device.type == "xpu":
+                    # UMT5-XXL (~11 GiB) plus the diffusion stack exceeds 32 GiB XPU cards.
+                    encoder_device = torch.device("cpu")
+                    encoder_dtype = torch.float32
+                # Load the text encoder before allocating the diffusion weights on XPU.
+                self.text_encoder = WanTextEncoder(layout.text_encoder, layout.tokenizer)
+                self.text_encoder.to(encoder_device, dtype=encoder_dtype)
+                self.diffusion = build_diffusion_architecture(values)
                 self.diffusion.module.eval().requires_grad_(False).to(
                     device=self.device, dtype=inference_dtype
                 )
-                self.text_encoder.to(self.device, dtype=inference_dtype)
+                self.vae = Wan5BVAE(layout.vae)
                 self.vae.to(self.device, dtype=inference_dtype)
                 self._loaded_role: str | None = None
                 self._prepared: dict[int, Any] = {}
