@@ -14,8 +14,10 @@ import json
 import math
 import os
 import random
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -29,7 +31,11 @@ from solarwm.checkpoint import (
     verify_checkpoint,
 )
 from solarwm.errors import BackendContractError
-from solarwm.runtime.output_layout import checkpoint_model_dir, validation_staging_root
+from solarwm.runtime.output_layout import (
+    checkpoint_model_dir,
+    invocation_output_dir,
+    validation_staging_root,
+)
 from solarwm.runtime.randomness import model_init_seed
 from solarwm.training.ema import ShardedEMA
 from solarwm.training.engine import JsonlEventSink, suspend_automatic_cycle_collection
@@ -71,6 +77,465 @@ _TORCHRUN_OWNER_ENV = "SOLARWM_TORCHRUN_LIFECYCLE_OWNER"
 _STREAMING_VAE_LATENT_CHUNK = 60
 _FILE_STREAMING_PIXEL_THRESHOLD = 4096
 _FILE_STREAMING_VAE_LATENT_CHUNK = 12
+
+
+@dataclass(frozen=True)
+class _Stage2QuantizedVaeOutput:
+    """GPU-quantized generated pixels for video and comparison encoders."""
+
+    video: Any
+    compare: Any
+
+
+class _Stage2XpuVaePipeline:
+    """Decode each completed diffusion tile with a continuous-cache XPU VAE.
+
+    Tiles are decoded incrementally during the rollout rather than after it, so
+    host pixel accumulation stays bounded by the tile size instead of the
+    rollout horizon, and pixels are quantized on XPU with the existing video and
+    comparison encoder rules before the host transfer.
+
+    Decoding runs on the caller's stream. WS6 submitted tiles to a second XPU
+    stream to overlap them with the next chunk's diffusion; a two-stream
+    microbenchmark measures 1.001x on this device, so the stream, its events,
+    and the double buffering were removed as machinery that never overlapped.
+    See ``docs/backends/wan22-xpu-inference-optimization-plan.md``.
+    """
+
+    def __init__(
+        self,
+        *,
+        vae: Any,
+        device: Any,
+        height: int,
+        width: int,
+        chunk_latent_frames: int,
+    ) -> None:
+        import torch
+
+        xpu = getattr(torch, "xpu", None)
+        if (
+            getattr(device, "type", None) != "xpu"
+            or xpu is None
+            or not callable(getattr(vae, "streaming_decode_session", None))
+        ):
+            raise BackendContractError("Stage2 XPU VAE pipeline is unavailable")
+        self._torch = torch
+        self._xpu = xpu
+        self._vae = vae
+        self._device = device
+        self._height = int(height)
+        self._width = int(width)
+        self._chunk_latent_frames = int(chunk_latent_frames)
+        if self._chunk_latent_frames <= 0:
+            raise BackendContractError("Stage2 XPU VAE pipeline chunk size must be positive")
+        self._session: Any | None = None
+        self._decode_tile: Callable[[Any], Any] | None = None
+        self._video_buffer: Any | None = None
+        self._compare_buffer: Any | None = None
+        self._finite_buffer: Any | None = None
+        self._video_tiles: list[Any] = []
+        self._compare_tiles: list[Any] = []
+        self._submitted = 0
+        self._entered_at: float | None = None
+        self._decode_seconds = 0.0
+
+    def __enter__(self) -> _Stage2XpuVaePipeline:
+        self._session = self._vae.streaming_decode_session()
+        self._decode_tile = self._session.__enter__()
+        self._entered_at = time.perf_counter()
+        return self
+
+    def submit(self, latents: Any, *, start: int, end: int) -> None:
+        """Decode one completed latent tile and retain its quantized pixels."""
+
+        if self._decode_tile is None:
+            raise BackendContractError("Stage2 XPU VAE pipeline was not entered")
+        count = int(end) - int(start)
+        if count <= 0:
+            raise BackendContractError("Stage2 XPU VAE pipeline received an empty tile")
+        if int(start) != self._submitted:
+            raise BackendContractError("Stage2 XPU VAE tiles submitted out of order")
+        frames = 1 + 4 * (count - 1) if int(start) == 0 else 4 * count
+        capacity = 4 * self._chunk_latent_frames
+        if frames > capacity:
+            raise BackendContractError("Stage2 XPU VAE tile exceeds pipeline capacity")
+        if self._video_buffer is None:
+            self._video_buffer = self._torch.empty(
+                (1, capacity, 3, self._height, self._width),
+                dtype=self._torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._compare_buffer = self._torch.empty(
+                (1, capacity, 3, self._height, self._width),
+                dtype=self._torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._finite_buffer = self._torch.empty(
+                (), dtype=self._torch.bool, device="cpu", pin_memory=True
+            )
+        started = time.perf_counter()
+        decoded = self._decode_tile(latents)
+        if int(decoded.shape[1]) != frames:
+            raise BackendContractError(
+                "Stage2 XPU VAE tile frame count differs from latent-aligned output"
+            )
+        # Quantization rules are per-artifact and must not be unified: video.mp4
+        # rounds, compare.mp4 truncates after its comparison normalization.
+        pixels = decoded.clamp(-1, 1)
+        self._video_buffer[:, :frames].copy_(
+            ((pixels + 1.0) * 127.5).round().to(self._torch.uint8),
+            non_blocking=True,
+        )
+        self._compare_buffer[:, :frames].copy_(
+            ((pixels + 1.0) * 127.5).to(self._torch.uint8),
+            non_blocking=True,
+        )
+        self._finite_buffer.copy_(
+            self._torch.isfinite(decoded).all(),
+            non_blocking=True,
+        )
+        # One synchronization per tile, before the pinned host buffers are read
+        # and reused. Negligible against a ~1.7 s decode.
+        self._xpu.current_stream(self._device).synchronize()
+        self._decode_seconds += time.perf_counter() - started
+        if not bool(self._finite_buffer.item()):
+            raise BackendContractError("Stage2 VAE decode produced non-finite pixels")
+        self._video_tiles.append(self._video_buffer[:, :frames].clone())
+        self._compare_tiles.append(self._compare_buffer[:, :frames].clone())
+        self._submitted = int(end)
+
+    def finish(self, *, expected_latent_frames: int) -> _Stage2QuantizedVaeOutput:
+        if self._submitted != int(expected_latent_frames):
+            raise BackendContractError("Stage2 XPU VAE pipeline did not decode every latent tile")
+        return _Stage2QuantizedVaeOutput(
+            video=self._torch.cat(self._video_tiles, dim=1),
+            compare=self._torch.cat(self._compare_tiles, dim=1),
+        )
+
+    def measurements(self) -> dict[str, Any]:
+        """Return tile-level decode telemetry after ``finish``."""
+
+        return {
+            "tiles": len(self._video_tiles),
+            "elapsed_seconds": (
+                time.perf_counter() - self._entered_at if self._entered_at is not None else None
+            ),
+            "decode_seconds": self._decode_seconds,
+        }
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self._session is not None:
+            self._session.__exit__(exc_type, exc, traceback)
+            self._session = None
+
+
+@dataclass
+class _Stage2InferenceBuffers:
+    """Stable inference-only storage for a variable camera rollout horizon."""
+
+    max_latent_frames: int
+    output: Any
+    initial_noise: Any
+    denoise_noise: Any
+
+
+def _allocate_stage2_inference_buffers(
+    *,
+    max_latent_frames: int,
+    chunk_latent_frames: int,
+    channels: int,
+    height: int,
+    width: int,
+    device: Any,
+) -> _Stage2InferenceBuffers:
+    """Allocate the maximum camera rollout shape once for standalone inference."""
+
+    import torch
+
+    shape = (1, int(max_latent_frames), int(channels), int(height), int(width))
+    return _Stage2InferenceBuffers(
+        max_latent_frames=int(max_latent_frames),
+        output=torch.empty(shape, device=device, dtype=torch.bfloat16),
+        initial_noise=torch.empty(shape, device=device, dtype=torch.bfloat16),
+        denoise_noise=torch.empty(
+            (1, int(chunk_latent_frames), int(channels), int(height), int(width)),
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+    )
+
+
+def _stage2_inference_buffer_views(
+    provider: Any, *, latent_frames: int, chunk_latent_frames: int
+) -> tuple[Any, Any, Any] | None:
+    """Return exact-shaped views, rejecting an undersized configured maximum."""
+
+    buffers = getattr(provider, "_stage2_inference_buffers", None)
+    if buffers is None:
+        return None
+    if int(latent_frames) > int(buffers.max_latent_frames):
+        raise BackendContractError(
+            "Stage2 camera rollout exceeds inference.max_rollout_latent_frames: "
+            f"{latent_frames} > {buffers.max_latent_frames}"
+        )
+    if int(chunk_latent_frames) > int(buffers.denoise_noise.shape[1]):
+        raise BackendContractError(
+            "Stage2 inference noise buffer is smaller than the denoise chunk"
+        )
+    return (
+        buffers.output[:, :latent_frames],
+        buffers.initial_noise[:, :latent_frames],
+        buffers.denoise_noise[:, :chunk_latent_frames],
+    )
+
+
+class _Stage2InferenceMeasurements:
+    """Opt-in, XPU-aware phase recorder for standalone Stage2 inference."""
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        device: Any,
+        rank: int,
+        torch_module: Any | None = None,
+    ) -> None:
+        runtime = config.get("runtime", {})
+        self.enabled = bool(
+            isinstance(runtime, Mapping) and runtime.get("stage2_inference_measurements", False)
+        )
+        self.global_peak = bool(
+            isinstance(runtime, Mapping) and runtime.get("stage2_inference_global_peak", False)
+        )
+        self.config = config
+        self.device = device
+        self.rank = int(rank)
+        self._torch = torch_module
+        self.events: list[dict[str, Any]] = []
+        if self.enabled and self.global_peak:
+            xpu = self._xpu()
+            self._synchronize(xpu)
+            self._reset_memory(xpu)
+
+    def _xpu(self) -> Any | None:
+        if not self.enabled or getattr(self.device, "type", None) != "xpu":
+            return None
+        if self._torch is None:
+            import torch
+
+            self._torch = torch
+        return getattr(self._torch, "xpu", None)
+
+    def _synchronize(self, xpu: Any | None) -> None:
+        synchronize = getattr(xpu, "synchronize", None)
+        if callable(synchronize):
+            synchronize(self.device)
+
+    def _reset_memory(self, xpu: Any | None) -> None:
+        reset = getattr(xpu, "reset_peak_memory_stats", None)
+        if callable(reset):
+            reset(self.device)
+
+    def _memory(self, xpu: Any | None) -> Mapping[str, int] | None:
+        allocated = getattr(xpu, "max_memory_allocated", None)
+        reserved = getattr(xpu, "max_memory_reserved", None)
+        if not callable(allocated) or not callable(reserved):
+            return None
+        return {
+            "max_allocated_bytes": int(allocated(self.device)),
+            "max_reserved_bytes": int(reserved(self.device)),
+        }
+
+    @contextmanager
+    def phase(self, name: str, *, synchronize: bool = True, **metadata: Any) -> Any:
+        if not self.enabled:
+            with nullcontext():
+                yield
+            return
+        xpu = self._xpu()
+        if synchronize:
+            self._synchronize(xpu)
+        if not self.global_peak:
+            self._reset_memory(xpu)
+        started = time.perf_counter()
+        status = "ok"
+        try:
+            yield
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            if synchronize:
+                self._synchronize(xpu)
+            self.events.append(
+                {
+                    "schema": "solarwm.wan22-stage2-inference-measurement.v1",
+                    "event": "phase",
+                    "phase": name,
+                    "status": status,
+                    "elapsed_seconds": time.perf_counter() - started,
+                    "memory": self._memory(xpu),
+                    "synchronized": synchronize,
+                    "global_peak_tracking": self.global_peak,
+                    **metadata,
+                }
+            )
+
+    def record(self, name: str, **metadata: Any) -> None:
+        """Append telemetry that is measured by an asynchronous runtime component."""
+
+        if self.enabled:
+            self.events.append(
+                {
+                    "schema": "solarwm.wan22-stage2-inference-measurement.v1",
+                    "event": "component",
+                    "phase": name,
+                    "status": "ok",
+                    **metadata,
+                }
+            )
+
+    def write_report(self) -> Path | None:
+        if not self.enabled:
+            return None
+        target = (
+            invocation_output_dir(self.config)
+            / "reports"
+            / f"stage2-inference-measurements.rank-{self.rank:05d}.jsonl"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.partial")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                for event in self.events:
+                    handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")))
+                    handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
+
+
+class _Stage2XpuProfiler:
+    """One opt-in steady-state Chrome/Perfetto trace for camera inference."""
+
+    def __init__(self, config: Mapping[str, Any], *, device: Any, rank: int) -> None:
+        runtime = config.get("runtime", {})
+        self.enabled = bool(
+            isinstance(runtime, Mapping) and runtime.get("stage2_xpu_profiler", False)
+        )
+        self.config = config
+        self.device = device
+        self.rank = int(rank)
+        self._captured = False
+        self.start_chunk = int(
+            runtime.get("stage2_xpu_profiler_start_chunk", 4)
+            if isinstance(runtime, Mapping)
+            else 4
+        )
+        self.end_chunk = int(
+            runtime.get("stage2_xpu_profiler_end_chunk", 8)
+            if isinstance(runtime, Mapping)
+            else 8
+        )
+        self._profiler: Any | None = None
+        self._target: Path | None = None
+
+    def begin(self, *, case_slot: int, chunk_index: int) -> None:
+        if (
+            self._captured
+            or not self.enabled
+            or chunk_index != self.start_chunk
+            or getattr(self.device, "type", None) != "xpu"
+        ):
+            return
+        import torch
+
+        activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
+        self._captured = True
+        self._profiler = torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            # Achieved FLOP/s per op is the usable XPU utilization signal on
+            # this stack: Level Zero hardware counters (ZET_ENABLE_METRICS)
+            # do not reach the PyTorch trace in 2.12.1+xpu, but `with_flops`
+            # plus kernel time gives TFLOP/s to compare against the 183.5
+            # TFLOP/s bf16 spec peak.
+            with_flops=True,
+        )
+        self._target = (
+            invocation_output_dir(self.config)
+            / "reports"
+            / f"stage2-xpu-profile.slot-{case_slot:06d}.rank-{self.rank:05d}.json"
+        )
+        self._profiler.start()
+
+    def end(self, *, chunk_index: int, force: bool = False) -> None:
+        if self._profiler is None or (not force and chunk_index != self.end_chunk):
+            return
+        profiler, target = self._profiler, self._target
+        self._profiler = None
+        self._target = None
+        profiler.stop()
+        if target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Summary first: it is the small, high-value artifact, and doing it
+            # after the multi-hundred-MB chrome export runs the host out of
+            # memory on a two-chunk window.
+            self._export_op_summary(profiler, target)
+            profiler.export_chrome_trace(str(target))
+
+    @staticmethod
+    def _export_op_summary(profiler: Any, trace_target: Path) -> None:
+        """Write per-op device time and FLOPs next to the chrome trace.
+
+        ``with_flops`` results are only reachable through ``key_averages()``;
+        ``export_chrome_trace`` drops them. Achieved FLOP/s is the usable
+        utilization signal here, so persist it rather than re-running.
+        """
+        try:
+            averages = profiler.key_averages()
+        except Exception:  # pragma: no cover - diagnostics must not fail a run
+            return
+        rows = []
+        for entry in averages:
+            device_us = float(getattr(entry, "self_device_time_total", 0.0) or 0.0)
+            flops = int(getattr(entry, "flops", 0) or 0)
+            if device_us <= 0.0 and flops <= 0:
+                continue
+            rows.append(
+                {
+                    "op": entry.key,
+                    "count": int(getattr(entry, "count", 0) or 0),
+                    "self_device_us": device_us,
+                    "self_cpu_us": float(getattr(entry, "self_cpu_time_total", 0.0) or 0.0),
+                    "flops": flops,
+                    "achieved_tflops": (flops / (device_us * 1e-6) / 1e12) if device_us else None,
+                }
+            )
+        rows.sort(key=lambda row: -row["self_device_us"])
+        summary = trace_target.with_name(
+            trace_target.name.replace("stage2-xpu-profile", "stage2-xpu-op-summary")
+        )
+        summary.write_text(json.dumps(rows, indent=2))
+
+
+def _measurement_phase(
+    provider: Any, name: str, *, synchronize: bool = True, **metadata: Any
+) -> Any:
+    measurements = getattr(provider, "_stage2_measurements", None)
+    if measurements is None:
+        return nullcontext()
+    return measurements.phase(name, synchronize=synchronize, **metadata)
+
+
 
 
 class Stage2GenerationRunner(Protocol):
