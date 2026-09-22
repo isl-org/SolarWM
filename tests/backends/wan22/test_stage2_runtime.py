@@ -13,7 +13,11 @@ from solarwm.backends.wan22.generation import GenerationPass
 from solarwm.backends.wan22.runtime.stage2 import (
     RoleCheckpointReceipt,
     Wan5BStage2Runtime,
+    _Stage2InferenceMeasurements,
+    _allocate_stage2_inference_buffers,
+    _compile_stage2_xpu_transformer_blocks,
     _published_default_weight_role,
+    _stage2_xpu_vae_pipeline_enabled,
     _stage2_generated_sample,
     _stage2_initialization_receipt,
     _stage2_self_forcing_latents,
@@ -35,20 +39,396 @@ class _FakeScheduler:
         return clean
 
 
+def test_stage2_xpu_compile_wraps_only_transformer_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch = pytest.importorskip("torch")
+    compiled: list[object] = []
+    blocks = torch.nn.ModuleList((torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)))
+    diffusion = SimpleNamespace(module=SimpleNamespace(blocks=blocks))
+    monkeypatch.setattr(torch, "compile", lambda block, **kwargs: compiled.append((block, kwargs)) or block)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+
+    _compile_stage2_xpu_transformer_blocks(diffusion, device=torch.device("xpu"))
+
+    assert [kwargs for _, kwargs in compiled] == [{"dynamic": False}, {"dynamic": False}]
+    assert diffusion.module.blocks is not blocks
+    assert diffusion.module._solarwm_stage2_xpu_blocks_compiled is True
+    _compile_stage2_xpu_transformer_blocks(diffusion, device=torch.device("xpu"))
+    assert len(compiled) == 2
+
+
+def test_stage2_xpu_compile_rejects_non_xpu_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    blocks = torch.nn.ModuleList((torch.nn.Linear(2, 2),))
+    diffusion = SimpleNamespace(module=SimpleNamespace(blocks=blocks))
+    monkeypatch.setattr(torch, "compile", lambda *_args, **_kwargs: pytest.fail("must not compile"))
+
+    with pytest.raises(BackendContractError, match="requires inference.device=xpu"):
+        _compile_stage2_xpu_transformer_blocks(diffusion, device=torch.device("cpu"))
+    assert diffusion.module.blocks is blocks
+
+
+def test_stage2_xpu_vae_pipeline_uses_serial_cpu_fallback() -> None:
+    torch = pytest.importorskip("torch")
+    provider = SimpleNamespace(
+        device=torch.device("cpu"),
+        config={
+            "action": "infer",
+            "inference": {"length": "camera", "stage2_xpu_vae_pipeline": True},
+        },
+        vae=SimpleNamespace(streaming_decode_session=lambda: pytest.fail("must not open on CPU")),
+    )
+
+    assert not _stage2_xpu_vae_pipeline_enabled(
+        provider,
+        output_latent_frames=60,
+        rollout_latent_frames=60,
+    )
+
+
+def test_stage2_measurements_sync_and_reset_xpu_per_phase(tmp_path: Path) -> None:
+    class FakeXpu:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def synchronize(self, device: object) -> None:
+            self.calls.append(("synchronize", device))
+
+        def reset_peak_memory_stats(self, device: object) -> None:
+            self.calls.append(("reset", device))
+
+        @staticmethod
+        def max_memory_allocated(_device: object) -> int:
+            return 123
+
+        @staticmethod
+        def max_memory_reserved(_device: object) -> int:
+            return 456
+
+    device = SimpleNamespace(type="xpu")
+    xpu = FakeXpu()
+    measurements = _Stage2InferenceMeasurements(
+        {
+            "action": "infer",
+            "name": "measurement-test",
+            "inference": {"length": "camera", "run_id": "measurement-test"},
+            "runtime": {
+                "output_dir": str(tmp_path),
+                "stage2_inference_measurements": True,
+            },
+        },
+        device=device,
+        rank=3,
+        torch_module=SimpleNamespace(xpu=xpu),
+    )
+
+    with measurements.phase("rollout_chunk", chunk_index=2):
+        pass
+
+    assert [name for name, _ in xpu.calls] == ["synchronize", "reset", "synchronize"]
+    assert measurements.events[0]["phase"] == "rollout_chunk"
+    assert measurements.events[0]["synchronized"] is True
+    assert measurements.events[0]["memory"] == {
+        "max_allocated_bytes": 123,
+        "max_reserved_bytes": 456,
+    }
+    report = measurements.write_report()
+    assert report == tmp_path / "runs" / "measurement-test" / "reports" / (
+        "stage2-inference-measurements.rank-00003.jsonl"
+    )
+    assert '"phase":"rollout_chunk"' in report.read_text(encoding="utf-8")
+
+
+def test_stage2_measurements_can_record_async_pipeline_telemetry(tmp_path: Path) -> None:
+    class FakeXpu:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def synchronize(self, _device: object) -> None:
+            self.calls.append("synchronize")
+
+        def reset_peak_memory_stats(self, _device: object) -> None:
+            self.calls.append("reset")
+
+    xpu = FakeXpu()
+    measurements = _Stage2InferenceMeasurements(
+        {
+            "action": "infer",
+            "inference": {"length": "camera", "run_id": "async-measurement-test"},
+            "runtime": {
+                "output_dir": str(tmp_path),
+                "stage2_inference_measurements": True,
+            },
+        },
+        device=SimpleNamespace(type="xpu"),
+        rank=0,
+        torch_module=SimpleNamespace(xpu=xpu),
+    )
+
+    with measurements.phase("rollout_chunk", synchronize=False):
+        pass
+    measurements.record("vae_pipeline", tiles=14, wait_seconds=0.0)
+
+    assert xpu.calls == ["reset"]
+    assert measurements.events[0]["synchronized"] is False
+    assert measurements.events[1]["phase"] == "vae_pipeline"
+    assert measurements.events[1]["tiles"] == 14
+
+
+def test_stage2_measurements_are_inert_when_disabled() -> None:
+    xpu = SimpleNamespace(
+        synchronize=lambda _device: pytest.fail("disabled measurements must not synchronize"),
+        reset_peak_memory_stats=lambda _device: pytest.fail("disabled measurements must not reset"),
+    )
+    measurements = _Stage2InferenceMeasurements(
+        {"runtime": {"stage2_inference_measurements": False}},
+        device=SimpleNamespace(type="xpu"),
+        rank=0,
+        torch_module=SimpleNamespace(xpu=xpu),
+    )
+
+    with measurements.phase("rollout_chunk"):
+        pass
+
+    assert measurements.events == []
+    assert measurements.write_report() is None
+
+
 def _cache_alloc(batch_size: int, *, dtype: object, device: object) -> list[dict]:
     torch = pytest.importorskip("torch")
     return [
         {
             "k": torch.zeros((batch_size, 1), dtype=dtype, device=device),
             "v": torch.zeros((batch_size, 1), dtype=dtype, device=device),
-            "global_end_index": torch.zeros(1, dtype=torch.long, device=device),
-            "local_end_index": torch.zeros(1, dtype=torch.long, device=device),
+            "global_end_index": 0,
+            "local_end_index": 0,
             "_fused_prope_camera_metadata": {
                 "viewmats": torch.eye(4, device=device).reshape(1, 1, 4, 4),
                 "K": torch.eye(3, device=device).reshape(1, 1, 3, 3),
             },
         }
     ]
+
+
+def test_kv_cache_indices_use_host_ints_and_accept_legacy_tensors() -> None:
+    torch = pytest.importorskip("torch")
+    from solarwm.backends.wan22.runtime.modeling.causal_model import (
+        _cache_index,
+        _set_cache_index,
+    )
+
+    host_cache = {"global_end_index": 3, "local_end_index": 5}
+    assert _cache_index(host_cache, "global_end_index") == 3
+    _set_cache_index(host_cache, "local_end_index", 7)
+    assert host_cache["local_end_index"] == 7
+
+    legacy_cache = {
+        "global_end_index": torch.tensor([3], dtype=torch.long),
+        "local_end_index": torch.tensor([5], dtype=torch.long),
+    }
+    assert _cache_index(legacy_cache, "global_end_index") == 3
+    _set_cache_index(legacy_cache, "local_end_index", 7)
+    assert legacy_cache["local_end_index"].tolist() == [7]
+
+
+def test_stage2_kv_cache_allocator_uses_host_index_scalars() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Root:
+        blocks = (object(),)
+        num_heads = 2
+        dim = 4
+
+    runtime = Wan5BStage2Runtime.__new__(Wan5BStage2Runtime)
+    runtime._kv_cache_allocator = None
+    runtime.student = SimpleNamespace(module=_Root())
+    runtime.config = {
+        "model": {
+            "local_attn_size": 2,
+            "frame_sequence_length": 3,
+        }
+    }
+
+    cache = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+
+    assert cache["global_end_index"] == 0
+    assert cache["local_end_index"] == 0
+    assert type(cache["global_end_index"]) is int
+    assert type(cache["local_end_index"]) is int
+
+
+def test_stage2_camera_circular_allocator_mirrors_cache_storage() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Root:
+        blocks = (object(),)
+        num_heads = 2
+        dim = 4
+
+    runtime = Wan5BStage2Runtime.__new__(Wan5BStage2Runtime)
+    runtime._kv_cache_allocator = None
+    runtime.student = SimpleNamespace(module=_Root())
+    runtime.config = {
+        "action": "infer",
+        "inference": {"length": "camera"},
+        "model": {"local_attn_size": 2, "frame_sequence_length": 3},
+    }
+
+    cache = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+
+    assert cache["k"].shape[1] == 12
+    assert cache["_circular_kv_cache"] is True
+    assert cache["_circular_capacity"] == 6
+    assert cache["_circular_ring_start"] == 0
+    assert type(cache["_circular_ring_start"]) is int
+
+
+def test_mirrored_circular_cache_keeps_wrapped_window_contiguous() -> None:
+    torch = pytest.importorskip("torch")
+    from solarwm.backends.wan22.runtime.modeling.causal_model import (
+        CausalWanModel,
+        _write_mirrored_ring,
+    )
+
+    cache = {
+        "k": torch.zeros((1, 4, 1, 1)),
+        "v": torch.zeros((1, 4, 1, 1)),
+        "global_end_index": 2,
+        "local_end_index": 2,
+        "_circular_kv_cache": True,
+        "_circular_capacity": 2,
+        "_circular_ring_start": 0,
+    }
+    _write_mirrored_ring(cache["k"], start=0, values=torch.tensor([[[[1.0]], [[2.0]]]]))
+    _write_mirrored_ring(cache["v"], start=0, values=torch.tensor([[[[1.0]], [[2.0]]]]))
+    _write_mirrored_ring(cache["k"], start=0, values=torch.tensor([[[[3.0]]]]))
+    _write_mirrored_ring(cache["v"], start=0, values=torch.tensor([[[[3.0]]]]))
+
+    # A speculative denoise may overwrite ring slots, but it cannot advance
+    # logical state until the detached commit has completed.
+    assert cache["_circular_ring_start"] == 0
+    assert cache["global_end_index"] == 2
+    CausalWanModel._apply_cache_updates(
+        object(),
+        [cache],
+        [(0, (3, 2, {"action": "circular_insert", "ring_start": 1}))],
+    )
+    assert cache["_circular_ring_start"] == 1
+    assert cache["global_end_index"] == 3
+    assert cache["local_end_index"] == 2
+    assert cache["k"][0, 1:3, 0, 0].tolist() == [2.0, 3.0]
+    assert cache["v"][0, 1:3, 0, 0].tolist() == [2.0, 3.0]
+
+
+def test_circular_attention_uses_contiguous_wrapped_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    from solarwm.backends.wan22.runtime.modeling import causal_model
+
+    attn = causal_model.CausalWanSelfAttention(
+        dim=2,
+        num_heads=1,
+        local_attn_size=2,
+        sink_size=0,
+        qk_norm=False,
+        frame_seq_length=1,
+        use_echorope=False,
+    )
+    with torch.no_grad():
+        for projection in (attn.q, attn.k, attn.v, attn.o):
+            projection.weight.copy_(torch.eye(2))
+            projection.bias.zero_()
+    monkeypatch.setattr(
+        attn,
+        "_rope_q_and_window_k",
+        lambda *, q, k_window, **_kwargs: (q, k_window, None),
+    )
+    visible_windows: list[object] = []
+    monkeypatch.setattr(
+        causal_model,
+        "attention",
+        lambda q, k, _v: (visible_windows.append(k.detach().clone()) or q),
+    )
+    cache = {
+        "k": torch.zeros((1, 4, 1, 2)),
+        "v": torch.zeros((1, 4, 1, 2)),
+        "global_end_index": 0,
+        "local_end_index": 0,
+        "_circular_kv_cache": True,
+        "_circular_capacity": 2,
+        "_circular_ring_start": 0,
+    }
+    grid = torch.tensor([[1, 1, 1]])
+    for index, value in enumerate((1.0, 2.0, 3.0)):
+        _, update = attn(
+            torch.tensor([[[value, 0.0]]]),
+            torch.tensor([1]),
+            grid,
+            torch.empty(0),
+            cache,
+            current_start=index,
+            frame_seqlen=1,
+            cache_update_policy="inference_direct",
+        )
+        causal_model.CausalWanModel._apply_cache_updates(
+            object(), [cache], [(0, update)]
+        )
+
+    assert cache["_circular_ring_start"] == 1
+    assert visible_windows[-1][0, :, 0, 0].tolist() == [2.0, 3.0]
+
+
+def test_inference_direct_cache_policy_writes_only_uncommitted_direct_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    from solarwm.backends.wan22.runtime.modeling import causal_model
+
+    attn = causal_model.CausalWanSelfAttention(
+        dim=2,
+        num_heads=1,
+        local_attn_size=2,
+        sink_size=0,
+        qk_norm=False,
+        frame_seq_length=1,
+        use_echorope=False,
+    )
+    with torch.no_grad():
+        for projection in (attn.q, attn.k, attn.v, attn.o):
+            projection.weight.copy_(torch.eye(2))
+            projection.bias.zero_()
+    monkeypatch.setattr(
+        attn,
+        "_rope_q_and_window_k",
+        lambda *, q, k_window, **_kwargs: (q, k_window, None),
+    )
+    monkeypatch.setattr(causal_model, "attention", lambda q, _k, _v: q)
+
+    cache = {
+        "k": torch.zeros((1, 2, 1, 2)),
+        "v": torch.zeros((1, 2, 1, 2)),
+        "global_end_index": 0,
+        "local_end_index": 0,
+    }
+    value = torch.tensor([[[3.0, 5.0]]])
+    _, (current_end, local_end, update) = attn(
+        value,
+        torch.tensor([1]),
+        torch.tensor([[1, 1, 1]]),
+        torch.empty(0),
+        cache,
+        current_start=0,
+        frame_seqlen=1,
+        cache_update_policy="inference_direct",
+    )
+
+    assert current_end == local_end == 1
+    assert update["action"] == "direct_insert"
+    assert cache["global_end_index"] == cache["local_end_index"] == 0
+    assert torch.equal(cache["k"][:, :1, 0], value)
+    assert torch.equal(cache["v"][:, :1, 0], value)
 
 
 class _FakeStudent:
@@ -142,11 +522,15 @@ def test_stage2_rollout_is_no_grad_chunks_then_one_gradient_replay() -> None:
     assert student.parameter.grad.abs().item() > 0
 
 
-def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4() -> None:
+@pytest.mark.parametrize("latent_frames", (6, 42))
+def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4(
+    latent_frames: int,
+) -> None:
     torch = pytest.importorskip("torch")
     student = _FakeStudent()
     allocations = {"kv": 0, "cross": 0}
     noise_shapes: list[tuple[int, ...]] = []
+    final_tiles: list[tuple[int, int, object]] = []
 
     def kv_cache(batch_size: int, *, dtype: object, device: object) -> list[dict]:
         allocations["kv"] += 1
@@ -169,7 +553,7 @@ def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4() -> None:
                 "latent_channels": 1,
                 "frame_sequence_length": 2,
             },
-            "data": {"latent_shape": [6, 1, 1, 1]},
+            "data": {"latent_shape": [latent_frames, 1, 1, 1]},
             "train": {"num_train_timesteps": 1000},
         },
         device=torch.device("cpu"),
@@ -180,6 +564,10 @@ def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4() -> None:
         allocate_kv_cache=kv_cache,
         allocate_crossattn_cache=cross_cache,
         _noise=noise,
+        _inference_direct_cache_writes=True,
+        _stage2_final_latent_tile_callback=lambda value, *, start, end: final_tiles.append(
+            (start, end, value.clone())
+        ),
     )
     generation_pass = GenerationPass(
         name="live_self_forcing_nfe4",
@@ -187,15 +575,15 @@ def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4() -> None:
         mode="autoregressive",
         solver="self_forcing",
         num_inference_steps=4,
-        rollout_latent_frames=6,
-        min_rollout_latent_frames=6,
-        fixed_plan_pixel_frames=21,
+        rollout_latent_frames=latent_frames,
+        min_rollout_latent_frames=latent_frames,
+        fixed_plan_pixel_frames=1 + 4 * (latent_frames - 1),
         variable_rollout_by_source=False,
     )
     first = torch.full((1, 1, 1, 1, 1), 9.0, dtype=torch.bfloat16)
     camera = {
-        "viewmats": torch.eye(4).repeat(1, 12, 1, 1),
-        "K": torch.eye(3).repeat(1, 12, 1, 1),
+        "viewmats": torch.eye(4).repeat(1, latent_frames * 2, 1, 1),
+        "K": torch.eye(3).repeat(1, latent_frames * 2, 1, 1),
     }
     latents, schedule = _stage2_self_forcing_latents(
         provider,
@@ -206,19 +594,120 @@ def test_stage2_generation_uses_one_persistent_cache_and_exact_nfe4() -> None:
         torch.Generator(),
     )
 
-    assert latents.shape == (1, 6, 1, 1, 1)
+    chunks = latent_frames // 3
+    assert latents.shape == (1, latent_frames, 1, 1, 1)
     assert torch.equal(latents[:, :1], first)
     assert allocations == {"kv": 1, "cross": 1}
-    assert len(student.calls) == 10
-    assert [call["cache_update_policy"] for call in student.calls].count("none") == 8
-    assert [call["cache_update_policy"] for call in student.calls].count("commit_detached") == 2
-    assert [call["current_start"] for call in student.calls] == [0] * 5 + [6] * 5
+    assert len(student.calls) == 5 * chunks
+    assert [call["cache_update_policy"] for call in student.calls].count("inference_direct") == 4 * chunks
+    assert [call["cache_update_policy"] for call in student.calls].count("commit_detached") == chunks
+    assert [call["current_start"] for call in student.calls] == [
+        start * 2 for start in range(0, latent_frames, 3) for _ in range(5)
+    ]
     assert all(call["timestep"].dtype == torch.bfloat16 for call in student.calls)
     assert torch.unique(student.calls[1]["timestep"]).tolist() == [0.0, 752.0]
-    assert torch.unique(student.calls[6]["timestep"]).tolist() == [752.0]
+    # Calls 0–4 complete chunk 0. Call 5 begins the next chunk at the
+    # schedule's first denoise timestep; the re-noised 752 value remains
+    # internal to chunk 0 and is not carried across chunk boundaries.
+    assert torch.unique(student.calls[5]["timestep"]).tolist() == [1000.0]
+    assert [(start, end) for start, end, _ in final_tiles] == [
+        (start, start + 3) for start in range(0, latent_frames, 3)
+    ]
+    assert torch.equal(torch.cat([value for _, _, value in final_tiles], dim=1), latents)
     assert schedule["timesteps"] == [1000.0, 750.0, 500.0, 250.0]
     assert schedule["persistent_kv_cache"] is True
-    assert noise_shapes == [(1, 6, 1, 1, 1)] + [(1, 3, 1, 1, 1)] * 6
+    assert noise_shapes == [(1, latent_frames, 1, 1, 1)] + [(1, 3, 1, 1, 1)] * (3 * chunks)
+
+
+def test_stage2_inference_buffers_preserve_rng_draw_shapes_and_output() -> None:
+    torch = pytest.importorskip("torch")
+
+    def generate(*, preallocated: bool) -> tuple[object, list[object]]:
+        draws: list[object] = []
+
+        def noise(shape: object, generator: object) -> object:
+            value = torch.randn(
+                tuple(int(item) for item in shape),
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
+            draws.append(value.float().clone())
+            return value
+
+        def noise_into(value: object, generator: object) -> None:
+            torch.randn(tuple(value.shape), generator=generator, out=value)
+            draws.append(value.float().clone())
+
+        provider = SimpleNamespace(
+            config={
+                "model": {
+                    "num_frame_per_block": 3,
+                    "latent_channels": 1,
+                    "frame_sequence_length": 2,
+                },
+                "data": {"latent_shape": [6, 1, 1, 1]},
+                "train": {"num_train_timesteps": 1000},
+            },
+            device=torch.device("cpu"),
+            diffusion=_FakeStudent(),
+            denoising_steps=tuple(
+                torch.tensor(value, dtype=torch.float32) for value in (1000, 750, 500, 250)
+            ),
+            allocate_kv_cache=lambda batch_size, *, dtype, device: _cache_alloc(
+                batch_size, dtype=dtype, device=device
+            ),
+            allocate_crossattn_cache=lambda batch_size, *, dtype, device: _cache_alloc(
+                batch_size, dtype=dtype, device=device
+            ),
+            _noise=noise,
+            _noise_into=noise_into,
+            _inference_direct_cache_writes=True,
+            _stage2_inference_buffers=(
+                _allocate_stage2_inference_buffers(
+                    max_latent_frames=9,
+                    chunk_latent_frames=3,
+                    channels=1,
+                    height=1,
+                    width=1,
+                    device=torch.device("cpu"),
+                )
+                if preallocated
+                else None
+            ),
+        )
+        generation_pass = GenerationPass(
+            name="live_self_forcing_nfe4",
+            weights="live",
+            mode="autoregressive",
+            solver="self_forcing",
+            num_inference_steps=4,
+            rollout_latent_frames=6,
+            min_rollout_latent_frames=6,
+            fixed_plan_pixel_frames=21,
+            variable_rollout_by_source=False,
+        )
+        latents, _ = _stage2_self_forcing_latents(
+            provider,
+            generation_pass,
+            torch.full((1, 1, 1, 1, 1), 9.0, dtype=torch.bfloat16),
+            {"prompt_embeds": torch.zeros((1, 1, 1))},
+            {
+                "viewmats": torch.eye(4).repeat(1, 12, 1, 1),
+                "K": torch.eye(3).repeat(1, 12, 1, 1),
+            },
+            torch.Generator().manual_seed(73),
+        )
+        return latents.clone(), draws
+
+    allocated_latents, allocated_draws = generate(preallocated=False)
+    reused_latents, reused_draws = generate(preallocated=True)
+
+    assert torch.equal(reused_latents, allocated_latents)
+    assert [value.shape for value in reused_draws] == [value.shape for value in allocated_draws]
+    assert all(
+        torch.equal(reused.float(), allocated.float())
+        for reused, allocated in zip(reused_draws, allocated_draws, strict=True)
+    )
 
 
 def test_stage2_generated_sample_preserves_configured_denoising_steps(
@@ -730,7 +1219,7 @@ def test_stage2_cuda_adapter_admits_multiple_logical_dp_groups(
         "build_diffusion_architecture",
         lambda _: SimpleNamespace(module=movable),
     )
-    monkeypatch.setattr(stage2, "WanTextEncoder", lambda *_: movable)
+    monkeypatch.setattr(stage2, "WanTextEncoder", lambda *_, **__: movable)
     monkeypatch.setattr(stage2, "Wan5BVAE", lambda *_: movable)
     config = {
         "model": {"family": "wan22_ti2v_5b"},

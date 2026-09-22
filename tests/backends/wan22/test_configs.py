@@ -58,6 +58,39 @@ def test_stage1_training_requires_compiled_flex_attention() -> None:
         create_backend(family="wan22_ti2v_5b").validate_config(config)
 
 
+def test_stage2_camera_inference_defaults_to_circular_kv_cache() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    assert config["inference"]["kv_cache_mode"] == "circular"
+    assert config["inference"]["max_rollout_latent_frames"] == 900
+    del config["inference"]["kv_cache_mode"]
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+def test_stage2_camera_inference_accepts_clone_kv_cache_fallback() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["inference"]["kv_cache_mode"] = "clone"
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+def test_stage2_camera_circular_kv_cache_rejects_sink() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["model"]["sink_size"] = 3
+    with pytest.raises(BackendContractError, match="sink_size"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+@pytest.mark.parametrize("maximum", (0, 20))
+def test_stage2_camera_inference_requires_chunk_aligned_buffer_capacity(maximum: int) -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["inference"]["max_rollout_latent_frames"] = maximum
+    with pytest.raises(BackendContractError, match="max_rollout_latent_frames"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
 def test_backend_factory_is_strict() -> None:
     with pytest.raises(BackendContractError, match="does not implement"):
         create_backend(family="wan22_future")
@@ -234,6 +267,10 @@ def test_stage2_camera_length_inference_selects_one_direct_model() -> None:
     assert config["inference"] == {
         "source": "validation",
         "length": "camera",
+        "kv_cache_mode": "circular",
+        "max_rollout_latent_frames": 900,
+        "stage2_xpu_vae_pipeline": True,
+        "stage2_xpu_compile_blocks": False,
         "output_layout": "dataset_triplet_v1",
         "run_id": "wan22-ti2v-5b-stage2-sgf-camera-length-inference",
     }
@@ -248,6 +285,63 @@ def test_stage2_camera_length_inference_rejects_weight_role_selection() -> None:
     config = load_config(path).mutable_copy()
     config["checkpoint"]["weights"] = "ema"
     with pytest.raises(BackendContractError, match="selects the checkpoint model automatically"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+def test_stage2_camera_length_measurements_are_opt_in_and_validated() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["runtime"]["stage2_inference_measurements"] = True
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+    config["runtime"]["stage2_inference_global_peak"] = True
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+    config["runtime"]["stage2_xpu_profiler"] = True
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    config["runtime"]["stage2_inference_measurements"] = "true"
+    with pytest.raises(BackendContractError, match="must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+def test_stage2_camera_xpu_vae_pipeline_is_opt_out_and_camera_only() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["inference"]["stage2_xpu_vae_pipeline"] = False
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    config["inference"]["stage2_xpu_vae_pipeline"] = "false"
+    with pytest.raises(BackendContractError, match="must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    fixed = load_config(EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_81f.yaml").mutable_copy()
+    fixed["inference"]["stage2_xpu_vae_pipeline"] = True
+    with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
+        create_backend(family="wan22_ti2v_5b").validate_config(fixed)
+
+
+def test_stage2_camera_xpu_block_compile_is_opt_in_and_camera_only() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    assert config["inference"]["stage2_xpu_compile_blocks"] is False
+    config["inference"]["stage2_xpu_compile_blocks"] = True
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    config["inference"]["stage2_xpu_compile_blocks"] = "true"
+    with pytest.raises(BackendContractError, match="must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    fixed = load_config(EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_81f.yaml").mutable_copy()
+    fixed["inference"]["stage2_xpu_compile_blocks"] = True
+    with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
+        create_backend(family="wan22_ti2v_5b").validate_config(fixed)
+
+
+def test_stage2_measurements_reject_non_camera_or_training_routes() -> None:
+    config = load_config(
+        EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_81f.yaml"
+    ).mutable_copy()
+    config["runtime"]["stage2_inference_measurements"] = True
+    with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
         create_backend(family="wan22_ti2v_5b").validate_config(config)
 
 
