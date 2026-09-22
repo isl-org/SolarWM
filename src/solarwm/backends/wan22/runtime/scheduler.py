@@ -86,20 +86,37 @@ class FlowMatchScheduler:
             sigmas = sigmas[:-1]
         self.sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
         self.timesteps = self.sigmas * self.num_train_timesteps
+        self._device_grids: dict[tuple[str, Any, Any], Any] = {}
         if training:
             x = self.timesteps
             weighting = torch.exp(-2 * ((x - steps / 2) / steps) ** 2)
             shifted = weighting - weighting.min()
             self.linear_timesteps_weights = shifted * (steps / shifted.sum())
 
+    def grid_on(self, name: str, *, device: Any, dtype: Any | None = None) -> Any:
+        """Return a cached device copy of one of the constant schedule grids.
+
+        The grids hold ``num_train_timesteps`` entries and never change after
+        ``set_timesteps`` builds them, but they are created on the host.
+        Re-materializing them per call costs a blocking pageable
+        host-to-device transfer on every diffusion step.
+        """
+
+        key = (name, device, dtype)
+        cached = self._device_grids.get(key)
+        if cached is None:
+            cached = getattr(self, name).to(device=device, dtype=dtype)
+            self._device_grids[key] = cached
+        return cached
+
     def _indices(self, timestep: Any, *, device: Any) -> Any:
         values = timestep.flatten() if timestep.ndim == 2 else timestep
-        schedule = self.timesteps.to(device=device)
+        schedule = self.grid_on("timesteps", device=device)
         return (schedule.unsqueeze(0) - values.unsqueeze(1)).abs().argmin(dim=1)
 
     def add_noise(self, clean: Any, noise: Any, timestep: Any) -> Any:
         indices = self._indices(timestep, device=noise.device)
-        sigma = self.sigmas.to(noise.device)[indices].reshape(-1, 1, 1, 1)
+        sigma = self.grid_on("sigmas", device=noise.device)[indices].reshape(-1, 1, 1, 1)
         return ((1 - sigma) * clean + sigma * noise).type_as(noise)
 
     @staticmethod
@@ -109,7 +126,7 @@ class FlowMatchScheduler:
 
     def training_weight(self, timestep: Any) -> Any:
         indices = self._indices(timestep, device=timestep.device)
-        return self.linear_timesteps_weights.to(timestep.device)[indices]
+        return self.grid_on("linear_timesteps_weights", device=timestep.device)[indices]
 
 
 __all__ = ["FlowMatchScheduler", "build_wan_flow_unipc_scheduler"]

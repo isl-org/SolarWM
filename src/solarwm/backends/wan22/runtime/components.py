@@ -174,6 +174,7 @@ class Wan5BVAE:
 
         self._mean = torch.tensor(self.mean, dtype=torch.float32)
         self._std = torch.tensor(self.std, dtype=torch.float32)
+        self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         try:
             self.module = (
                 _video_vae(
@@ -192,10 +193,33 @@ class Wan5BVAE:
         return self
 
     def _scale(self, reference: Any) -> list[Any]:
-        return [
-            self._mean.to(device=reference.device, dtype=reference.dtype),
-            1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
-        ]
+        """Return the per-channel centre and inverse standard deviation.
+
+        Both grids are host constants, so rebuilding them per call costs a
+        blocking host-to-device transfer on every encode and decode.  They are
+        cached instead, keyed on the ambient autocast state as well as the
+        reference device and dtype: ``1.0 / std`` is promoted to fp32 under
+        autocast but stays in the reference dtype outside it, so the autocast
+        state changes the result and must take part in the key.
+        """
+
+        import torch
+
+        device_type = reference.device.type
+        key = (
+            reference.device,
+            reference.dtype,
+            torch.is_autocast_enabled(device_type),
+            torch.get_autocast_dtype(device_type),
+        )
+        cached = self._scale_cache.get(key)
+        if cached is None:
+            cached = (
+                self._mean.to(device=reference.device, dtype=reference.dtype),
+                1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
+            )
+            self._scale_cache[key] = cached
+        return [cached[0], cached[1]]
 
     def encode(self, pixels_bcthw: Any) -> Any:
         import torch
@@ -342,6 +366,7 @@ class WanA14BVAE:
 
         self._mean = torch.tensor(self.mean, dtype=torch.float32)
         self._std = torch.tensor(self.std, dtype=torch.float32)
+        self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         try:
             state = torch.load(
                 str(weights),
@@ -378,10 +403,33 @@ class WanA14BVAE:
         return self
 
     def _scale(self, reference: Any) -> list[Any]:
-        return [
-            self._mean.to(device=reference.device, dtype=reference.dtype),
-            1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
-        ]
+        """Return the per-channel centre and inverse standard deviation.
+
+        Both grids are host constants, so rebuilding them per call costs a
+        blocking host-to-device transfer on every encode and decode.  They are
+        cached instead, keyed on the ambient autocast state as well as the
+        reference device and dtype: ``1.0 / std`` is promoted to fp32 under
+        autocast but stays in the reference dtype outside it, so the autocast
+        state changes the result and must take part in the key.
+        """
+
+        import torch
+
+        device_type = reference.device.type
+        key = (
+            reference.device,
+            reference.dtype,
+            torch.is_autocast_enabled(device_type),
+            torch.get_autocast_dtype(device_type),
+        )
+        cached = self._scale_cache.get(key)
+        if cached is None:
+            cached = (
+                self._mean.to(device=reference.device, dtype=reference.dtype),
+                1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
+            )
+            self._scale_cache[key] = cached
+        return [cached[0], cached[1]]
 
     def encode(self, pixels_bcthw: Any) -> Any:
         import torch
@@ -602,8 +650,12 @@ class WanDiffusion:
         original_dtype = flow.dtype
         flat_noisy = noisy.flatten(0, 1).double()
         flat_flow = flow.flatten(0, 1).double()
-        schedule_timesteps = self.scheduler.timesteps.to(device=noisy.device, dtype=torch.float64)
-        schedule_sigmas = self.scheduler.sigmas.to(device=noisy.device, dtype=torch.float64)
+        schedule_timesteps = self.scheduler.grid_on(
+            "timesteps", device=noisy.device, dtype=torch.float64
+        )
+        schedule_sigmas = self.scheduler.grid_on(
+            "sigmas", device=noisy.device, dtype=torch.float64
+        )
         timestep_ids = (
             (schedule_timesteps.unsqueeze(0) - timestep.flatten().double().unsqueeze(1))
             .abs()
