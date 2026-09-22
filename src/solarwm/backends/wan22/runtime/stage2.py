@@ -1094,6 +1094,24 @@ def _generation_steps(provider: Any) -> tuple[Any, ...]:
     )
 
 
+def _stage2_xpu_vae_pipeline_enabled(
+    provider: Any, *, output_latent_frames: int, rollout_latent_frames: int
+) -> bool:
+    """Limit overlap to the validated standalone camera XPU route."""
+
+    config = provider.config
+    inference = config.get("inference", {})
+    return bool(
+        getattr(provider.device, "type", None) == "xpu"
+        and str(config.get("action", "")).strip().lower() == "infer"
+        and str(inference.get("length", "fixed")).strip().lower() == "camera"
+        and bool(inference.get("stage2_xpu_vae_pipeline", True))
+        and int(output_latent_frames) == int(rollout_latent_frames)
+        and 1 + 4 * (int(output_latent_frames) - 1) <= _FILE_STREAMING_PIXEL_THRESHOLD
+        and callable(getattr(provider.vae, "streaming_decode_session", None))
+    )
+
+
 def _stage2_self_forcing_latents(
     provider: Any,
     generation_pass: Any,
@@ -1129,17 +1147,25 @@ def _stage2_self_forcing_latents(
     latent_height = int(provider.config["data"]["latent_shape"][-2])
     latent_width = int(provider.config["data"]["latent_shape"][-1])
     frame_tokens = int(provider.config["model"]["frame_sequence_length"])
-    output = torch.zeros(
-        1,
-        latent_frames,
-        channels,
-        latent_height,
-        latent_width,
-        device=provider.device,
-        dtype=torch.bfloat16,
+    buffers = _stage2_inference_buffer_views(
+        provider, latent_frames=latent_frames, chunk_latent_frames=chunk
     )
+    if buffers is None:
+        output = torch.zeros(
+            1,
+            latent_frames,
+            channels,
+            latent_height,
+            latent_width,
+            device=provider.device,
+            dtype=torch.bfloat16,
+        )
+        initial_noise = provider._noise(tuple(output.shape), generator)
+        denoise_noise = None
+    else:
+        output, initial_noise, denoise_noise = buffers
+        provider._noise_into(initial_noise, generator)
     output[:, 0] = first_latent[:, 0]
-    initial_noise = provider._noise(tuple(output.shape), generator)
     initial_noise[:, 0] = first_latent[:, 0]
     steps = _generation_steps(provider)
     if len(steps) != 4:
@@ -1148,104 +1174,142 @@ def _stage2_self_forcing_latents(
     # rollout, so resolving it here (one host/device sync) removes a ``.item()`` sync from
     # inside the per-chunk, per-denoise-step hot loop below.
     step_values = [float(step.item()) for step in steps]
+    # Only the standalone adapter owns an inference-only cache.  Its non-rolling denoise
+    # forwards may fill their uncommitted slots directly; the detached commit overwrites
+    # those slots and is the sole operation that advances cache indices.  Training
+    # validation retains the clone-and-defer behavior.
+    denoise_cache_policy = (
+        "inference_direct"
+        if bool(getattr(provider, "_inference_direct_cache_writes", False))
+        else "none"
+    )
     kv_cache = provider.allocate_kv_cache(1, dtype=output.dtype, device=provider.device)
     crossattn_cache = provider.allocate_crossattn_cache(
         1, dtype=output.dtype, device=provider.device
     )
     if kv_cache and "_fused_prope_camera_metadata" not in kv_cache[0]:
         raise BackendContractError("Stage2 generation requires preallocated fused camera metadata")
+    latent_tile_callback = getattr(provider, "_stage2_final_latent_tile_callback", None)
     # Accumulate finiteness with a device-side reduction instead of syncing after every
     # chunk; only the final check (after the loop) forces a host/device sync.
     finite_ok = torch.ones((), dtype=torch.bool, device=provider.device)
+    profiler = getattr(provider, "_stage2_xpu_profiler", None)
     try:
         for start in range(0, latent_frames, chunk):
             end = start + chunk
-            # ``initial_noise[:, start:end]`` for distinct chunks never overlaps and
-            # ``initial_noise`` itself is not read again after this loop, so aliasing the
-            # slice instead of cloning it is safe under the enclosing ``no_grad()``.
-            latents = initial_noise[:, start:end]
-            camera_chunk = _slice_camera(
-                camera,
-                start_frame=start,
-                end_frame=end,
-                frame_sequence_length=frame_tokens,
-            )
-            for step_index, step_value in enumerate(step_values):
-                timestep = torch.full(
-                    (1, chunk),
-                    step_value,
-                    device=provider.device,
-                    dtype=output.dtype,
+            chunk_index = start // chunk
+            if profiler is not None:
+                profiler.begin(case_slot=0, chunk_index=chunk_index)
+            with (
+                _measurement_phase(
+                    provider,
+                    "rollout_chunk",
+                    synchronize=latent_tile_callback is None,
+                    chunk_index=chunk_index,
+                    latent_start=start,
+                    latent_end=end,
+                ),
+            ):
+                # ``initial_noise[:, start:end]`` for distinct chunks never overlaps and
+                # ``initial_noise`` itself is not read again after this loop, so aliasing the
+                # slice instead of cloning it is safe under the enclosing ``no_grad()``.
+                latents = initial_noise[:, start:end]
+                camera_chunk = _slice_camera(
+                    camera,
+                    start_frame=start,
+                    end_frame=end,
+                    frame_sequence_length=frame_tokens,
                 )
-                if start == 0:
-                    timestep[:, 0] = 0.0
-                with torch.autocast(
-                    device_type=provider.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=provider.device.type in ("cuda", "xpu"),
+                for step_index, step_value in enumerate(step_values):
+                    timestep = torch.full(
+                        (1, chunk),
+                        step_value,
+                        device=provider.device,
+                        dtype=output.dtype,
+                    )
+                    if start == 0:
+                        timestep[:, 0] = 0.0
+                    with torch.autocast(
+                        device_type=provider.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=provider.device.type in ("cuda", "xpu"),
+                    ):
+                        flow = provider.diffusion(
+                            latents,
+                            condition,
+                            camera_chunk,
+                            expand_timesteps_to_tokens(timestep, frame_tokens),
+                            sequence_length=chunk * frame_tokens,
+                            kv_cache=kv_cache,
+                            crossattn_cache=crossattn_cache,
+                            current_start=start * frame_tokens,
+                            cache_start=0,
+                            cache_update_policy=denoise_cache_policy,
+                        )
+                        x0 = provider.diffusion.flow_to_x0(latents, flow, timestep)
+                    if start == 0:
+                        x0 = _restore_first(x0, first_latent, start_frame=0)
+                    if step_index + 1 < len(step_values):
+                        next_timestep = torch.full(
+                            (1, chunk),
+                            step_values[step_index + 1],
+                            device=provider.device,
+                            dtype=torch.float32,
+                        )
+                        if start == 0:
+                            next_timestep[:, 0] = 0.0
+                        if denoise_noise is None:
+                            renoise = provider._noise(tuple(x0.shape), generator)
+                        else:
+                            # Fill an exact-shaped view, so random draws retain the
+                            # allocation-based sampler's call order and shapes.
+                            provider._noise_into(denoise_noise, generator)
+                            renoise = denoise_noise
+                        latents = (
+                            provider.diffusion.scheduler.add_noise(
+                                x0.flatten(0, 1).float(),
+                                renoise.flatten(0, 1).float(),
+                                next_timestep.flatten(0, 1),
+                            )
+                            .unflatten(0, (1, chunk))
+                            .to(output.dtype)
+                        )
+                        if start == 0:
+                            latents = _restore_first(latents, first_latent, start_frame=0)
+                    else:
+                        latents = x0
+                finite_ok = finite_ok & torch.isfinite(latents).all()
+                output[:, start:end] = latents
+                commit_timestep = torch.zeros(
+                    (1, chunk), device=provider.device, dtype=output.dtype
+                )
+                with (
+                    torch.no_grad(),
+                    torch.autocast(
+                        device_type=provider.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=provider.device.type in ("cuda", "xpu"),
+                    ),
                 ):
-                    flow = provider.diffusion(
+                    provider.diffusion(
                         latents,
                         condition,
                         camera_chunk,
-                        expand_timesteps_to_tokens(timestep, frame_tokens),
+                        expand_timesteps_to_tokens(commit_timestep, frame_tokens),
                         sequence_length=chunk * frame_tokens,
                         kv_cache=kv_cache,
                         crossattn_cache=crossattn_cache,
                         current_start=start * frame_tokens,
                         cache_start=0,
-                        cache_update_policy="none",
+                        cache_update_policy="commit_detached",
                     )
-                    x0 = provider.diffusion.flow_to_x0(latents, flow, timestep)
-                if start == 0:
-                    x0 = _restore_first(x0, first_latent, start_frame=0)
-                if step_index + 1 < len(step_values):
-                    next_timestep = torch.full(
-                        (1, chunk),
-                        step_values[step_index + 1],
-                        device=provider.device,
-                        dtype=torch.float32,
-                    )
-                    if start == 0:
-                        next_timestep[:, 0] = 0.0
-                    renoise = provider._noise(tuple(x0.shape), generator)
-                    latents = (
-                        provider.diffusion.scheduler.add_noise(
-                            x0.flatten(0, 1).float(),
-                            renoise.flatten(0, 1).float(),
-                            next_timestep.flatten(0, 1),
-                        )
-                        .unflatten(0, (1, chunk))
-                        .to(output.dtype)
-                    )
-                    if start == 0:
-                        latents = _restore_first(latents, first_latent, start_frame=0)
-                else:
-                    latents = x0
-            finite_ok = finite_ok & torch.isfinite(latents).all()
-            output[:, start:end] = latents
-            commit_timestep = torch.zeros((1, chunk), device=provider.device, dtype=output.dtype)
-            with (
-                torch.no_grad(),
-                torch.autocast(
-                    device_type=provider.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=provider.device.type in ("cuda", "xpu"),
-                ),
-            ):
-                provider.diffusion(
-                    latents,
-                    condition,
-                    camera_chunk,
-                    expand_timesteps_to_tokens(commit_timestep, frame_tokens),
-                    sequence_length=chunk * frame_tokens,
-                    kv_cache=kv_cache,
-                    crossattn_cache=crossattn_cache,
-                    current_start=start * frame_tokens,
-                    cache_start=0,
-                    cache_update_policy="commit_detached",
-                )
+                if callable(latent_tile_callback):
+                    latent_tile_callback(output[:, start:end], start=start, end=end)
+            if profiler is not None:
+                profiler.end(chunk_index=chunk_index)
     finally:
+        if profiler is not None:
+            profiler.end(chunk_index=-1, force=True)
         del kv_cache, crossattn_cache
     if not bool(finite_ok.item()):
         raise BackendContractError("Stage2 generation rollout produced non-finite latents")
@@ -1302,6 +1366,22 @@ def _stage2_generated_sample(
     )
     if generation_pass.mode != "autoregressive":
         raise BackendContractError("Stage2 self forcing requires autoregressive mode")
+    output_latent_frames = int(
+        metadata.get("output_rollout_latent_frames", generation_pass.rollout_latent_frames)
+    )
+    pipeline: _Stage2XpuVaePipeline | None = None
+    if _stage2_xpu_vae_pipeline_enabled(
+        provider,
+        output_latent_frames=output_latent_frames,
+        rollout_latent_frames=generation_pass.rollout_latent_frames,
+    ):
+        pipeline = _Stage2XpuVaePipeline(
+            vae=provider.vae,
+            device=provider.device,
+            height=int(provider.config["data"]["height"]),
+            width=int(provider.config["data"]["width"]),
+            chunk_latent_frames=int(provider.config["model"]["num_frame_per_block"]),
+        )
     rng = torch.Generator(device=provider.device)
     rng.manual_seed(int(case.noise_seed))
     first, condition, camera, model_y = provider._conditions(
@@ -1309,21 +1389,35 @@ def _stage2_generated_sample(
     )
     if model_y is not None:
         raise BackendContractError("Stage2 TI2V generation may not receive I2V y")
-    with torch.no_grad():
-        latents, schedule = _stage2_self_forcing_latents(
-            provider,
-            generation_pass,
-            first,
-            condition,
-            camera,
-            rng,
-        )
-        output_latent_frames = int(
-            metadata.get(
-                "output_rollout_latent_frames",
-                generation_pass.rollout_latent_frames,
+    previous_callback = getattr(provider, "_stage2_final_latent_tile_callback", None)
+    try:
+        with (pipeline if pipeline is not None else nullcontext()):
+            if pipeline is not None:
+                provider._stage2_final_latent_tile_callback = pipeline.submit
+            with torch.no_grad():
+                latents, schedule = _stage2_self_forcing_latents(
+                    provider,
+                    generation_pass,
+                    first,
+                    condition,
+                    camera,
+                    rng,
+                )
+            decoded_from_pipeline = (
+                pipeline.finish(expected_latent_frames=output_latent_frames)
+                if pipeline is not None
+                else None
             )
-        )
+            if pipeline is not None:
+                measurements = getattr(provider, "_stage2_measurements", None)
+                if measurements is not None:
+                    measurements.record("vae_pipeline", **pipeline.measurements())
+    finally:
+        if previous_callback is None:
+            provider.__dict__.pop("_stage2_final_latent_tile_callback", None)
+        else:
+            provider._stage2_final_latent_tile_callback = previous_callback
+    with torch.no_grad():
         output_latents = latents[:, :output_latent_frames].contiguous()
         prepared = provider._prepared.get(case.slot)
         if prepared is None:
@@ -1390,6 +1484,9 @@ def _stage2_generated_sample(
                 fps=float(provider.config["data"].get("fps", 16.0)),
                 temporary_root=runtime_output.resolve().parent,
                 chunk_latent_frames=_FILE_STREAMING_VAE_LATENT_CHUNK,
+                measure_phase=lambda name, **metadata: _measurement_phase(
+                    provider, name, case_slot=int(case.slot), **metadata
+                ),
             )
             artifacts: dict[str, Any] = {
                 "compare.mp4": streamed.compare,
@@ -1411,12 +1508,26 @@ def _stage2_generated_sample(
             # instead of switching to a horizon-dependent single-shot decode below
             # _STREAMING_VAE_LATENT_CHUNK.
             chunk_latent_frames = min(_STREAMING_VAE_LATENT_CHUNK, output_latent_frames)
-            decoded = provider.vae.decode_streaming(
-                output_latents,
-                chunk_latent_frames=chunk_latent_frames,
-            )
+            if decoded_from_pipeline is None:
+                with _measurement_phase(
+                    provider, "vae_decode", case_slot=int(case.slot), mode="streaming"
+                ):
+                    decoded = provider.vae.decode_streaming(
+                        output_latents,
+                        chunk_latent_frames=chunk_latent_frames,
+                    )
+                compare_decoded = decoded
+                decoded_is_uint8 = False
+            else:
+                decoded = decoded_from_pipeline.video
+                compare_decoded = decoded_from_pipeline.compare
+                decoded_is_uint8 = True
             vae_decode = {
-                "mode": "continuous_cached_tiles",
+                "mode": (
+                    "continuous_cached_xpu_pipeline_tiles"
+                    if decoded_from_pipeline is not None
+                    else "continuous_cached_tiles"
+                ),
                 "chunk_latent_frames": chunk_latent_frames,
             }
             if int(decoded.shape[1]) != model_output_pixel_frames:
@@ -1441,6 +1552,10 @@ def _stage2_generated_sample(
             tail_pad_frames = max(target_pixel_frames - int(decoded.shape[1]), 0)
             if trim_frames:
                 decoded = decoded[:, :target_pixel_frames].contiguous()
+                if decoded_is_uint8:
+                    compare_decoded = compare_decoded[:, :target_pixel_frames].contiguous()
+                else:
+                    compare_decoded = decoded
             elif tail_pad_frames:
                 tail = decoded[:, -1:].expand(
                     -1,
@@ -1450,16 +1565,41 @@ def _stage2_generated_sample(
                     -1,
                 )
                 decoded = torch.cat((decoded, tail), dim=1).contiguous()
-            video = (
-                encoder(decoded, fps=float(provider.config["data"].get("fps", 16.0)))
-                if callable(encoder)
-                else _encode_mp4(decoded, fps=float(provider.config["data"].get("fps", 16.0)))
-            )
-            compare = _encode_compare_mp4(
-                decoded,
-                prepared,
-                fps=float(provider.config["data"].get("fps", 16.0)),
-            )
+                if decoded_is_uint8:
+                    compare_tail = compare_decoded[:, -1:].expand(
+                        -1,
+                        tail_pad_frames,
+                        -1,
+                        -1,
+                        -1,
+                    )
+                    compare_decoded = torch.cat(
+                        (compare_decoded, compare_tail), dim=1
+                    ).contiguous()
+                else:
+                    compare_decoded = decoded
+            with _measurement_phase(
+                provider, "mp4_encode", case_slot=int(case.slot), artifact="video.mp4"
+            ):
+                video = (
+                    encoder(
+                        decoded.float().mul_(1.0 / 127.5).sub_(1.0)
+                        if decoded_is_uint8
+                        else decoded,
+                        fps=float(provider.config["data"].get("fps", 16.0)),
+                    )
+                    if callable(encoder)
+                    else _encode_mp4(decoded, fps=float(provider.config["data"].get("fps", 16.0)))
+                )
+            with _measurement_phase(
+                provider, "mp4_encode", case_slot=int(case.slot), artifact="compare.mp4"
+            ):
+                compare = _encode_compare_mp4(
+                    compare_decoded,
+                    prepared,
+                    fps=float(provider.config["data"].get("fps", 16.0)),
+                    generated_uint8=decoded_is_uint8,
+                )
             artifacts = {
                 "compare.mp4": compare,
                 "video.mp4": video,
@@ -2213,6 +2353,18 @@ class Wan5BStage2Runtime:
         self._broadcast(value)
         return value
 
+    def _noise_into(self, value: Any, generator: Any) -> None:
+        """Fill preallocated inference storage without changing RNG draw semantics."""
+
+        import torch
+
+        torch.randn(
+            tuple(int(item) for item in value.shape),
+            generator=generator,
+            out=value,
+        )
+        self._broadcast(value)
+
     def build_cases(self, plan: Any) -> tuple[Any, ...]:
         # Case materialization is deliberately reused byte-for-byte from the
         # common Wan adapter. Only the diffusion sampler is Stage2-specific.
@@ -2258,7 +2410,7 @@ class Wan5BStage2Runtime:
     def allocate_kv_cache(
         self, batch_size: int, *, dtype: Any, device: Any
     ) -> list[dict[str, Any]]:
-        """Allocate the six-chunk no-sink cache and camera metadata up front."""
+        """Allocate the no-sink cache and fused-camera metadata up front."""
 
         if self._kv_cache_allocator is not None:
             return self._kv_cache_allocator(batch_size, dtype=dtype, device=device)
@@ -2273,11 +2425,18 @@ class Wan5BStage2Runtime:
         head_dim = dim // num_heads
         cache_frames = int(self.config["model"]["local_attn_size"])
         cache_tokens = cache_frames * int(self.config["model"]["frame_sequence_length"])
+        inference = self.config.get("inference", {})
+        circular = (
+            str(self.config.get("action", "")).strip().lower() == "infer"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera"
+            and str(inference.get("kv_cache_mode", "circular")).strip().lower() == "circular"
+        )
+        physical_cache_tokens = cache_tokens * 2 if circular else cache_tokens
         caches = [
             {
                 "k": torch.zeros(
                     batch_size,
-                    cache_tokens,
+                    physical_cache_tokens,
                     num_heads,
                     head_dim,
                     dtype=dtype,
@@ -2285,21 +2444,28 @@ class Wan5BStage2Runtime:
                 ),
                 "v": torch.zeros(
                     batch_size,
-                    cache_tokens,
+                    physical_cache_tokens,
                     num_heads,
                     head_dim,
                     dtype=dtype,
                     device=device,
                 ),
-                "global_end_index": torch.zeros(1, dtype=torch.long, device=device),
-                "local_end_index": torch.zeros(1, dtype=torch.long, device=device),
+                "global_end_index": 0,
+                "local_end_index": 0,
             }
             for _ in blocks
         ]
+        if circular:
+            for cache in caches:
+                # Host-only pointer state intentionally avoids accelerator
+                # scalar synchronization in the generation hot path.
+                cache["_circular_kv_cache"] = True
+                cache["_circular_capacity"] = cache_tokens
+                cache["_circular_ring_start"] = 0
         caches[0]["_fused_prope_camera_metadata"] = {
             "viewmats": torch.zeros(
                 batch_size,
-                cache_tokens,
+                physical_cache_tokens,
                 4,
                 4,
                 dtype=torch.float32,
@@ -2307,7 +2473,7 @@ class Wan5BStage2Runtime:
             ),
             "K": torch.zeros(
                 batch_size,
-                cache_tokens,
+                physical_cache_tokens,
                 3,
                 3,
                 dtype=torch.float32,
@@ -2924,6 +3090,17 @@ class CudaWanStage2GenerationAdapter:
                 )
                 self.is_writer = int(self.topology.sp_rank) == 0
                 self.device = resolve_device(values, int(self.topology.local_rank))
+                self._stage2_measurements = _Stage2InferenceMeasurements(
+                    values,
+                    device=self.device,
+                    rank=int(self.topology.raw_rank),
+                    torch_module=torch,
+                )
+                self._stage2_xpu_profiler = _Stage2XpuProfiler(
+                    values,
+                    device=self.device,
+                    rank=int(self.topology.raw_rank),
+                )
                 (
                     self.checkpoint_path,
                     checkpoint_manifest_id,
@@ -2945,19 +3122,39 @@ class CudaWanStage2GenerationAdapter:
                 if self.device.type == "xpu":
                     # UMT5-XXL (~11 GiB) plus the diffusion stack exceeds 32 GiB XPU cards.
                     encoder_device = torch.device("cpu")
-                    encoder_dtype = torch.float32
+                    encoder_dtype = torch.bfloat16
                 # Load the text encoder before allocating the diffusion weights on XPU.
-                self.text_encoder = WanTextEncoder(layout.text_encoder, layout.tokenizer)
-                self.text_encoder.to(encoder_device, dtype=encoder_dtype)
-                self.diffusion = build_diffusion_architecture(values)
-                self.diffusion.module.eval().requires_grad_(False).to(
-                    device=self.device, dtype=inference_dtype
+                with self._stage2_measurements.phase("model_load"):
+                    self.text_encoder = WanTextEncoder(
+                        layout.text_encoder,
+                        layout.tokenizer,
+                        dtype=encoder_dtype,
+                    )
+                    self.text_encoder.to(encoder_device, dtype=encoder_dtype)
+                    self.diffusion = build_diffusion_architecture(values)
+                    self.diffusion.module.eval().requires_grad_(False).to(
+                        device=self.device, dtype=inference_dtype
+                    )
+                    self.vae = Wan5BVAE(layout.vae)
+                    self.vae.to(self.device, dtype=inference_dtype)
+                self._stage2_inference_buffers = (
+                    _allocate_stage2_inference_buffers(
+                        max_latent_frames=int(
+                            values["inference"]["max_rollout_latent_frames"]
+                        ),
+                        chunk_latent_frames=int(values["model"]["num_frame_per_block"]),
+                        channels=int(values["model"]["latent_channels"]),
+                        height=int(values["data"]["latent_shape"][-2]),
+                        width=int(values["data"]["latent_shape"][-1]),
+                        device=self.device,
+                    )
+                    if self._direct_model
+                    else None
                 )
-                self.vae = Wan5BVAE(layout.vae)
-                self.vae.to(self.device, dtype=inference_dtype)
                 self._loaded_role: str | None = None
                 self._prepared: dict[int, Any] = {}
                 self._deferred_camera_inputs = None
+                self._inference_direct_cache_writes = True
 
             @staticmethod
             def _root(module: Any) -> Any:
@@ -2972,6 +3169,32 @@ class CudaWanStage2GenerationAdapter:
                 if role == "model" and self._direct_model:
                     return super()._checkpoint_state_field(str(self._model_weight_role))
                 return super()._checkpoint_state_field(role)
+
+            def _load_role(self, role: str) -> None:
+                if self._loaded_role == role:
+                    return
+                with self._stage2_measurements.phase("weight_load", weight_role=role):
+                    super()._load_role(role)
+                if _stage2_xpu_compile_blocks_enabled(self.config):
+                    with self._stage2_measurements.phase(
+                        "compile_transformer_blocks",
+                        weight_role=role,
+                    ):
+                        _compile_stage2_xpu_transformer_blocks(
+                            self.diffusion,
+                            device=self.device,
+                        )
+
+            def _conditions(
+                self, case: Any, *, latent_frames: int
+            ) -> tuple[Any, Mapping[str, Any], Mapping[str, Any], Any | None]:
+                with self._stage2_measurements.phase(
+                    "conditions", case_slot=int(case.slot), latent_frames=int(latent_frames)
+                ):
+                    return super()._conditions(case, latent_frames=latent_frames)
+
+            def _noise_into(self, value: Any, generator: Any) -> None:
+                Wan5BStage2Runtime._noise_into(self, value, generator)
 
             def allocate_kv_cache(
                 self, batch_size: int, *, dtype: Any, device: Any
@@ -3017,7 +3240,84 @@ class CudaWanStage2GenerationAdapter:
                 finally:
                     self._prepared.pop(case.slot, None)
 
+            def close(self) -> None:
+                try:
+                    self._stage2_measurements.write_report()
+                finally:
+                    super().close()
+
         return _Adapter(config, plan)
+
+
+def _stage2_xpu_compile_blocks_enabled(config: Mapping[str, Any]) -> bool:
+    """Return the explicitly opt-in Stage2 XPU block compiler setting."""
+
+    inference = config.get("inference", {})
+    return bool(inference.get("stage2_xpu_compile_blocks", False)) if isinstance(
+        inference, Mapping
+    ) else False
+
+
+# Measured ceiling on distinct Dynamo variants per compiled block on the
+# circular camera rollout, with headroom over the 11 observed states.
+_STAGE2_XPU_DYNAMO_VARIANTS = 32
+
+
+def _compile_stage2_xpu_transformer_blocks(diffusion: Any, *, device: Any) -> None:
+    """Wrap Stage2 transformer blocks with ``torch.compile`` after weight loading.
+
+    This intentionally targets individual blocks, rather than the diffusion
+    wrapper or complete pipeline.  The latter would capture VAE/text/host I/O
+    paths and makes failures difficult to localize.  ``torch.compile`` is
+    lazy, so compiler failures during the first denoise forward intentionally
+    propagate to the caller; opt-in compilation never silently falls back.
+    """
+
+    import torch
+
+    if torch.device(device).type != "xpu":
+        raise BackendContractError(
+            "inference.stage2_xpu_compile_blocks requires inference.device=xpu"
+        )
+    dynamo = getattr(torch, "_dynamo", None)
+    dynamo_config = getattr(dynamo, "config", None)
+    if bool(getattr(dynamo_config, "suppress_errors", False)):
+        raise BackendContractError(
+            "inference.stage2_xpu_compile_blocks requires torch._dynamo.config."
+            "suppress_errors=false; refusing a silent eager fallback"
+        )
+    module = diffusion.module
+    blocks = getattr(module, "blocks", None)
+    if not isinstance(blocks, torch.nn.ModuleList) or not blocks:
+        raise BackendContractError("Stage2 diffusion model has no transformer blocks to compile")
+    if bool(getattr(module, "_solarwm_stage2_xpu_blocks_compiled", False)):
+        return
+    # The circular rollout produces a *bounded* set of variants, not an
+    # unbounded one: capacity 7290 advancing 1215 tokens per chunk gives 6
+    # `ring_start` residues, `local_end_index` saturates, and
+    # `cache_update_policy` contributes 2 -- 11 distinct states measured over
+    # 14 chunks, and 11 for any horizon. Dynamo's default limit of 8 is just
+    # below that, so self-attention alone fell back to eager after chunk 3.
+    # Raise the ceiling past the known bound rather than leaving the hottest
+    # code object interpreted.
+    if dynamo_config is not None:
+        if int(getattr(dynamo_config, "cache_size_limit", 0)) < _STAGE2_XPU_DYNAMO_VARIANTS:
+            dynamo_config.cache_size_limit = _STAGE2_XPU_DYNAMO_VARIANTS
+        accumulated = int(getattr(dynamo_config, "accumulated_cache_size_limit", 0))
+        if accumulated < _STAGE2_XPU_DYNAMO_VARIANTS * len(blocks):
+            dynamo_config.accumulated_cache_size_limit = _STAGE2_XPU_DYNAMO_VARIANTS * len(blocks)
+    try:
+        # `dynamic=False` keeps the known fixed camera rollout shapes specialized.
+        # current_start remains a Python integer and may produce per-offset
+        # variants; that is preferable to widening the complete model graph.
+        compiled = [torch.compile(block, dynamic=False) for block in blocks]
+    except Exception as exc:
+        raise BackendContractError(
+            "Stage2 XPU transformer-block compilation failed before modifying the model: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    module.blocks = torch.nn.ModuleList(compiled)
+    module._solarwm_stage2_xpu_blocks_compiled = True
 
 
 def build_stage2_generation_provider(config: Mapping[str, Any]) -> Any:

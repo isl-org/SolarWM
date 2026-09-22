@@ -22,17 +22,24 @@ from .scheduler import FlowMatchScheduler
 class WanTextEncoder:
     """Frozen UMT5-XXL encoder with the model tokenization contract."""
 
-    def __init__(self, weights: str | Path, tokenizer: str | Path) -> None:
+    def __init__(
+        self,
+        weights: str | Path,
+        tokenizer: str | Path,
+        *,
+        dtype: Any | None = None,
+    ) -> None:
         import torch
 
         from .modeling.t5 import umt5_xxl
         from .modeling.tokenizers import HuggingfaceTokenizer
 
+        module_dtype = torch.float32 if dtype is None else dtype
         self.module = (
             umt5_xxl(
                 encoder_only=True,
                 return_tokenizer=False,
-                dtype=torch.float32,
+                dtype=module_dtype,
                 device=torch.device("cpu"),
             )
             .eval()
