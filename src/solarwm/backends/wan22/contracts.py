@@ -218,6 +218,107 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             _int(validation_cache_max_gib, "runtime.validation_cache_max_gib") > 0,
             "runtime.validation_cache_max_gib must be positive",
         )
+    measurements = runtime.get("stage2_inference_measurements", False)
+    _require(
+        isinstance(measurements, bool),
+        "runtime.stage2_inference_measurements must be boolean",
+    )
+    global_peak = runtime.get("stage2_inference_global_peak", False)
+    _require(
+        isinstance(global_peak, bool),
+        "runtime.stage2_inference_global_peak must be boolean",
+    )
+    _require(
+        not global_peak or measurements,
+        "runtime.stage2_inference_global_peak requires runtime.stage2_inference_measurements=true",
+    )
+    profiler = runtime.get("stage2_xpu_profiler", False)
+    _require(
+        isinstance(profiler, bool),
+        "runtime.stage2_xpu_profiler must be boolean",
+    )
+    profiler_start_chunk = _int(runtime.get("stage2_xpu_profiler_start_chunk", 4), "runtime.stage2_xpu_profiler_start_chunk")
+    profiler_end_chunk = _int(runtime.get("stage2_xpu_profiler_end_chunk", 8), "runtime.stage2_xpu_profiler_end_chunk")
+    _require(
+        profiler_start_chunk >= 0 and profiler_end_chunk >= profiler_start_chunk,
+        "runtime.stage2_xpu_profiler chunk range must be non-negative and ordered",
+    )
+    if measurements:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_inference_measurements is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    if profiler:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_xpu_profiler is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    inference = _mapping(config, "inference")
+    vae_pipeline = inference.get("stage2_xpu_vae_pipeline", True)
+    _require(
+        isinstance(vae_pipeline, bool),
+        "inference.stage2_xpu_vae_pipeline must be boolean",
+    )
+    if "stage2_xpu_vae_pipeline" in inference:
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "inference.stage2_xpu_vae_pipeline is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    compile_blocks = inference.get("stage2_xpu_compile_blocks", False)
+    _require(
+        isinstance(compile_blocks, bool),
+        "inference.stage2_xpu_compile_blocks must be boolean",
+    )
+    if compile_blocks:
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "inference.stage2_xpu_compile_blocks is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    cache_mode = str(inference.get("kv_cache_mode", "circular")).strip().lower()
+    if (
+        str(config.get("action", "")).strip().lower() == "infer"
+        and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+        and str(inference.get("length", "fixed")).strip().lower() == "camera"
+    ):
+        max_rollout_latent_frames = _int(
+            inference.get("max_rollout_latent_frames", 0),
+            "inference.max_rollout_latent_frames",
+        )
+        _require(
+            cache_mode in {"circular", "clone"},
+            "inference.kv_cache_mode must be circular or clone",
+        )
+        _require(
+            max_rollout_latent_frames > 0,
+            "camera-length Stage2 inference requires a positive "
+            "inference.max_rollout_latent_frames",
+        )
+        _require(
+            max_rollout_latent_frames
+            % _int(_mapping(config, "model").get("num_frame_per_block", 0), "model.num_frame_per_block")
+            == 0,
+            "inference.max_rollout_latent_frames must divide evenly into "
+            "model.num_frame_per_block chunks",
+        )
+        if cache_mode == "circular":
+            _require(
+                _int(_mapping(config, "model").get("sink_size", 0), "model.sink_size") == 0,
+                "inference.kv_cache_mode=circular requires model.sink_size=0",
+            )
 
 
 def _validate_data(config: Mapping[str, Any], route: Route, profile: FamilyProfile) -> None:

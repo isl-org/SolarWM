@@ -98,6 +98,7 @@ checkpoint:
   weights: ema
 inference:
   source: validation
+  kv_cache_mode: clone
 runtime:
   output_dir: /path/to/outputs/wan22-ti2v-5b-stage2-sgf-inference
   compile_flex: false

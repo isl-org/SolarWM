@@ -96,6 +96,10 @@ checkpoint:
 inference:
   source: validation
   length: camera
+  kv_cache_mode: circular
+  max_rollout_latent_frames: 900
+  stage2_xpu_vae_pipeline: true
+  stage2_xpu_compile_blocks: false
   output_layout: dataset_triplet_v1
   run_id: wan22-ti2v-5b-stage2-sgf-camera-length-inference
 runtime:
