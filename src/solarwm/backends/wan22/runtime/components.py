@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +277,36 @@ class Wan5BVAE:
             outputs.append(torch.cat(chunks, dim=1))
         return torch.cat(outputs, dim=0)
 
+    @contextmanager
+    def streaming_decode_session(self) -> Any:
+        """Yield a continuous-cache decoder whose tiles remain on the device."""
+
+        import torch
+
+        clear_cache = getattr(self.module, "clear_cache", None)
+        cached_decode = getattr(self.module, "cached_decode", None)
+        if not callable(clear_cache) or not callable(cached_decode):
+            raise BackendContractError(
+                "Wan streaming VAE decode requires cache-aware decoder methods"
+            )
+        clear_cache()
+
+        def decode_tile(latents_btchw: Any) -> Any:
+            if latents_btchw.ndim != 5 or int(latents_btchw.shape[0]) != 1:
+                raise BackendContractError(
+                    "Wan streaming VAE device decode requires one BTCHW sample"
+                )
+            # Match decode_streaming_chunks' contiguous BCTHW tile layout exactly.
+            clip = latents_btchw.permute(0, 2, 1, 3, 4).contiguous()
+            with torch.autocast(device_type=clip.device.type, dtype=clip.dtype):
+                decoded = cached_decode(clip, self._scale(clip))
+            return decoded.float().clamp_(-1, 1).permute(0, 2, 1, 3, 4).contiguous()
+
+        try:
+            yield decode_tile
+        finally:
+            clear_cache()
+
     def decode_streaming_chunks(
         self,
         latents_btchw: Any,
@@ -292,29 +323,18 @@ class Wan5BVAE:
             raise BackendContractError("Wan streaming VAE file decode requires batch size one")
         if chunk_latent_frames <= 0:
             raise BackendContractError("Wan streaming VAE chunk size must be positive")
-        clear_cache = getattr(self.module, "clear_cache", None)
-        cached_decode = getattr(self.module, "cached_decode", None)
-        if not callable(clear_cache) or not callable(cached_decode):
-            raise BackendContractError(
-                "Wan streaming VAE decode requires cache-aware decoder methods"
-            )
-
-        clips = latents_btchw.permute(0, 2, 1, 3, 4)
-        for clip in clips:
-            clear_cache()
-            try:
-                for start in range(0, int(clip.shape[1]), chunk_latent_frames):
-                    chunk = clip[:, start : start + chunk_latent_frames].contiguous()
-                    with torch.autocast(device_type=chunk.device.type, dtype=chunk.dtype):
-                        decoded = cached_decode(chunk.unsqueeze(0), self._scale(chunk))
+        with self.streaming_decode_session() as decode_tile:
+            for start in range(0, int(latents_btchw.shape[1]), chunk_latent_frames):
+                chunk = latents_btchw[:, start : start + chunk_latent_frames].contiguous()
+                decoded = decode_tile(chunk)
+                try:
                     if not bool(torch.isfinite(decoded).all().item()):
                         raise BackendContractError(
                             "Wan streaming VAE decode produced non-finite pixels"
                         )
-                    yield (decoded.float().clamp_(-1, 1).permute(0, 2, 1, 3, 4).contiguous().cpu())
+                    yield decoded.cpu()
+                finally:
                     del decoded
-            finally:
-                clear_cache()
 
 
 class WanA14BVAE:

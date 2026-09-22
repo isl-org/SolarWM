@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -622,13 +622,16 @@ def _encode_mp4(frames: Any, *, fps: float) -> bytes:
     executable = shutil.which("ffmpeg")
     if executable is None:
         raise BackendContractError("Wan inference requires ffmpeg to encode MP4 artifacts")
-    array = (
-        ((frames[0].float().clamp(-1, 1) + 1.0) * 127.5)
-        .round()
-        .to(dtype=__import__("torch").uint8)
-        .cpu()
-        .numpy()
-    )
+    if frames.dtype == __import__("torch").uint8:
+        array = frames[0].cpu().numpy()
+    else:
+        array = (
+            ((frames[0].float().clamp(-1, 1) + 1.0) * 127.5)
+            .round()
+            .to(dtype=__import__("torch").uint8)
+            .cpu()
+            .numpy()
+        )
     if array.ndim != 4 or array.shape[1] != 3:
         raise BackendContractError(f"Wan VAE decoded unexpected video shape {tuple(array.shape)}")
     array = np.transpose(array, (0, 2, 3, 1))
@@ -677,19 +680,21 @@ def _encode_compare_mp4(
     prepared: _PreparedCase,
     *,
     fps: float,
+    generated_uint8: bool = False,
 ) -> bytes:
     """Adapt Wan tensors to the shared comparison encoder."""
 
     reference = prepared.pixels
     if prepared.repeat_first_frame:
         reference = reference[:1].expand(int(generated.shape[1]), -1, -1, -1)
-    return encode_compare_mp4(
-        reference.unsqueeze(0),
-        generated,
-        fps=fps,
-        layout="btchw",
-        value_range="minus_one_one",
-    )
+    kwargs: dict[str, Any] = {
+        "fps": fps,
+        "layout": "btchw",
+        "value_range": "minus_one_one",
+    }
+    if generated_uint8:
+        kwargs["generated_uint8"] = True
+    return encode_compare_mp4(reference.unsqueeze(0), generated, **kwargs)
 
 
 class _RawVideoFileWriter:
@@ -810,6 +815,7 @@ def _encode_stage2_streaming(
     fps: float,
     temporary_root: Path,
     chunk_latent_frames: int,
+    measure_phase: Callable[..., Any] | None = None,
 ) -> _StreamedStage2Artifacts:
     """Decode, compare, and encode a long Stage2 rollout with bounded host memory."""
 
@@ -921,14 +927,31 @@ def _encode_stage2_streaming(
             raise BackendContractError(
                 "hour-scale Wan inference requires chunk-yielding VAE decode"
             )
-        for chunk in decode_chunks(latents, chunk_latent_frames=chunk_latent_frames):
+        iterator = iter(decode_chunks(latents, chunk_latent_frames=chunk_latent_frames))
+        while True:
+            phase = (
+                measure_phase("vae_decode", mode="file_streaming")
+                if measure_phase is not None
+                else nullcontext()
+            )
+            with phase:
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    break
             count = int(chunk.shape[1])
             if decoded_model_frames + count > expected_model_frames:
                 raise BackendContractError("Wan streaming VAE decoded too many frames")
             remaining = target_pixel_frames - written_frames
             if remaining > 0:
                 published = chunk[:, : min(count, remaining)]
-                write_chunk(published, reference_start=written_frames)
+                phase = (
+                    measure_phase("mp4_encode", artifact="streaming_tiles")
+                    if measure_phase is not None
+                    else nullcontext()
+                )
+                with phase:
+                    write_chunk(published, reference_start=written_frames)
                 written_frames += int(published.shape[1])
             decoded_model_frames += count
         if decoded_model_frames != expected_model_frames or last_generated is None:
@@ -938,10 +961,16 @@ def _encode_stage2_streaming(
             )
         tail_frames = target_pixel_frames - written_frames
         if tail_frames:
-            write_chunk(
-                last_generated.expand(-1, tail_frames, -1, -1, -1),
-                reference_start=written_frames,
+            phase = (
+                measure_phase("mp4_encode", artifact="streaming_tail")
+                if measure_phase is not None
+                else nullcontext()
             )
+            with phase:
+                write_chunk(
+                    last_generated.expand(-1, tail_frames, -1, -1, -1),
+                    reference_start=written_frames,
+                )
             written_frames += tail_frames
         if written_frames != target_pixel_frames:
             raise BackendContractError(
@@ -950,8 +979,14 @@ def _encode_stage2_streaming(
             )
         if video_writer is None or compare_writer is None:
             raise BackendContractError("Wan streaming VAE produced no encodable frames")
-        video_writer.finish()
-        compare_writer.finish()
+        phase = (
+            measure_phase("mp4_encode", artifact="streaming_finalize")
+            if measure_phase is not None
+            else nullcontext()
+        )
+        with phase:
+            video_writer.finish()
+            compare_writer.finish()
         return _StreamedStage2Artifacts(
             video=GeneratedFile(video_path),
             compare=GeneratedFile(compare_path),

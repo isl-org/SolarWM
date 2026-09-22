@@ -42,6 +42,7 @@ def encode_compare_mp4(
     fps: float,
     layout: Literal["btchw", "bcthw"],
     value_range: Literal["zero_one", "minus_one_one"],
+    generated_uint8: bool = False,
 ) -> bytes:
     """Encode the left-GT/right-GEN H.264 visualization."""
 
@@ -66,14 +67,31 @@ def encode_compare_mp4(
         return torch.nan_to_num(result, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
 
     gt = canonical(reference, "GT")
-    gen = canonical(generated, "GEN")
+    if generated_uint8:
+        if generated.ndim != 5 or int(generated.shape[0]) != 1:
+            raise BackendContractError(
+                f"validation compare GEN has unexpected shape {tuple(generated.shape)}"
+            )
+        gen = generated if layout == "btchw" else generated.permute(0, 2, 1, 3, 4)
+        if int(gen.shape[2]) != 3 or gen.dtype != torch.uint8:
+            raise BackendContractError(
+                f"validation compare GEN must be uint8 RGB: {tuple(gen.shape)} {gen.dtype}"
+            )
+        gen = gen.detach().to(device="cpu", dtype=torch.uint8)
+        gt = gt.mul(255.0).to(torch.uint8)
+    else:
+        gen = canonical(generated, "GEN")
     frames = min(int(gt.shape[1]), int(gen.shape[1]))
     if frames < 1 or tuple(gt.shape[2:]) != tuple(gen.shape[2:]):
         raise BackendContractError(
             f"validation compare GT/GEN shapes differ: gt={tuple(gt.shape)} gen={tuple(gen.shape)}"
         )
     joined = torch.cat((gt[:, :frames], gen[:, :frames]), dim=-1)
-    array = joined[0].permute(0, 2, 3, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+    array = (
+        joined[0].permute(0, 2, 3, 1).cpu().numpy()
+        if generated_uint8
+        else joined[0].permute(0, 2, 3, 1).mul(255.0).to(torch.uint8).cpu().numpy()
+    )
     height, width = int(array.shape[1]), int(array.shape[2])
     executable = shutil.which("ffmpeg")
     if executable is None:
