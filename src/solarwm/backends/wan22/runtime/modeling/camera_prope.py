@@ -180,6 +180,64 @@ def prope_qkv_separate(
     return apply_fn_q(q), apply_fn_kv(k), apply_fn_kv(v), apply_fn_o
 
 
+def prope_apply_fns_separate_cached(
+    cache: dict,
+    *,
+    head_dim: int,
+    q_viewmats: torch.Tensor,  # (batch, query_len, 4, 4)
+    q_Ks: Optional[torch.Tensor],  # (batch, query_len, 3, 3)
+    kv_viewmats: torch.Tensor,  # (batch, kv_len, 4, 4)
+    kv_Ks: Optional[torch.Tensor],  # (batch, kv_len, 3, 3)
+    kv_window: Tuple[int, int],
+    camera_translation_transform: str = "linear",
+) -> Tuple[
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+    Callable[[torch.Tensor], torch.Tensor],
+]:
+    """Return :func:`prope_qkv_separate`'s transforms, memoized in ``cache``.
+
+    The projection matrices depend only on the camera tensors, which are staged
+    once per forward and shared by every transformer block, so building them
+    per block is redundant.  ``cache`` must be scoped to a single forward;
+    ``kv_window`` identifies the visible K/V slice so a different window cannot
+    silently reuse the previous one's transforms.
+
+    Shape validation stays in :func:`prope_qkv_separate`, which the uncached
+    path still runs; this returns transforms only, so it has no q/k/v to check.
+    """
+    entry = cache.get("q")
+    if entry is None:
+        apply_fn_q, _, apply_fn_o = _prepare_apply_fns_all_dim(
+            head_dim=head_dim,
+            viewmats=transform_relative_viewmats(q_viewmats, camera_translation_transform),
+            Ks=q_Ks,
+            patches_x=None,
+            patches_y=None,
+            image_width=None,
+            image_height=None,
+        )
+        entry = (apply_fn_q, apply_fn_o)
+        cache["q"] = entry
+    apply_fn_q, apply_fn_o = entry
+
+    kv_key = ("kv", kv_window)
+    apply_fn_kv = cache.get(kv_key)
+    if apply_fn_kv is None:
+        _, apply_fn_kv, _ = _prepare_apply_fns_all_dim(
+            head_dim=head_dim,
+            viewmats=transform_relative_viewmats(kv_viewmats, camera_translation_transform),
+            Ks=kv_Ks,
+            patches_x=None,
+            patches_y=None,
+            image_width=None,
+            image_height=None,
+        )
+        cache[kv_key] = apply_fn_kv
+
+    return apply_fn_q, apply_fn_kv, apply_fn_o
+
+
 def _prepare_apply_fns_all_dim(
     head_dim: int,  # Q/K/V will have this last dimension
     viewmats: torch.Tensor,  # (batch, cameras, 4, 4)

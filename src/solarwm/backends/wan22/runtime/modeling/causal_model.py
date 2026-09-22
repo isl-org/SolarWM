@@ -9,7 +9,11 @@
 # over chunked history, camera conditioning through PRoPE, and the
 # sequence-parallel paths the causal routes need.
 from .attention import attention
-from .camera_prope import prope_qkv, prope_qkv_separate
+from .camera_prope import (
+    prope_apply_fns_separate_cached,
+    prope_qkv,
+    prope_qkv_separate,
+)
 from .model import WanRMSNorm, WanLayerNorm, WanCrossAttention, rope_params, sinusoidal_embedding_1d
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -85,6 +89,55 @@ def normalize_camera_attention_mode(camera_attention_mode="parallel"):
     return value
 
 
+def _cache_index(cache, name: str) -> int:
+    """Read a cache position without synchronizing newly allocated device caches.
+
+    Stage2 inference owns these values as Python state.  Retain tensor support
+    for legacy callers, including existing training and sequence-parallel
+    caches, whose index tensors may be used outside this module.
+    """
+    value = cache[name]
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    return int(value)
+
+
+def _set_cache_index(cache, name: str, value: int) -> None:
+    """Update either host-owned or legacy tensor cache position state."""
+    current = cache[name]
+    if isinstance(current, torch.Tensor):
+        current.fill_(value)
+    else:
+        cache[name] = int(value)
+
+
+def _is_circular_cache(cache) -> bool:
+    """Whether this is the standalone mirrored, no-sink inference cache."""
+    return bool(cache.get("_circular_kv_cache", False))
+
+
+def _write_mirrored_ring(storage, *, start: int, values) -> None:
+    """Write ``values`` at a logical ring position and its mirrored alias.
+
+    ``storage`` has physical length ``2 * capacity``.  The duplicate half lets
+    every logical cache window be addressed by one contiguous tensor slice.
+    """
+    capacity = storage.shape[1] // 2
+    length = values.shape[1]
+    if not 0 <= start < capacity or length > capacity:
+        raise ValueError("invalid mirrored circular-cache write")
+    first = min(length, capacity - start)
+    if first:
+        storage[:, start : start + first] = values[:, :first]
+        storage[:, start + capacity : start + capacity + first] = values[:, :first]
+    if first < length:
+        remainder = length - first
+        storage[:, :remainder] = values[:, first:]
+        storage[:, capacity : capacity + remainder] = values[:, first:]
+
+
 def echorope_apply(
     x,
     grid_sizes,
@@ -92,6 +145,7 @@ def echorope_apply(
     start_frame=0,
     frame_indices=None,
     seq_offsets=None,
+    grid_list=None,
 ):
     """Apply window-relative RoPE to self-attention Q/K.
 
@@ -115,6 +169,12 @@ def echorope_apply(
             and cache-free sliding-window validation (``[0..window_F-1]``).
         seq_offsets: Reserved for future token-sharded RoPE support.  The
             verified stage1 paths use unsharded RoPE coordinates (offset 0).
+        grid_list: Optional ``[(F, H, W), ...]`` of Python ints carrying the
+            same values as ``grid_sizes``.  ``grid_sizes.tolist()`` is the only
+            reason this function reads that tensor, and under ``torch.compile``
+            it was the single graph break in the whole transformer block, once
+            per rope call.  Callers that already hold the sizes as Python ints
+            pass them here instead.
 
     Tail tokens beyond ``prod(grid_sizes[i])`` are FlexAttention padding and are
     copied through unrotated.
@@ -136,7 +196,7 @@ def echorope_apply(
         )
 
     output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    for i, (f, h, w) in enumerate(grid_list if grid_list is not None else grid_sizes.tolist()):
         if f == 0:
             if x.shape[1] == 0:
                 output.append(x[i])
@@ -153,6 +213,11 @@ def echorope_apply(
         valid_len = min(x.shape[1], seq_len)
 
         if frame_indices is None:
+            if start_frame < 0 or start_frame + f > freqs_t.shape[0]:
+                raise ValueError(
+                    f"EchoRoPE temporal range [{start_frame}, {start_frame + f - 1}] "
+                    f"is outside RoPE table length {freqs_t.shape[0]}"
+                )
             temporal_idx = torch.arange(
                 start_frame, start_frame + f, device=x.device, dtype=torch.long
             )
@@ -164,14 +229,23 @@ def echorope_apply(
                 )
             temporal_idx = frame_indices
 
-        if temporal_idx.numel() > 0:
-            min_idx = int(temporal_idx.min().item())
-            max_idx = int(temporal_idx.max().item())
-            if min_idx < 0 or max_idx >= freqs_t.shape[0]:
-                raise ValueError(
-                    f"EchoRoPE temporal indices [{min_idx}, {max_idx}] are "
-                    f"outside RoPE table length {freqs_t.shape[0]}"
-                )
+            # Only arbitrary caller-supplied indices need a value check, and it
+            # costs a device sync. The contiguous branch above already proved
+            # [start_frame, start_frame + f) lies in the table using Python
+            # ints, so re-deriving the same bound from device scalars there
+            # bought nothing and synchronized twice per rope call -- 120 times
+            # per KV-cache forward.
+            is_compiling = bool(
+                getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)()
+            )
+            if temporal_idx.numel() > 0 and not is_compiling:
+                min_idx = int(temporal_idx.min().item())
+                max_idx = int(temporal_idx.max().item())
+                if min_idx < 0 or max_idx >= freqs_t.shape[0]:
+                    raise ValueError(
+                        f"EchoRoPE temporal indices [{min_idx}, {max_idx}] are "
+                        f"outside RoPE table length {freqs_t.shape[0]}"
+                    )
 
         freqs_i_full = torch.cat(
             [
@@ -203,6 +277,7 @@ def block_relativistic_rope(
     freqs,
     start_frame=0,
     relative_frame_indices=None,
+    grid_list=None,
 ):
     """Apply the SolarWM window/block-relative Wan RoPE.
 
@@ -217,6 +292,7 @@ def block_relativistic_rope(
         freqs,
         start_frame=start_frame,
         frame_indices=relative_frame_indices,
+        grid_list=grid_list,
     )
 
 
@@ -592,12 +668,21 @@ class CausalWanSelfAttention(nn.Module):
         *,
         kv_cam_viewmats=None,
         kv_cam_K=None,
+        prope_cache=None,
+        kv_window=None,
     ):
         """Apply SolarWM PRoPE after ordinary RoPE, before one attention pass.
 
         Inputs and outputs use the native self-attention layout ``[B,L,H,D]``.
         The returned output transform applies ``P`` to attention results in
         ``[B,H,L,D]`` layout before the ordinary ``self.o`` projection.
+
+        The projection matrices depend only on the camera tensors, which are
+        staged once per forward and shared by every block, so ``prope_cache``
+        memoizes them for the duration of one forward instead of rebuilding
+        them 60 times. ``kv_window`` identifies the visible K/V slice and keys
+        the K/V half; ``None`` disables memoization and restores the per-layer
+        construction used by the training and non-circular paths.
         """
         if self.camera_attention_mode != "fused_prope":
             return q, k, v, None
@@ -636,16 +721,31 @@ class CausalWanSelfAttention(nn.Module):
         else:
             if kv_cam_viewmats is None or kv_cam_K is None:
                 raise ValueError("fused_prope requires both visible-KV viewmats and K, or neither")
-            q_t, k_t, v_t, apply_fn_o = prope_qkv_separate(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                q_viewmats=cam_viewmats,
-                q_Ks=cam_K,
-                kv_viewmats=kv_cam_viewmats,
-                kv_Ks=kv_cam_K,
-                camera_translation_transform=self.camera_translation_transform,
-            )
+            if prope_cache is None or kv_window is None:
+                q_t, k_t, v_t, apply_fn_o = prope_qkv_separate(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    q_viewmats=cam_viewmats,
+                    q_Ks=cam_K,
+                    kv_viewmats=kv_cam_viewmats,
+                    kv_Ks=kv_cam_K,
+                    camera_translation_transform=self.camera_translation_transform,
+                )
+            else:
+                apply_fn_q, apply_fn_kv, apply_fn_o = prope_apply_fns_separate_cached(
+                    prope_cache,
+                    head_dim=self.head_dim,
+                    q_viewmats=cam_viewmats,
+                    q_Ks=cam_K,
+                    kv_viewmats=kv_cam_viewmats,
+                    kv_Ks=kv_cam_K,
+                    kv_window=kv_window,
+                    camera_translation_transform=self.camera_translation_transform,
+                )
+                q_t = apply_fn_q(q.transpose(1, 2))
+                k_t = apply_fn_kv(k.transpose(1, 2))
+                v_t = apply_fn_kv(v.transpose(1, 2))
         return (
             q_t.transpose(1, 2),
             k_t.transpose(1, 2),
@@ -724,6 +824,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs,
         frame_seqlen: int,
         num_new_tokens: int,
+        grid_list=None,
     ):
         """Apply EchoRoPE to an already-sliced local K window and current Q.
 
@@ -732,16 +833,13 @@ class CausalWanSelfAttention(nn.Module):
         the tail of the window.  This avoids global temporal positions growing
         beyond the training horizon during long rollouts.
         """
-        num_window_frames = k_window.shape[1] // frame_seqlen if frame_seqlen > 0 else 0
-        num_new_frames = (
-            num_new_tokens // frame_seqlen if frame_seqlen > 0 else int(grid_sizes[0][0].item())
-        )
-        if num_new_frames != int(grid_sizes[0][0].item()):
+        if frame_seqlen <= 0 or num_new_tokens % frame_seqlen:
             raise ValueError(
                 f"EchoRoPE expects chunk token count to be whole frames: "
-                f"num_new_frames={num_new_frames}, grid F={int(grid_sizes[0][0].item())}, "
                 f"num_new_tokens={num_new_tokens}, frame_seqlen={frame_seqlen}"
             )
+        num_window_frames = k_window.shape[1] // frame_seqlen
+        num_new_frames = num_new_tokens // frame_seqlen
 
         if self.use_echorope:
             pos = self._window_relative_positions(
@@ -770,17 +868,30 @@ class CausalWanSelfAttention(nn.Module):
                 f"pmax={self._echorope_pmax_frames(freqs, min_frames=num_new_frames)}"
             )
 
-        q_grid = grid_sizes.clone()
-        q_grid[:, 0] = num_new_frames
+        # Reuse the caller's Python-int grid when it has one: rebuilding the
+        # frame count as a tensor only to read it back with ``.tolist()``
+        # inside the rope helper is what broke the compiled graph in two.
+        q_grid_list = (
+            None if grid_list is None else [(num_new_frames, h, w) for _, h, w in grid_list]
+        )
+        q_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+        if grid_list is None:
+            q_grid[:, 0] = num_new_frames
         rope_fn = echorope_apply if self.use_echorope else block_relativistic_rope
-        roped_query = rope_fn(q, q_grid, freqs, start_frame=pos["q_start"]).type_as(q)
+        roped_query = rope_fn(
+            q, q_grid, freqs, start_frame=pos["q_start"], grid_list=q_grid_list
+        ).type_as(q)
 
         if num_window_frames > 0:
-            k_grid = grid_sizes.clone()
-            k_grid[:, 0] = num_window_frames
-            roped_k = rope_fn(k_window, k_grid, freqs, start_frame=pos["local_start"]).type_as(
-                k_window
+            k_grid_list = (
+                None if grid_list is None else [(num_window_frames, h, w) for _, h, w in grid_list]
             )
+            k_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+            if grid_list is None:
+                k_grid[:, 0] = num_window_frames
+            roped_k = rope_fn(
+                k_window, k_grid, freqs, start_frame=pos["local_start"], grid_list=k_grid_list
+            ).type_as(k_window)
         else:
             # Empty KV windows should only occur for malformed cache states;
             # fail loudly instead of returning an all-zero attention context.
@@ -885,12 +996,16 @@ class CausalWanSelfAttention(nn.Module):
         current_start=0,
         cache_start=None,
         sink_recache_after_switch=False,
+        cache_update_policy="commit_detached",
         block_mask=None,
         frame_indices=None,
         cam_viewmats=None,
         cam_K=None,
         kv_cam_viewmats=None,
         kv_cam_K=None,
+        frame_seqlen=None,
+        prope_cache=None,
+        grid_list=None,
     ):
         """
         Args:
@@ -999,7 +1114,10 @@ class CausalWanSelfAttention(nn.Module):
             x_out = self.o(x_out)
             return x_out, (current_start + s, s, None)
 
-        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+        if frame_seqlen is None:
+            frame_seqlen = int(math.prod(grid_sizes[0][1:]).item())
+        else:
+            frame_seqlen = int(frame_seqlen)
         if kv_cache is None:
             # Stage0.5 trains on the whole bidirectional window, so an empty
             # empty cache is equivalent to full attention over the current K/V.
@@ -1011,6 +1129,7 @@ class CausalWanSelfAttention(nn.Module):
                 freqs=freqs,
                 frame_seqlen=frame_seqlen,
                 num_new_tokens=num_new_tokens,
+                grid_list=grid_list,
             )
             attn_q, attn_k, attn_v, apply_fn_o = self._apply_fused_prope(
                 roped_query, roped_k, v, cam_viewmats, cam_K
@@ -1025,30 +1144,93 @@ class CausalWanSelfAttention(nn.Module):
             x_out = self.o(x_out.flatten(2))
             return x_out, (current_start + num_new_tokens, num_new_tokens, None)
 
-        current_end = current_start + q.shape[1]
         sink_tokens = self.sink_size * frame_seqlen
         kv_cache_size = kv_cache["k"].shape[1]
         num_new_tokens = q.shape[1]
+        global_end_index = _cache_index(kv_cache, "global_end_index")
+        local_end_index = _cache_index(kv_cache, "local_end_index")
 
+        if _is_circular_cache(kv_cache):
+            # Standalone camera inference is strictly append-only.  Unlike the
+            # legacy cache, its physical storage is a mirrored ring, so the
+            # complete logical window is always one contiguous slice.
+            if cache_update_policy not in {"inference_direct", "commit_detached"}:
+                raise ValueError("circular KV cache is restricted to standalone inference")
+            capacity = int(kv_cache["_circular_capacity"])
+            ring_start = int(kv_cache["_circular_ring_start"])
+            if num_new_tokens > capacity:
+                raise ValueError("invalid standalone circular KV-cache append")
+            # The production circular cache is append-only. Its logical end is
+            # authoritative cache state, not the caller's global offset. This
+            # avoids specializing compiled blocks for every `current_start`.
+            current_end = global_end_index + num_new_tokens
+            num_evicted = max(0, local_end_index + num_new_tokens - capacity)
+            new_local_end = min(capacity, local_end_index + num_new_tokens)
+            new_ring_start = (ring_start + num_evicted) % capacity
+            write_start = (ring_start + local_end_index) % capacity
+            with torch.no_grad():
+                _write_mirrored_ring(kv_cache["k"], start=write_start, values=k.detach())
+                _write_mirrored_ring(kv_cache["v"], start=write_start, values=v.detach())
+
+            window_start = new_ring_start + max(0, new_local_end - self.max_attention_size)
+            window_end = new_ring_start + new_local_end
+            k_window_raw = kv_cache["k"][:, window_start:window_end]
+            roped_query, roped_k_window, _ = self._rope_q_and_window_k(
+                q=q,
+                k_window=k_window_raw,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+                frame_seqlen=frame_seqlen,
+                num_new_tokens=num_new_tokens,
+                grid_list=grid_list,
+            )
+            visible_cam_viewmats = None
+            visible_cam_K = None
+            if kv_cam_viewmats is not None or kv_cam_K is not None:
+                if kv_cam_viewmats is None or kv_cam_K is None:
+                    raise ValueError("fused_prope KV-cache requires both shared camera tensors")
+                visible_cam_viewmats = kv_cam_viewmats[:, window_start:window_end]
+                visible_cam_K = kv_cam_K[:, window_start:window_end]
+            attn_q, attn_k, attn_v, apply_fn_o = self._apply_fused_prope(
+                roped_query,
+                roped_k_window,
+                kv_cache["v"][:, window_start:window_end],
+                cam_viewmats,
+                cam_K,
+                kv_cam_viewmats=visible_cam_viewmats,
+                kv_cam_K=visible_cam_K,
+                prope_cache=prope_cache,
+                kv_window=(window_start, window_end),
+            )
+            x = attention(attn_q, attn_k, attn_v)
+            if apply_fn_o is not None:
+                x = apply_fn_o(x.transpose(1, 2)).transpose(1, 2)
+            if cache_head_parallel:
+                x = sequence_model_parallel_all_gather(x, dim=2)
+            elif sp_enabled:
+                x = sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+            x = self.o(x.flatten(2))
+            update = {
+                "action": "circular_insert",
+                "ring_start": new_ring_start,
+                "local_end_index": new_local_end,
+                "current_end": current_end,
+            }
+            return x, (current_end, new_local_end, update)
+
+        current_end = current_start + q.shape[1]
         cache_update_info = None
-        is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
+        is_recompute = current_end <= global_end_index and current_start > 0
 
         if (
             self.local_attn_size != -1
-            and (current_end > kv_cache["global_end_index"].item())
-            and (num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size)
+            and (current_end > global_end_index)
+            and (num_new_tokens + local_end_index > kv_cache_size)
         ):
             # === ROLLING MODE: cache full, evict oldest non-sink tokens ===
-            num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-            num_rolled_tokens = (
-                kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-            )
-            local_end_index = (
-                kv_cache["local_end_index"].item()
-                + current_end
-                - kv_cache["global_end_index"].item()
-                - num_evicted_tokens
-            )
+            num_evicted_tokens = num_new_tokens + local_end_index - kv_cache_size
+            num_rolled_tokens = local_end_index - num_evicted_tokens - sink_tokens
+            local_end_index = local_end_index + current_end - global_end_index - num_evicted_tokens
             local_start_index = local_end_index - num_new_tokens
 
             temp_k = kv_cache["k"].detach().clone()
@@ -1095,15 +1277,22 @@ class CausalWanSelfAttention(nn.Module):
             }
         else:
             # === DIRECT INSERT MODE: cache not yet full ===
-            local_end_index = (
-                kv_cache["local_end_index"].item()
-                + current_end
-                - kv_cache["global_end_index"].item()
-            )
+            local_end_index = local_end_index + current_end - global_end_index
             local_start_index = local_end_index - num_new_tokens
 
-            temp_k = kv_cache["k"].detach().clone()
-            temp_v = kv_cache["v"].detach().clone()
+            direct_inference_write = cache_update_policy == "inference_direct"
+            if direct_inference_write:
+                # Standalone inference owns this cache and will overwrite these
+                # uncommitted slots with the subsequent detached commit.  The
+                # indices remain unchanged, so no later chunk can observe this
+                # speculative write.  This is intentionally restricted to the
+                # non-rolling path: a rolling forward must expose an evicted
+                # window without shifting the persistent cache four times.
+                temp_k = kv_cache["k"]
+                temp_v = kv_cache["v"]
+            else:
+                temp_k = kv_cache["k"].detach().clone()
+                temp_v = kv_cache["v"].detach().clone()
 
             write_start_index = (
                 max(local_start_index, sink_tokens) if is_recompute else local_start_index
@@ -1113,12 +1302,21 @@ class CausalWanSelfAttention(nn.Module):
             roped_offset = max(0, write_start_index - local_start_index)
             write_len = max(0, local_end_index - write_start_index)
             if write_len > 0:
-                temp_k[:, write_start_index:local_end_index] = k[
-                    :, roped_offset : roped_offset + write_len
-                ]
-                temp_v[:, write_start_index:local_end_index] = v[
-                    :, roped_offset : roped_offset + write_len
-                ]
+                if direct_inference_write:
+                    with torch.no_grad():
+                        temp_k[:, write_start_index:local_end_index] = k[
+                            :, roped_offset : roped_offset + write_len
+                        ].detach()
+                        temp_v[:, write_start_index:local_end_index] = v[
+                            :, roped_offset : roped_offset + write_len
+                        ].detach()
+                else:
+                    temp_k[:, write_start_index:local_end_index] = k[
+                        :, roped_offset : roped_offset + write_len
+                    ]
+                    temp_v[:, write_start_index:local_end_index] = v[
+                        :, roped_offset : roped_offset + write_len
+                    ]
 
             cache_update_info = {
                 "action": "direct_insert",
@@ -1204,6 +1402,7 @@ class CausalWanSelfAttention(nn.Module):
                 freqs=freqs,
                 frame_seqlen=frame_seqlen,
                 num_new_tokens=num_new_tokens,
+                grid_list=grid_list,
             )
             visible_cam_viewmats = None
             visible_cam_K = None
@@ -1296,6 +1495,7 @@ class CausalPropeSelfAttention(nn.Module):
         sink_recache_after_switch=False,
         cache_update_policy="commit_detached",
         block_mask=None,
+        frame_seqlen=None,
     ):
         """
         Args:
@@ -1361,34 +1561,30 @@ class CausalPropeSelfAttention(nn.Module):
             x_out = attention(proped_q, proped_k, proped_v)
         else:
             # KV cache mode with rolling cache support
-            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            if frame_seqlen is None:
+                frame_seqlen = int(math.prod(grid_sizes[0][1:]).item())
+            else:
+                frame_seqlen = int(frame_seqlen)
             num_new_tokens = s
             current_end = current_start + num_new_tokens
             sink_tokens = self.sink_size * frame_seqlen
             kv_cache_size = kv_cache["k"].shape[1]
-            is_recompute = (current_end <= kv_cache["global_end_index"].item()) and (
-                current_start > 0
-            )
+            global_end_index = _cache_index(kv_cache, "global_end_index")
+            local_end_index = _cache_index(kv_cache, "local_end_index")
+            is_recompute = (current_end <= global_end_index) and (current_start > 0)
             attn_k = kv_cache["k"]
             attn_v = kv_cache["v"]
 
             if (
                 self.local_attn_size != -1
-                and (current_end > kv_cache["global_end_index"].item())
-                and (num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size)
+                and (current_end > global_end_index)
+                and (num_new_tokens + local_end_index > kv_cache_size)
             ):
                 # === ROLLING MODE ===
-                num_evicted_tokens = (
-                    num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                )
-                num_rolled_tokens = (
-                    kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                )
+                num_evicted_tokens = num_new_tokens + local_end_index - kv_cache_size
+                num_rolled_tokens = local_end_index - num_evicted_tokens - sink_tokens
                 local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                    - num_evicted_tokens
+                    local_end_index + current_end - global_end_index - num_evicted_tokens
                 )
                 local_start_index = local_end_index - num_new_tokens
 
@@ -1397,11 +1593,11 @@ class CausalPropeSelfAttention(nn.Module):
                 )
                 roped_offset = max(0, write_start_index - local_start_index)
                 write_len = max(0, local_end_index - write_start_index)
-                if cache_update_policy == "none":
-                    # No-commit forwards (training loss / validation denoise) must
-                    # still attend to the current chunk. Build a temporary rolled
-                    # cache with this chunk's PRoPE K/V, but leave kv_cache state
-                    # untouched so later clean-context commits are well-defined.
+                if cache_update_policy in ("none", "inference_direct"):
+                    # No-index forwards must still attend to the current chunk.
+                    # Build a temporary rolled cache with this chunk's PRoPE K/V,
+                    # but leave kv_cache state untouched so the one detached
+                    # commit can shift history exactly once.
                     attn_k = kv_cache["k"].detach().clone()
                     attn_v = kv_cache["v"].detach().clone()
                     attn_k[:, sink_tokens : sink_tokens + num_rolled_tokens] = attn_k[
@@ -1452,11 +1648,7 @@ class CausalPropeSelfAttention(nn.Module):
                             ].detach()
             else:
                 # === DIRECT INSERT MODE ===
-                local_end_index = (
-                    kv_cache["local_end_index"].item()
-                    + current_end
-                    - kv_cache["global_end_index"].item()
-                )
+                local_end_index = local_end_index + current_end - global_end_index
                 local_start_index = local_end_index - num_new_tokens
 
                 write_start_index = (
@@ -1476,6 +1668,15 @@ class CausalPropeSelfAttention(nn.Module):
                         attn_v[:, write_start_index:local_end_index] = proped_v[
                             :, roped_offset : roped_offset + write_len
                         ]
+                elif cache_update_policy == "inference_direct":
+                    if write_len > 0:
+                        with torch.no_grad():
+                            kv_cache["k"][:, write_start_index:local_end_index] = proped_k[
+                                :, roped_offset : roped_offset + write_len
+                            ].detach()
+                            kv_cache["v"][:, write_start_index:local_end_index] = proped_v[
+                                :, roped_offset : roped_offset + write_len
+                            ].detach()
                 else:
                     if write_len > 0:
                         with torch.no_grad():
@@ -1509,9 +1710,9 @@ class CausalPropeSelfAttention(nn.Module):
                     attn_v[:, window_start:local_end_index],
                 )
 
-            if not is_recompute and cache_update_policy != "none":
-                kv_cache["global_end_index"].fill_(current_end)
-                kv_cache["local_end_index"].fill_(local_end_index)
+            if not is_recompute and cache_update_policy == "commit_detached":
+                _set_cache_index(kv_cache, "global_end_index", current_end)
+                _set_cache_index(kv_cache, "local_end_index", local_end_index)
 
         if cache_head_parallel:
             x_out = sequence_model_parallel_all_gather(x_out, dim=2)
@@ -1628,13 +1829,23 @@ class CausalWanAttentionBlock(nn.Module):
         frame_indices=None,
         kv_cam_viewmats=None,
         kv_cam_K=None,
+        frame_seqlen=None,
+        prope_cache=None,
+        grid_list=None,
     ):
-        num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
+        # ``e`` is expanded per token, so its axis here is the token axis rather
+        # than the physical video-frame axis. Keep the original modulation
+        # reshape independent from the physical frame sequence length threaded
+        # to the causal attention cache below.
+        num_tokens = e.shape[1]
+        modulation_seqlen = x.shape[1] // num_tokens
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
         # self-attention
         attn_input = (
-            self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]
+            self.norm1(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
+            * (1 + e[1])
+            + e[0]
         ).flatten(1, 2)
         y, cache_update_info = self.self_attn(
             attn_input,
@@ -1642,9 +1853,11 @@ class CausalWanAttentionBlock(nn.Module):
             grid_sizes,
             freqs,
             kv_cache,
-            current_start,
-            cache_start,
-            sink_recache_after_switch,
+            frame_seqlen=frame_seqlen,
+            current_start=current_start,
+            cache_start=cache_start,
+            sink_recache_after_switch=sink_recache_after_switch,
+            cache_update_policy=cache_update_policy,
             block_mask=block_mask,
             frame_indices=frame_indices,
             cam_viewmats=(
@@ -1667,6 +1880,8 @@ class CausalWanAttentionBlock(nn.Module):
                 if self.camera_attention_enabled and self.camera_attention_mode == "fused_prope"
                 else None
             ),
+            prope_cache=prope_cache,
+            grid_list=grid_list,
         )
 
         # PRoPE camera attention (parallel branch)
@@ -1687,13 +1902,16 @@ class CausalWanAttentionBlock(nn.Module):
                 grid_sizes,
                 freqs,
                 kv_cache=prope_kv_cache,
+                frame_seqlen=frame_seqlen,
                 current_start=current_start,
                 cache_start=cache_start,
                 cache_update_policy=cache_update_policy,
                 block_mask=block_mask,
             )
 
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+        x = x + (
+            y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[2]
+        ).flatten(1, 2)
 
         # cross-attention & FFN
         x = x + self.cross_attn(
@@ -1701,10 +1919,14 @@ class CausalWanAttentionBlock(nn.Module):
         )
         y = self.ffn(
             (
-                self.norm2(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[4]) + e[3]
+                self.norm2(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
+                * (1 + e[4])
+                + e[3]
             ).flatten(1, 2)
         )
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[5]).flatten(1, 2)
+        x = x + (
+            y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[5]
+        ).flatten(1, 2)
 
         return x, cache_update_info
 
@@ -1954,6 +2176,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         current_start: int,
         num_new_tokens: int,
         frame_seqlen: int,
+        cache_update_policy: str,
     ):
         """Stage one shared camera-metadata cache matching the raw K/V layout.
 
@@ -1996,8 +2219,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 "fused_prope camera/cache batch mismatch: "
                 f"camera={cam_viewmats.shape[0]}, cache={batch}"
             )
-        global_end = int(cache["global_end_index"].item())
-        previous_local_end = int(cache["local_end_index"].item())
+        global_end = _cache_index(cache, "global_end_index")
+        previous_local_end = _cache_index(cache, "local_end_index")
         current_end = current_start + num_new_tokens
         sink_tokens = int(self.sink_size) * int(frame_seqlen)
         is_recompute = current_end <= global_end and current_start > 0
@@ -2029,6 +2252,35 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             )
         if state["viewmats"].device != cam_viewmats.device or state["K"].device != cam_K.device:
             raise RuntimeError("fused_prope shared camera cache is on the wrong device")
+
+        if _is_circular_cache(cache):
+            if cache_update_policy not in {"inference_direct", "commit_detached"}:
+                raise ValueError("circular fused_prope cache is restricted to standalone inference")
+            capacity = int(cache["_circular_capacity"])
+            ring_start = int(cache["_circular_ring_start"])
+            if current_end <= global_end:
+                raise ValueError("circular fused_prope cache does not support recompute forwards")
+            if num_new_tokens > capacity:
+                raise ValueError("invalid standalone circular camera-cache append")
+            num_evicted = max(0, previous_local_end + num_new_tokens - capacity)
+            new_local_end = min(capacity, previous_local_end + num_new_tokens)
+            new_ring_start = (ring_start + num_evicted) % capacity
+            write_start = (ring_start + previous_local_end) % capacity
+            # Camera metadata follows the same speculative-write contract as
+            # K/V.  It has no logical pointer of its own; the detached K/V
+            # commit below is the sole owner of the ring pointer.
+            with torch.no_grad():
+                _write_mirrored_ring(
+                    state["viewmats"], start=write_start, values=cam_viewmats.detach()
+                )
+                _write_mirrored_ring(state["K"], start=write_start, values=cam_K.detach())
+            return (
+                cam_viewmats,
+                cam_K,
+                state["viewmats"],
+                state["K"],
+                None,
+            )
 
         temp_viewmats = state["viewmats"].detach().clone()
         temp_K = state["K"].detach().clone()
@@ -2716,6 +2968,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # patch embedding
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        frame_seqlen = int(x[0].shape[3] * x[0].shape[4])
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
@@ -2752,7 +3005,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         ):
             if cam_viewmats is None or cam_K is None:
                 raise ValueError("fused_prope requires both camera viewmats and K, or neither")
-            frame_seqlen = int(math.prod(grid_sizes[0][1:]).item())
             (
                 cam_viewmats,
                 cam_K,
@@ -2766,6 +3018,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 current_start=current_start,
                 num_new_tokens=x.shape[1],
                 frame_seqlen=frame_seqlen,
+                cache_update_policy=cache_update_policy,
             )
 
         sp_enabled = is_sequence_parallel_enabled()
@@ -2779,7 +3032,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     f"num_heads={self.num_heads} must be divisible by sp_size={sp_size}"
                 )
             num_frames = int(grid_sizes[0][0].item())
-            frame_seqlen = int(math.prod(grid_sizes[0][1:]).item())
             if sp_seq_len_orig != num_frames * frame_seqlen:
                 raise RuntimeError(
                     "Stage0.5 SP requires a whole-frame token layout: "
@@ -2814,7 +3066,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cam_viewmats=kv_cam_viewmats,
             kv_cam_K=kv_cam_K,
             cache_update_policy=cache_update_policy,
+            frame_seqlen=frame_seqlen if (kv_cache is not None or not sp_enabled) else None,
+            # ``grid_sizes`` is a CPU tensor built from Python shapes, so read
+            # it once here rather than inside every block's rope calls.
+            grid_list=[tuple(int(v) for v in row) for row in grid_sizes.tolist()],
         )
+        # Circular standalone inference derives its append position from the
+        # committed cache state. Do not pass varying Python offsets into each
+        # compiled block: they are unused on this path but would otherwise
+        # create one Dynamo variant per rollout chunk.
+        circular_inference_cache = bool(kv_cache) and all(
+            _is_circular_cache(cache) for cache in kv_cache
+        )
+        # PRoPE projection matrices depend only on the camera tensors staged
+        # above, so every block would otherwise rebuild the same ones. Scope
+        # the memo to this forward; the ring window slides on the next commit.
+        if circular_inference_cache and self.camera_attention_mode == "fused_prope":
+            block_kwargs["prope_cache"] = {}
 
         cache_update_infos = []
         for block_index, block in enumerate(self.blocks):
@@ -2824,16 +3092,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     "crossattn_cache": crossattn_cache[block_index]
                     if crossattn_cache is not None
                     else None,
-                    "current_start": current_start,
-                    "cache_start": cache_start,
                 }
             )
+            if not circular_inference_cache:
+                block_kwargs.update(
+                    {
+                        "current_start": current_start,
+                        "cache_start": cache_start,
+                    }
+                )
             x, block_cache_update_info = block(x, **block_kwargs)
             if kv_cache is not None:
                 cache_update_infos.append((block_index, block_cache_update_info))
 
         # Apply deferred cache updates
-        if kv_cache is not None and cache_update_infos and cache_update_policy != "none":
+        if kv_cache is not None and cache_update_infos and cache_update_policy == "commit_detached":
             self._apply_cache_updates(kv_cache, cache_update_infos)
             if self.camera_attention_mode == "fused_prope" and cam_viewmats is None:
                 # A cache populated without camera conditioning cannot later be
@@ -2865,7 +3138,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 if update_info is not None:
                     cache = kv_cache[block_index]
 
-                    if update_info["action"] == "roll_and_insert":
+                    if update_info["action"] == "circular_insert":
+                        # K/V (and shared camera metadata) were written into
+                        # mirrored slots during the forward.  Advancing these
+                        # host-only logical pointers is deferred until the
+                        # successful detached commit.
+                        cache["_circular_ring_start"] = int(update_info["ring_start"])
+                    elif update_info["action"] == "roll_and_insert":
                         sink_tokens = update_info["sink_tokens"]
                         num_rolled_tokens = update_info["num_rolled_tokens"]
                         num_evicted_tokens = update_info["num_evicted_tokens"]
@@ -2917,8 +3196,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     False if update_info is None else update_info.get("is_recompute", False)
                 )
                 if not is_recompute:
-                    kv_cache[block_index]["global_end_index"].fill_(current_end)
-                    kv_cache[block_index]["local_end_index"].fill_(local_end_index)
+                    _set_cache_index(kv_cache[block_index], "global_end_index", current_end)
+                    _set_cache_index(kv_cache[block_index], "local_end_index", local_end_index)
 
     def unpatchify(self, x, grid_sizes):
         """Reconstruct video tensors from patch embeddings."""
