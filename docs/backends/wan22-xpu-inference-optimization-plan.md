@@ -1,9 +1,10 @@
 # Wan2.2 Stage2 XPU inference optimization plan
 
 **Status:** WS1–WS5, WS9, WS12, and WS16 done and verified; WS6, WS7, WS8, and WS17 rejected on
-measurement (WS6's overlap machinery reverted; WS17's caching kept for correctness, not speed);
+measurement (WS6's overlap machinery reverted; WS17's caching kept for correctness, not speed;
+WS7 rejected in both default and `max-autotune` compile mode);
 **WS13 is the only remaining lever with a projected gain**
-**Last updated:** 2026-09-21 (B70)
+**Last updated:** 2026-09-22 (B70)
 **Device:** Intel B70, 30.3 GiB VRAM, `torch 2.12.1+xpu`
 **Output anchor:** `md5 380d9cf74a9018d76408a3e615558fab`,
 `sha256 2da7fa11bc10faf9d8309f84e7f5365708d05f190baaf71e6d2b4b3e27023a5c`
@@ -36,6 +37,96 @@ blocked on a quality decision rather than on engineering.
 > the cautionary case: a projected 6.3 fps derived from two correct measurements was treated as
 > an outcome before the assumption behind it was tested, and it turned out to be false.
 
+## Algorithm: end-to-end inference (production camera route)
+
+Documents the exact sequence of mathematical operations from a text prompt + camera trajectory
+to output pixels, for the path used in production: `camera_attention_mode=fused_prope`,
+`sink_size=0`, circular KV cache, EchoRoPE, single GPU. Values are the production configuration
+(`ti2v_5b.json`, `sgf.py:122-127`). **dtype** marks the tensor's steady-state dtype;
+`fp64`/`fp32` round-trips note transient casts within a step.
+
+### 0. Fixed shapes and parameters
+
+| Symbol | Value | Meaning |
+| --- | --- | --- |
+| `B` | 1 | batch (single sample) |
+| `dim` | 3072 | transformer hidden width |
+| `ffn_dim` | 14336 | FFN inner width |
+| `num_heads`, `head_dim` | 24, 128 | attention heads × per-head width |
+| `num_layers` | 30 | transformer blocks |
+| `in_dim`, `out_dim` | 48, 48 | latent channels in/out (= VAE `z_dim`) |
+| `patch_size` | (1, 2, 2) | temporal, height, width patch stride |
+| `text_len`, `text_dim` | 512, 4096 | UMT5-XXL context length / width |
+| `freq_dim` | 256 | sinusoidal timestep embedding width |
+| `frame_seq_length` | 405 | tokens per latent frame after patchify (15×27 grid) |
+| `num_frame_per_block` | 3 | latent frames generated per chunk |
+| `Lq` | 1215 | query tokens per forward = `3 × 405` |
+| `local_attn_size` | 18 | latent frames kept in the attention window |
+| `Lk` | 7290 | max KV window = `18 × 405` (`sink_size=0`) |
+| NFE | 4 | denoise steps per chunk, plus 1 commit forward |
+| VAE spatial / temporal downsample | 16× / `(F−1)×4+1` | pixel <-> latent |
+
+### 1. One-time setup (per video)
+
+**1.1 Text conditioning.** `context = umt5_xxl(tokenizer(prompt))`, shape `[1, 512, 4096]`,
+fp32, zeroed past sequence length. Projected once per model forward:
+`Linear(4096->3072) -> GELU(tanh) -> Linear(3072->3072)`, `[1, 512, 3072]`, bf16.
+Cross-attention K/V from this context are computed once and cached (bf16), reused verbatim
+thereafter.
+
+**1.2 Camera trajectory.** Per-frame `viewmats [F_total,4,4]`, `K [F_total,3,3]`, fp32,
+broadcast to one copy per spatial token and staged into a rolling buffer mirroring the K/V cache
+layout. `camera_translation_transform="linear"` makes `transform_relative_viewmats` the
+identity.
+
+### 2. Per-chunk causal rollout loop
+
+Repeats `ceil(total_latent_frames / 3)` times.
+
+**2.1 Diffusion transformer forward**, run once per denoise step and once for commit, all under
+`torch.autocast(bf16)`:
+
+1. **Patchify.** `Conv3d(48->3072, kernel/stride=(1,2,2))` on `[1,48,3,30,54]` (bf16) ->
+   tokens `x: [1,1215,3072]` (bf16).
+2. **Time embedding.** `sinusoidal_embedding_1d`: position cast to fp64, `cos/sin` computed in
+   fp64, cast back to bf16 before the `time_embedding` MLP. `e0 = time_projection(e)` ->
+   `[1,1215,6,3072]`, bf16.
+3. **Per layer (x 30):**
+   - `q,k`: `x = RMSnorm(Linear(x))`, `v`: `x = Linear(x)`, `[1, 1215 or 7290, 24, 128]`, bf16.
+   - **EchoRoPE**: `q,k` cast bf16 -> fp64/complex128, rotated, cast back to bf16. `v`
+     untouched.
+   - **PRoPE**: per-token `P = lift(K_norm)@viewmat` built and inverted in fp32, cast to bf16
+     immediately before the einsum; applied to `q` (`P^T`), `k`/`v` (`P^-1`).
+   - **Self-attention**: SDPA over `Lq=1215` x `Lk<=7290`, bf16. Output passed through `P` then
+     `Linear_o`.
+   - Residual with AdaLN gate, bf16.
+   - **Cross-attention**: `q` from `x` (1215), cached `k,v` from text context (512), bf16.
+   - **FFN**: `Linear(3072->14336) -> GELU(tanh) -> Linear(14336->3072)`, bf16.
+4. **Head + unpatchify** -> flow prediction `[48,3,30,54]`, bf16.
+
+**2.2 Flow-matching update.** `noisy`/`flow` cast bf16 -> fp64, `sigma(t)` looked up from a
+fp64 sigma grid, `x0 = x_t - sigma*flow` computed in fp64, cast back to bf16. For non-final
+steps, `add_noise`: `sigma` is fp32, so `(1-sigma)*x0 + sigma*noise` promotes to fp32 for the
+blend, then casts back to bf16. Repeated for the 4 denoise steps.
+
+**2.3 KV cache writes.** Each of the 5 forwards per chunk (4 denoise + 1 commit) writes its own
+raw (pre-RoPE, pre-PRoPE) `k, v` into the same circular-buffer ring slot, computed from the same
+`ring_start`/`local_end_index` snapshot, so each overwrites the previous forward's K/V at that
+slot. Only the commit forward (run at `t=0` on the final `x0`) advances the ring's persistent
+read/write pointers, so its write is the one later chunks see as history. Only raw, un-rotated K
+is stored; RoPE and PRoPE are re-applied to the full visible window on every read.
+
+### 3. VAE decode (streaming, tiled)
+
+Module weights bf16, decode runs under `torch.autocast(bf16)`. Per-channel affine
+denormalization using cached `(mean, 1/std)` tensors. Causal `Conv3d` decoder, bf16 compute,
+output upcast: `decoded.float().clamp_(-1,1)` -> fp32, `[1,3,F_pixel_tile,480,864]`.
+
+### 4. Output
+
+Pixel tiles concatenated along time -> `[1,3,F_pixel_total,480,864]`, fp32, where
+`F_pixel_total = (F_latent_total-1)*4+1`.
+
 ## Workstreams at a glance
 
 | WS | Change | Projected gain | Measured gain | Complexity | Gate | Status |
@@ -46,7 +137,7 @@ blocked on a quality decision rather than on engineering.
 | WS4 | Configurable KV cache: mirrored circular default, clone fallback | removes rolling full-cache clones | **chunk 3.5881 s clone → 3.3890 s circular (−199 ms, 5.5 %)**, A/B measured 2026-09-21; rollout reserved +0.84 GiB | medium | exact | **Done and verified — keep** |
 | WS5 | Memory: streaming decode, preallocation, reuse | ~0.3–1 GiB from decode *(estimated)*, horizon-independent peak | **reserved 13.93 → 11.69 GiB between rollout and decode**; peak now horizon-independent | medium | exact | **Done and verified** |
 | WS6 | Pipeline diffusion against VAE decode | 50.8 s → ~28 s *(projected, **assumes the XPU overlaps two compute streams**)* | **48.49 s — no gain**; two-stream microbenchmark measures **1.001×** overlap | high | exact | **Rejected and reverted** — device does not overlap compute; per-chunk tiling and uint8 D2H kept |
-| WS7 | `torch.compile` / inductor autotune | largest potential *(estimated)* | **3.3609 s eager → 3.3602 s compiled — no gain**, with 0 graph breaks and 0 eager fallback; costs 79 s of warmup and breaks the exact gate | high | PSNR | **Rejected** — see WS7 result |
+| WS7 | `torch.compile` / inductor autotune | largest potential *(estimated)* | **3.3609 s eager → 3.3602 s compiled (default mode), 3.3596 s (`max-autotune`) — no gain either way**; default mode costs 79 s warmup, `max-autotune` costs 674.6 s; both break the exact gate | high | PSNR | **Rejected** — see WS7 result |
 | WS8 | XPU graphs | launch overhead only *(estimated)* | — launch overhead is ~1 % of the chunk | high | PSNR | **Rejected** — no overhead to recover |
 | WS9 | Text encoder → host bf16 | −10.6 GiB host resident, −6.6 GiB load spike, encode 6.8 s → 5.1 s *(measured in isolation)* | **`conditions` 58.69 s → 27.56 s (−31.1 s)**; re-anchored, PSNR 28.27 dB mean vs old anchor (trajectory drift, visually clean) | small | PSNR | **Done and verified** |
 | WS10 | fp32 matmul precision knobs | small *(estimated)* | — | small | PSNR | Not started |
@@ -817,6 +908,63 @@ at 100 % of a ceiling that was itself measured from the best observed case. Agai
 alongside WS13**, when the kernel mix has changed enough that the profile must be re-taken
 anyway.
 
+### `max-autotune` result (2026-09-22) — run anyway, confirms the arithmetic above
+
+The arithmetic above was checked directly rather than left as a projection.
+`torch.compile(block, dynamic=False, mode="max-autotune")`, with `_STAGE2_XPU_DYNAMO_VARIANTS = 32`
+as requested, `runtime.stage2_inference_measurements` + `stage2_inference_global_peak` for
+per-chunk timing. The `mode="max-autotune"` override was made through a temporary env-var hook
+(`SOLARWM_STAGE2_XPU_COMPILE_MODE`) for this one-off measurement only; it was not a shipped
+config knob and has since been removed from the code. `_compile_stage2_xpu_transformer_blocks`
+is back to calling `torch.compile(block, dynamic=False)` (default mode) behind
+`inference.stage2_xpu_compile_blocks`, which remains **false** by default.
+
+| | steady-state chunk (mean of 6) | stdev | warmup (first 8 chunks) |
+| --- | --- | --- | --- |
+| eager | 3.3609 s | — | — |
+| compiled, default mode | 3.3602 s | — | +79.0 s |
+| **compiled, `max-autotune`** | **3.3596 s** | 4.5 ms | **+674.6 s (11.2 min)** |
+
+**1.3 ms / 0.04 % faster than eager, statistically indistinguishable from default-mode compile,
+for 8.5× the warmup.** This matches the predicted ceiling: the addressable GEMM gap was at most
+12.7 ms/forward ≈ 63 ms/chunk, and autotune recovered roughly 2 % of even that optimistic bound.
+Break-even against the extra ~596 s of autotune warmup (relative to default-mode compile) would
+take on the order of 470,000 additional chunks. Output digest is off the exact-match anchor (as
+expected for any compiled variant); not separately re-anchored since the result is rejected on
+speed.
+
+**New interaction found, not present in the original WS7 measurement: one block hit the
+recompile ceiling on a cause `torch._dynamo.config.recompile_limit` had not seen before.**
+`torch._dynamo hit config.recompile_limit (32)` on `CausalWanAttentionBlock.forward`
+(`causal_model.py:1811`), reason `KeyError on prope_cache['q']`. This is WS12's PRoPE
+memoization cache: `prope_cache` is a plain `dict` created fresh (`{}`) once per
+`CausalWanModel.forward` and populated as blocks run, so Dynamo's dict-key guard sees a
+different key set on every call into the compiled block and cannot stabilize — the same
+mechanism as the pre-WS12 `local_end_index`/`ring_start` specialization, but on a cache that
+WS12 added after this file's original WS7 measurement was taken. One block fell back to eager
+for the remainder of the run once the ceiling was hit; the other 29 stayed compiled. This did
+not change the conclusion (autotune was already a wash), but it means the WS7 "zero eager
+fallbacks after the raise" claim above is stale as of WS12 landing and does not hold for a
+fresh compile attempt today. **If `stage2_xpu_compile_blocks` is revisited, `prope_cache` needs
+to be kept out of the compiled call signature** (e.g. a `torch._dynamo.disable`-wrapped
+accessor, or move the memoization to a non-dict keyed structure Dynamo can guard on cheaply)
+rather than threaded through `forward()` as-is.
+
+**Profiling this configuration (chunks 4–5) reproducibly OOM-killed the host.** Three attempts,
+all on the same 30 GiB host: (1) `with_stack=True` (the profiler's default) died mid-run at
+~30.8 GiB host RSS; (2) an identical retry died the same way at the same point, ruling out a
+transient cause; (3) disabling `with_stack` via a second temporary env-var hook
+(`SOLARWM_STAGE2_XPU_PROFILE_STACK=0`, also since removed) let `profiler_start`/`profiler_stop`
+complete, but the process still died — again at ~31 GiB — during trace export (`key_averages()` /
+`export_chrome_trace`), before either the op-summary or chrome-trace file reached disk. A
+resident `max-autotune`-compiled 30-block model plus the profiler's per-op bookkeeping does not
+fit in 30 GiB of host RAM on this box; a per-op FLOP/TFLOP-s breakdown for the autotuned
+configuration was not obtained. Given the wall-clock result already settles the question
+(autotune is a wash), this was not pursued further with e.g. `record_shapes=False` or
+`profile_memory=False`. `_Stage2XpuProfiler` is unchanged in tree: `with_stack=True` is hardcoded
+again, since the escape hatch was diagnostic-only and this profiler's normal (non-compiled)
+use case is unaffected.
+
 ### WS7 plan, revised (superseded by the result above)
 
 The prerequisite is architectural, as previously recorded, and it is **WS13**: compile a
@@ -1253,7 +1401,11 @@ Sequencing it second means one implementation instead of two.
 
 `echorope_apply` (`causal_model.py:245-257`) casts activations to `torch.float64`, forms a
 `complex128` view, multiplies by a `complex128` frequency table, and casts back. The frequency
-table itself is built as `complex128` by `rope_params`.
+table itself is built as `complex128` by `rope_params`. **Independent corroboration:** the
+2026-09-22 VTune GPU-Hotspots breakdown's "Dtype cast / copy kernels" row (22.9 % of GPU time)
+was audited by call site and this up/down-cast pair is its single largest identified
+contributor (see the "Dtype-cast/copy category audited by call site" status log entry) — this
+is a real, measured target, not just a static-analysis guess.
 
 - **Projection.** ~26 → ~11 ms per forward after WS13 (projected from the microbenchmark below;
   assumes a minimal-traffic implementation).
@@ -1268,6 +1420,49 @@ table itself is built as `complex128` by `rope_params`.
 - **Accuracy.** Against the complex128 reference on random activations, max-abs deviation is
   1.56e-2 for fp32 and 3.12e-2 for bf16 — both dominated by bf16 input quantization rather than
   by the rotation arithmetic. Group this with WS10 and WS14 so the anchor moves once.
+
+## WS18 — fuse EchoRoPE into PRoPE's per-token matrices
+
+**Status (2026-09-22): rejected on the production quality gate; experimental code remains
+disabled behind `runtime.stage2_fuse_rope_prope=false`.** This was an experimental alternative
+to WS15 for the production circular-camera path: rather than first
+materializing an EchoRoPE-rotated Q/K tensor and then applying PRoPE, compose the two linear
+transforms before one application to Q/K. V remains PRoPE-only.
+
+Production shapes are Q `[1, 1215, 24, 128]` and visible K `[1, 7290, 24, 128]`. EchoRoPE
+operates on 64 complex pairs; PRoPE applies one 4×4 matrix to each of the 32 contiguous
+four-channel blocks. Each block therefore contains two complete RoPE pairs — no channel permutation
+is needed (one block straddles the height/width frequency-table boundary, which is valid because
+the two rotations are independently composed into that block).
+
+- **Implementation.** `camera_prope.py` now composes each PRoPE matrix with its two RoPE
+  pair rotations using column recombination (`P @ R`), then applies the resulting per-token,
+  per-4-channel-block matrices in one einsum. The circular-cache call path supplies the
+  window-relative RoPE frequencies directly, avoiding `echorope_apply`'s bf16 → fp64/complex128
+  → bf16 intermediate for Q/K. The derived matrices are cached on the circular cache and reused
+  across all four denoise calls plus the detached commit for a fixed uncommitted window; the cache
+  is replaced when that window advances. Existing non-fused paths are unchanged.
+- **Correctness gate.** New focused CPU tests cover fp64 equivalence, bf16 tolerance,
+  per-camera/per-token projection coverage, and reuse of the cached Q/KV transforms:
+  `tests/backends/wan22/test_camera_prope_fusion.py`, **4 passed**. The first full B70 smoke
+  was a control only: the production config has `use_echorope: false`, while the initial gate
+  incorrectly enabled only the EchoRoPE mode, so the flag left that run on the old path. The
+  block-relative RoPE path now uses its own matching position convention. The actual fused run
+  then completed but **failed**: video PSNR against the unfused camera run was **12.86 dB**
+  (minimum 10.87 dB), with different SHA-256 digests. Removing the bf16 rounding boundary between
+  the original rotation and PRoPE projection changes the operation ordering, and the
+  autoregressive rollout amplifies that difference. Do not enable this implementation.
+- **Wall-clock observation, not a valid throughput conclusion.** One cold complete process was
+  158.31 s fused vs 149.29 s unfused. These include checkpoint load, CPU text encoding, and
+  publication, so they cannot measure this kernel optimization; the intended Stage2 measurement
+  report was not emitted by this runtime despite `runtime.stage2_inference_measurements=true`.
+- **VTune blocker.** The retained flag-off GPU-Hotspots ROI
+  `stage2_chunk4-5_20260922_184446` is the baseline. The actual fused capture reached ITT
+  resume/pause but VTune 2025.10 failed finalization with `Attach to pid ... failed: Operation not
+  permitted`. `gpu-offload` additionally rejects this host's Metrics Discovery installation
+  because it lacks the unversioned `libmd.so`; CPU `hotspots` stack capture hits the same
+  finalization issue. No fused kernel-time comparison is available, and it would not change the
+  quality rejection above.
 
 ## Out of scope
 
@@ -1387,6 +1582,196 @@ round-trip through the mean and go undetected — so this is a correctness fix i
 ## Status log
 
 Append-only. Correct an earlier entry by adding a new one that supersedes it; do not edit history.
+
+### 2026-09-22 — WS18 rejected: bf16 fusion fails the autoregressive quality gate
+
+Implemented the production circular-cache-only fusion behind
+`runtime.stage2_fuse_rope_prope` (default `false`). It composes RoPE's two 2×2 rotations in each
+PRoPE 4×4 block into `P @ R`, applies Q/K once, leaves V unchanged, and persists the derived
+matrices on the circular cache for the four denoise calls plus commit sharing one uncommitted
+window. A new four-test numerical suite passes. The first B70 camera smoke was a control rather
+than fused validation: production uses block-relative RoPE (`use_echorope: false`), but the
+initial gate only enabled the EchoRoPE mode. After correcting the gate to use the block-relative
+coordinates, the real fused B70 run completed but produced **12.86 dB PSNR** against the
+flag-off camera output (minimum 10.87 dB; both MP4 SHA-256 digests differ). Algebraic fp64
+equivalence is insufficient because this fusion eliminates the bf16 rounding point between RoPE
+and PRoPE; self-forcing amplifies the small resulting perturbation. **The flag stays false and
+must not be enabled.**
+
+The intended VTune before/after did **not** produce usable data. In each attempt ITT correctly
+resumed at chunk 4 and paused after chunk 5, but VTune 2025.10 then failed finalization with
+`Failed to attach to the specified target process` / `Operation not permitted` after the ROI
+closed. GPU Hotspots, `gpu-offload`, and CPU Hotspots stack capture all share that
+process-finalization failure here; `gpu-offload` also rejects the installed Metrics Discovery
+libraries for missing unversioned `libmd.so`. No performance conclusion is recorded; the quality
+failure independently rejects the work. See WS18 for full details.
+
+### 2026-09-22 — Chunks 4–5 profiled with VTune GPU-Hotspots instead of `torch.profiler`
+
+Built a working VTune ROI harness (`scripts/debug/run_wan22_stage2_vtune.sh` +
+`run_stage2_vtune_roi.py` + `vtune_itt.py`) and used it to cross-check the `torch.profiler`
+findings above with independent hardware-counter data, since `torch.profiler`'s device-time
+attribution was already shown unreliable for queue-drain-dominated ops (see the
+`UR_L0_USE_IMMEDIATE_COMMANDLISTS` entry below). Same chunk-4–5 window, same code (compile
+disabled, all landed workstreams in place).
+
+**Tooling notes, since none of this worked out of the box:**
+- `sycl-ls` on this host only lists an `[opencl:cpu]` device unless run with full (non-sandboxed)
+  filesystem permissions to see `/dev/dri`; `torch.xpu` and `vtune` both work fine once that's
+  granted.
+- Sourcing `/opt/intel/oneapi/setvars.sh` into the same shell that later runs the venv's Python
+  breaks `import torch` (`undefined symbol ...LIBUR_LOADER_0.12`) — it prepends oneAPI's own
+  `libsycl`/`libur` onto `LD_LIBRARY_PATH`, which is ABI-incompatible with the wheels bundled in
+  `.venv-wan22-xpu`. The driver script never sources it; it only puts `vtune`'s `bin64` on `PATH`.
+- This VTune install (2025.10) ships only a static `libittnotify.a`, and `__itt_resume`/
+  `__itt_pause` are C *macros*, not functions, so no symbol by that name exists in the archive for
+  `ctypes.util.find_library`/`dlopen` to find. The `vtune-vllm-profiling` skill's `ittapi` PyPI
+  package works around this by compiling its own real wrapper functions around the macros; that
+  install was not attempted here (network-installing a package wasn't pre-authorized), so instead
+  a ~20-line `shim.c` was compiled locally against the SDK's static archive
+  (`scripts/debug/run_wan22_stage2_vtune.sh`'s `build_ittnotify_shim`), exporting `solarwm_itt_*`
+  wrappers, and `vtune_itt.py`'s ctypes backend was extended to also look for those names.
+- `-start-paused` prints `Warning: Pause command is not supported for managed code profiling` and
+  `Error: Unauthorized control server connection` for a Python target on this VTune version. This
+  looks alarming but the ITT resume/pause calls inside the process still worked correctly (see
+  next paragraph) — treat the two messages as an environment quirk, not a hard failure, on this
+  vtune build.
+- Report names differ from the `vtune-vllm-profiling` skill's examples on VTune 2025.10:
+  `gpu-hotspots` isn't a valid report name here, use `-report hotspots -group-by computing-task`
+  instead; `-report tasks`/`-report top-tasks` both fail too (unused here anyway, since this run
+  only used ITT resume/pause, not per-step ITT tasks).
+- `-group-by computing-task` does not collapse to one row per kernel *name* — it additionally
+  splits by exact `Work Size:Global`/`Work Size:Local`, so a name like `gemm_kernel` or
+  `gen_conv` that runs across many distinct tensor shapes becomes dozens to hundreds of separate
+  rows. `-report`'s `-limit N` truncates that row *list*, not a name-level aggregate: a limit
+  that's too low silently drops most of the shape-variant rows for exactly the highest-frequency
+  kernels, and summing what's left by name understates their true total with no error or warning
+  (measured: `-limit 30` implied `gemm_kernel` = 0.26 s/322 instances; the real total needs
+  `-limit 5000` and is 1.28 s/3,732 instances — confirmed against `vtune-gui`'s Platform tab
+  grouped by "source computing task"). `scripts/debug/run_wan22_stage2_vtune.sh` defaults to
+  `-limit 5000`, comfortably above the true row count, for this reason.
+- If `vtune-gui` has the same result open while a CLI `-report` call runs against it, the call
+  fails with `Error: 0x40000006 (Insufficient permissions) -- .../sqlite-db` — a session lock,
+  not a real filesystem permission problem. Querying a `cp -r` throwaway copy of the result
+  directory (its own independent, unlocked sqlite-db) works around it; the driver script retries
+  against a copy automatically when it sees that specific error string.
+
+**ROI validation:** `_Stage2XpuProfiler.begin`/`.end` were monkeypatched (no changes to
+`stage2.py` itself) to call `itt_resume()`/`itt_pause()` at chunk 4/chunk 5 instead of starting a
+`torch.profiler` capture, gated by the same `runtime.stage2_xpu_profiler_start_chunk`/`end_chunk`
+config already used for the `torch.profiler` runs. Elapsed Time for the whole process was
+194.6 s (model load + 6 chunks, matching prior runs), but **GPU Time inside the ROI window was
+6.78 s** — matching two chunks at the previously-measured 3.36 s/chunk steady state almost
+exactly, which is a good sanity check that VTune only sampled the requested window and that the
+two independent measurement methods (`torch.profiler` wall-clock vs. VTune hardware counters)
+agree.
+
+**Findings, independent of `torch.profiler`'s per-op device-time attribution:**
+- `XVE Array Stalled/Idle: 60.5%` of elapsed time with the GPU busy; `Occupancy: 90.6%`. This is a
+  hardware-counter-based confirmation of the same story the `torch.profiler` FLOP/s numbers told
+  in the `max-autotune` arithmetic above: the GPU is well-occupied but frequently stalled, which
+  is consistent with a workload gated by non-GEMM overhead rather than by GEMM tile-size choice —
+  supporting the WS7 rejection independent of the `torch.profiler` measurement.
+- Of the 6.78 s GPU-Time window, named computing tasks (`-group-by computing-task -limit 5000`,
+  the row count needed to avoid the truncation pitfall above) account for 6.566 s across 291 raw
+  rows — 96.9 % coverage. The remaining 3.1 % is transfers and the long tail of sub-1%
+  kernel-name/shape combinations, not investigated further.
+- The 291 raw rows are individually near-meaningless (the same op appears once per
+  dtype/rank/shape template instantiation, e.g. `gemm_kernel` alone spans dozens of rows and
+  3,732 instances); grouped by kernel family below, they resolve into a clear ranking.
+
+**Top time consumers, grouped by kernel family** (this groups by what the kernel *does* rather
+than its exact C++ template signature or shape, to make the ranking actionable; verified against
+`vtune-gui`'s Platform tab grouped by "source computing task"):
+
+| Rank | Category | GPU time | % of GPU-Time window | Instances | What it is |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **Convolution kernels** (`gen_conv`, `conv_reorder`) | 1.675 s | **24.7 %** | 720 | The single largest named consumer. Not previously named in this document; likely the model's patch-embedding and/or VAE conv layers — worth isolating which ones and whether channel/tile layout is XMX-friendly. |
+| 2 | **Dtype cast / copy kernels** (`CopyScalarFunc`, `CopyWithCastScalarFunc`) | 1.551 s | **22.9 %** | 11,912 | Every `.to(dtype)`, `.float()`, `.bfloat16()`, autocast boundary, and buffer copy in the forward path lowers to one of these. Candidate next workstream: audit dtype casts per layer (RoPE/PRoPE application, AdaLN modulation, attention output) for ones that are incidental rather than load-bearing. |
+| 3 | **GEMM** (`gemm_kernel`, dense matmul incl. attention projections) | 1.283 s | **18.9 %** | 3,732 | The "real work" — third-largest, not a small minority. This tempers the `max-autotune` arithmetic's framing above ("GEMM tuning has a low ceiling"): that measurement is real and independent (a full-rollout wall-clock A/B, not derived from this hotspots breakdown), but whether it generalizes given GEMM's actual 18.9 % share, or whether this 2-chunk profiling window happens to undersample GEMM shapes relative to the full-rollout average, is not yet answered by this document. |
+| 4 | **Other arithmetic elementwise** (`Mul`/`Div`/`Add`/`BinaryFunctor`, non-copy) | 0.762 s | **11.2 %** | 5,410 | Diffuse scheduler/normalization/residual math outside RoPE and activations. Unlikely to yield a single fix, but the instance count (5,410 over 2 chunks ≈ 90/layer) suggests per-layer elementwise ops that could fuse. |
+| 5 | **Activation / AdaLN modulation elementwise** (`SiluFunctor`, `GeluTanhFunctor`, `AUnaryFunctor`, `BUnaryFunctor`) | 0.452 s | **6.7 %** | 2,454 | SiLU/GELU activations and the AdaLN-style modulation chunk/scale/shift math flagged elsewhere in this document as a per-layer overhead candidate. |
+| — | **Fused scaled-dot-product attention** (`micro_sdpa`) | 0.435 s | 6.4 % | 600 | The attention-kernel cost as a named, isolated computing task, distinct from `gemm_kernel`'s Q/K/V/output projections — belongs alongside GEMM in any "real compute" accounting. |
+| — | complex128 elementwise math (RoPE/PRoPE freq tables) | 0.195 s | 2.9 % | 600 | Consistent with the RoPE/PRoPE frequency-table math this document already flags as a redundant, fp64-precision cost candidate for WS13. Independent hardware-counter confirmation that this op family is a real chunk of GPU time. |
+| — | everything else named | 0.213 s | 3.1 % | ~6,464 | Trig/pow, buffer fill, explicit memcpy commands, gather kernels — each individually under 1 %. |
+
+Reading this against the rest of the document: convolutions (24.7 %), dtype casts (22.9 %), and
+GEMM (18.9 %) are the three largest named consumers, together 66.5 % of the window; `micro_sdpa`
+(6.4 %) and complex128 RoPE math (2.9 %) are smaller but structurally distinct from the "diffuse
+overhead" categories. Convolutions and dtype casts were not previously on this document's radar
+at all and look like better next targets than continued compile/autotune work, given GEMM's
+measured 18.9 % share leaves comparatively little headroom for tile-size tuning to reach.
+
+Result kept on disk (raw data discarded, CSVs kept):
+`outputs/vtune_results/stage2_chunk4-5_20260922_184446/` (`vtune-gui` openable, 529 MB). No
+change to `stage2.py` or any shipped code; the three new files under `scripts/debug/` are a
+reusable diagnostic harness, not part of the inference path.
+
+### 2026-09-22 — Dtype-cast/copy category audited by call site; corroborates WS15, autocast layering flagged as open
+
+Followed up on the VTune "Dtype cast / copy kernels" row above (1.551 s, 22.9 %, 11,912
+instances) with a static grep audit of every `.to(dtype)`/`.float()`/`.double()`/`.type_as()`
+site and `torch.autocast` block in the Stage-2 hot path, to separate genuine casts (removable if
+the operand were already in the target dtype) from same-dtype copies that the profiler's kernel
+*names* (`CopyScalarFunc`/`CopyWithCastScalarFunc`) don't distinguish from casts. Not yet
+measured per-site (would need `torch.profiler` `record_function` markers scoped narrowly enough
+to avoid the `with_stack=True` OOM recorded under the WS7 `max-autotune` entry, or a wall-clock
+A/B on a candidate rewrite) — this is a static-audit finding only, recorded here to guide which
+site to instrument or A/B next, per the user's request to close this out as documentation rather
+than run anything new this session.
+
+- **The largest identified single cast site is `echorope_apply`** (`causal_model.py:260-266`):
+  `x[i, :valid_len].to(torch.float64)` → `view_as_complex` → complex128 multiply by the
+  `complex128` frequency table → `view_as_real` → `.type_as(x)` back to bf16. Called once each
+  for Q and K per layer per forward (`causal_model.py:883,894,938,978,983`), so ~2×30×(up to 6
+  forwards/chunk) times — consistent with an 11,912-instance total far above GEMM's 3,732 or
+  conv's 720. This is **exactly WS15's target** ("bf16 RoPE rotation instead of complex128"
+  below); the VTune breakdown is independent corroboration that the up/down-cast pair around
+  this rotation is a real, non-trivial slice of measured GPU time, not just the complex128
+  multiply itself (which is the separate 0.195 s / 2.9 % "complex128 elementwise math" row —
+  the *cast* traffic is additional, on top of that). WS15's own pre-check already found the
+  correct fix is bandwidth-driven (a minimal-traffic bf16 form, not a naive fp32 rewrite, which
+  is slower); no new number here, just confirmation from a second, independent profiler that
+  the target is real.
+- **PRoPE is not part of this.** `_apply_fused_prope` (camera projection, WS12's memoization
+  target) is real-valued matrix projection with no `float64`/`complex` round trip — the fp64
+  cast cost is specific to EchoRoPE's window-relative rotation, not the camera positional
+  encoding.
+- **Open question, not yet measured:** `self.diffusion.module`/`text_encoder`/`vae` are cast to
+  bf16 once at load (`inference.py:1028-1033`), and both diffusion forwards in the rollout loop
+  are additionally wrapped in `torch.autocast(dtype=torch.bfloat16)` (`stage2.py:1232-1236,
+  1288-1292`). Since the weights and activations are already bf16 going in, autocast should be
+  a no-op for GEMM/conv inputs (already the right dtype) — its only remaining effect would be
+  any op on PyTorch's autocast policy that forces fp32 regardless of ambient dtype (e.g. some
+  norm/softmax variants), which would insert an unnecessary up-cast/down-cast pair around
+  exactly those ops. Whether any op in this model actually hits that policy, and how much of
+  the 1.551 s it accounts for, is unverified — a candidate next audit (list ops on the bf16
+  autocast fp32-cast policy, check if any appear in `WanRMSNorm`/`WanLayerNorm`/attention here)
+  or a cheap A/B (disable `torch.autocast` entirely, since there's no fp32 master copy to
+  protect, and check cast-kernel count/time plus the PSNR gate for numerics drift).
+
+### 2026-09-22 — WS7 `max-autotune` measured; rejected the same as default mode
+
+Ran `torch.compile(block, dynamic=False, mode="max-autotune")` for real, with
+`_STAGE2_XPU_DYNAMO_VARIANTS = 32`, rather than leaving it as the skipped-on-arithmetic item
+recorded in the 2026-09-21 WS7 entry below. **Result: 3.3596 s/chunk steady state (stdev
+4.5 ms) against 3.3609 s eager and 3.3602 s default-mode compile — statistically the same as
+default mode, for 674.6 s of warmup against 79.0 s (8.5×).** Confirms the arithmetic rather than
+overturning it: the addressable GEMM gap was at most ~63 ms/chunk, and autotune recovered ~2 % of
+even that. **Found a new recompile cause the original WS7 measurement never saw:** one block hit
+`config.recompile_limit (32)` on `KeyError on prope_cache['q']` — WS12's PRoPE memoization dict is
+rebuilt fresh every forward and mutated as blocks run, so Dynamo's dict-key guard cannot
+stabilize on it. That one block fell back to eager for the rest of the run; the other 29 stayed
+compiled. This means the earlier "zero eager fallbacks" claim no longer holds as of WS12 landing,
+and `prope_cache` would need to be kept outside the compiled call signature before compile is
+revisited. **Profiling chunks 4–5 under this configuration reproducibly OOM-killed the 30 GiB
+host, three times** (twice with the profiler's default `with_stack=True`, once with it disabled),
+always during trace export; no per-op FLOP/TFLOP-s breakdown was obtained for `max-autotune`. Two
+temporary env-var hooks used for this measurement (`SOLARWM_STAGE2_XPU_COMPILE_MODE`,
+`SOLARWM_STAGE2_XPU_PROFILE_STACK`) were removed afterward; the in-tree code is unchanged from
+the 2026-09-21 WS7 state — `torch.compile(block, dynamic=False)`, default mode,
+`stage2_xpu_compile_blocks` still `false` by default. See the `max-autotune` result subsection
+under WS7 for the full writeup.
 
 ### 2026-09-21 — Citation audit: file:line references throughout this document were re-verified
 
