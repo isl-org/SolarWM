@@ -190,6 +190,8 @@ def prope_apply_fns_separate_cached(
     kv_Ks: Optional[torch.Tensor],  # (batch, kv_len, 3, 3)
     kv_window: Tuple[int, int],
     camera_translation_transform: str = "linear",
+    rope_freqs_q: Optional[torch.Tensor] = None,
+    rope_freqs_kv: Optional[torch.Tensor] = None,
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
@@ -206,7 +208,11 @@ def prope_apply_fns_separate_cached(
     Shape validation stays in :func:`prope_qkv_separate`, which the uncached
     path still runs; this returns transforms only, so it has no q/k/v to check.
     """
-    entry = cache.get("q")
+    if (rope_freqs_q is None) != (rope_freqs_kv is None):
+        raise ValueError("fused RoPE/PRoPE requires frequencies for both Q and K")
+    fused_rope = rope_freqs_q is not None
+    entry_key = "q_rope" if fused_rope else "q"
+    entry = cache.get(entry_key)
     if entry is None:
         apply_fn_q, _, apply_fn_o = _prepare_apply_fns_all_dim(
             head_dim=head_dim,
@@ -216,12 +222,13 @@ def prope_apply_fns_separate_cached(
             patches_y=None,
             image_width=None,
             image_height=None,
+            rope_freqs_q=rope_freqs_q,
         )
         entry = (apply_fn_q, apply_fn_o)
-        cache["q"] = entry
+        cache[entry_key] = entry
     apply_fn_q, apply_fn_o = entry
 
-    kv_key = ("kv", kv_window)
+    kv_key = ("kv_rope" if fused_rope else "kv", kv_window)
     apply_fn_kv = cache.get(kv_key)
     if apply_fn_kv is None:
         _, apply_fn_kv, _ = _prepare_apply_fns_all_dim(
@@ -232,10 +239,44 @@ def prope_apply_fns_separate_cached(
             patches_y=None,
             image_width=None,
             image_height=None,
+            rope_freqs_kv=rope_freqs_kv,
         )
         cache[kv_key] = apply_fn_kv
 
     return apply_fn_q, apply_fn_kv, apply_fn_o
+
+
+def _fuse_rope_into_matrix(matrix: torch.Tensor, rope_freqs: torch.Tensor) -> torch.Tensor:
+    """Compose a per-token 4x4 PRoPE matrix with two RoPE pair rotations.
+
+    ``matrix`` maps a feature column after RoPE.  This returns ``matrix @ R``,
+    where ``R`` consists of two independent complex rotations.  It keeps the
+    rotations implicit and uses column recombination instead of a generic
+    4x4-by-4x4 matrix multiply.
+    """
+    if matrix.ndim != 4 or matrix.shape[-2:] != (4, 4):
+        raise ValueError(f"expected per-token 4x4 matrices, got {tuple(matrix.shape)}")
+    if rope_freqs.ndim != 3 or rope_freqs.shape[:2] != matrix.shape[:2]:
+        raise ValueError(
+            "RoPE frequencies must be [batch, tokens, head_dim/2] and align with matrices: "
+            f"matrix={tuple(matrix.shape)}, freqs={tuple(rope_freqs.shape)}"
+        )
+    if rope_freqs.shape[-1] % 2:
+        raise ValueError("head_dim/2 must contain an even number of RoPE pairs")
+
+    pairs_per_block = 2
+    num_blocks = rope_freqs.shape[-1] // pairs_per_block
+    # [B, L, blocks, 2], retaining fp32/complex-derived precision until the
+    # final projection application casts to activation dtype.
+    cos = rope_freqs.real.reshape(*rope_freqs.shape[:2], num_blocks, pairs_per_block)
+    sin = rope_freqs.imag.reshape(*rope_freqs.shape[:2], num_blocks, pairs_per_block)
+    base = matrix.unsqueeze(-3).expand(*matrix.shape[:2], num_blocks, 4, 4)
+    fused = torch.empty_like(base)
+    for column, pair in ((0, 0), (2, 1)):
+        c, s = cos[..., pair].unsqueeze(-1), sin[..., pair].unsqueeze(-1)
+        fused[..., column] = base[..., column] * c + base[..., column + 1] * s
+        fused[..., column + 1] = -base[..., column] * s + base[..., column + 1] * c
+    return fused
 
 
 def _prepare_apply_fns_all_dim(
@@ -248,6 +289,8 @@ def _prepare_apply_fns_all_dim(
     image_height: int,  # Height of the image. Used to normalize intrinsics.
     coeffs_x: Optional[torch.Tensor] = None,
     coeffs_y: Optional[torch.Tensor] = None,
+    rope_freqs_q: Optional[torch.Tensor] = None,
+    rope_freqs_kv: Optional[torch.Tensor] = None,
 ) -> Tuple[
     Callable[[torch.Tensor], torch.Tensor],
     Callable[[torch.Tensor], torch.Tensor],
@@ -289,12 +332,30 @@ def _prepare_apply_fns_all_dim(
 
     # Block-diagonal transforms to the inputs and outputs of the attention operator.
     assert head_dim % 4 == 0
-    transforms_q = [
-        (partial(_apply_tiled_projmat, matrix=P_T), head_dim),
-    ]
-    transforms_kv = [
-        (partial(_apply_tiled_projmat, matrix=P_inv), head_dim),
-    ]
+    if rope_freqs_q is None:
+        transforms_q = [(partial(_apply_tiled_projmat, matrix=P_T), head_dim)]
+    else:
+        transforms_q = [
+            (
+                partial(
+                    _apply_tiled_projmat_per_block,
+                    matrix=_fuse_rope_into_matrix(P_T, rope_freqs_q),
+                ),
+                head_dim,
+            )
+        ]
+    if rope_freqs_kv is None:
+        transforms_kv = [(partial(_apply_tiled_projmat, matrix=P_inv), head_dim)]
+    else:
+        transforms_kv = [
+            (
+                partial(
+                    _apply_tiled_projmat_per_block,
+                    matrix=_fuse_rope_into_matrix(P_inv, rope_freqs_kv),
+                ),
+                head_dim,
+            )
+        ]
     transforms_o = [
         (partial(_apply_tiled_projmat, matrix=P), head_dim),
     ]
@@ -335,6 +396,23 @@ def _apply_tiled_projmat(
         "bcij,bncpkj->bncpki",
         matrix,
         feats.reshape((batch, num_heads, cameras, -1, feat_dim // D, D)),
+    ).reshape(feats.shape)
+
+
+def _apply_tiled_projmat_per_block(
+    feats: torch.Tensor,
+    matrix: torch.Tensor,  # [B, L, head_dim/4, 4, 4]
+) -> torch.Tensor:
+    """Apply distinct fused RoPE/PRoPE matrices to each contiguous 4-wide block."""
+    batch, num_heads, seqlen, feat_dim = feats.shape
+    if matrix.shape != (batch, seqlen, feat_dim // 4, 4, 4):
+        raise ValueError(
+            "per-block projection matrix must be [B, L, head_dim/4, 4, 4], got "
+            f"{tuple(matrix.shape)} for features {tuple(feats.shape)}"
+        )
+    feats_ = feats.view(batch, num_heads, seqlen, feat_dim // 4, 4)
+    return torch.einsum(
+        "btpij,bntpj->bntpi", matrix.to(dtype=feats.dtype), feats_
     ).reshape(feats.shape)
 
 

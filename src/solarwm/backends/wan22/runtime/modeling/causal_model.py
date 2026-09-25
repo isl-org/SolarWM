@@ -146,6 +146,7 @@ def echorope_apply(
     frame_indices=None,
     seq_offsets=None,
     grid_list=None,
+    rope_dtype=None,
 ):
     """Apply window-relative RoPE to self-attention Q/K.
 
@@ -175,10 +176,34 @@ def echorope_apply(
             it was the single graph break in the whole transformer block, once
             per rope call.  Callers that already hold the sizes as Python ints
             pass them here instead.
+        rope_dtype: Optional float dtype to perform rotation in (torch.float64,
+            torch.float32, or torch.float16). If None, deduced from ``freqs.dtype``.
 
     Tail tokens beyond ``prod(grid_sizes[i])`` are FlexAttention padding and are
     copied through unrotated.
     """
+    if rope_dtype is not None:
+        if str(rope_dtype).strip().lower() in {"float16", "fp16"} or rope_dtype == torch.float16:
+            rope_real_dtype = torch.float16
+            rope_complex_dtype = torch.complex32
+        elif str(rope_dtype).strip().lower() in {"float32", "fp32"} or rope_dtype == torch.float32:
+            rope_real_dtype = torch.float32
+            rope_complex_dtype = torch.complex64
+        elif str(rope_dtype).strip().lower() in {"float64", "fp64"} or rope_dtype == torch.float64:
+            rope_real_dtype = torch.float64
+            rope_complex_dtype = torch.complex128
+        else:
+            raise ValueError(f"Unsupported rope_dtype: {rope_dtype}")
+        if freqs.dtype != rope_complex_dtype:
+            freqs = freqs.to(rope_complex_dtype)
+    else:
+        if freqs.dtype == torch.complex32:
+            rope_real_dtype = torch.float16
+        elif freqs.dtype == torch.complex64:
+            rope_real_dtype = torch.float32
+        else:
+            rope_real_dtype = torch.float64
+
     n, c = x.size(2), x.size(3) // 2
     freqs_t, freqs_h, freqs_w = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
@@ -258,12 +283,12 @@ def echorope_apply(
 
         if valid_len > 0:
             x_i = torch.view_as_complex(
-                x[i, :valid_len].to(torch.float64).reshape(valid_len, n, -1, 2)
+                x[i, :valid_len].to(rope_real_dtype).reshape(valid_len, n, -1, 2)
             )
             freqs_i = freqs_i_full[seq_offset : seq_offset + valid_len]
             x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         else:
-            x_i = x[i, :0].to(torch.float64)
+            x_i = x[i, :0].to(rope_real_dtype)
         if x.shape[1] > valid_len:
             x_i = torch.cat([x_i, x[i, valid_len:].to(x_i.dtype)])
         output.append(x_i)
@@ -278,6 +303,7 @@ def block_relativistic_rope(
     start_frame=0,
     relative_frame_indices=None,
     grid_list=None,
+    rope_dtype=None,
 ):
     """Apply the SolarWM window/block-relative Wan RoPE.
 
@@ -293,6 +319,7 @@ def block_relativistic_rope(
         start_frame=start_frame,
         frame_indices=relative_frame_indices,
         grid_list=grid_list,
+        rope_dtype=rope_dtype,
     )
 
 
@@ -626,6 +653,7 @@ class CausalWanSelfAttention(nn.Module):
         use_echorope=True,
         camera_attention_mode="parallel",
         camera_translation_transform="linear",
+        fuse_rope_prope=False,
     ):
         assert dim % num_heads == 0
         super().__init__()
@@ -641,6 +669,7 @@ class CausalWanSelfAttention(nn.Module):
         if self.rope_train_frames is not None and self.rope_train_frames <= 0:
             raise ValueError(f"rope_train_frames must be positive, got {self.rope_train_frames}")
         self.use_echorope = bool(use_echorope)
+        self.fuse_rope_prope = bool(fuse_rope_prope)
         self.camera_attention_mode = normalize_camera_attention_mode(camera_attention_mode)
         self.camera_translation_transform = normalize_camera_translation_transform(
             camera_translation_transform
@@ -670,6 +699,8 @@ class CausalWanSelfAttention(nn.Module):
         kv_cam_K=None,
         prope_cache=None,
         kv_window=None,
+        rope_freqs_q=None,
+        rope_freqs_kv=None,
     ):
         """Apply SolarWM PRoPE after ordinary RoPE, before one attention pass.
 
@@ -686,6 +717,8 @@ class CausalWanSelfAttention(nn.Module):
         """
         if self.camera_attention_mode != "fused_prope":
             return q, k, v, None
+        if (rope_freqs_q is None) != (rope_freqs_kv is None):
+            raise ValueError("fused RoPE/PRoPE requires Q and K RoPE frequencies together")
         if cam_viewmats is None and cam_K is None:
             return q, k, v, None
         if cam_viewmats is None or cam_K is None:
@@ -742,6 +775,8 @@ class CausalWanSelfAttention(nn.Module):
                     kv_Ks=kv_cam_K,
                     kv_window=kv_window,
                     camera_translation_transform=self.camera_translation_transform,
+                    rope_freqs_q=rope_freqs_q,
+                    rope_freqs_kv=rope_freqs_kv,
                 )
                 q_t = apply_fn_q(q.transpose(1, 2))
                 k_t = apply_fn_kv(k.transpose(1, 2))
@@ -752,6 +787,53 @@ class CausalWanSelfAttention(nn.Module):
             v_t.transpose(1, 2),
             apply_fn_o,
         )
+
+    @staticmethod
+    def _echorope_freqs(
+        *,
+        token_count,
+        grid_sizes,
+        freqs,
+        start_frame,
+        grid_list=None,
+    ):
+        """Build EchoRoPE complex multipliers without applying them to Q/K.
+
+        This mirrors ``echorope_apply``'s contiguous-window coordinate path.
+        The fused PRoPE route only uses it for the standalone circular-cache
+        inference layout, which contains no FlexAttention padding.
+        """
+        pairs = freqs.shape[1]
+        split = pairs // 3
+        freqs_t, freqs_h, freqs_w = freqs.split([pairs - 2 * split, split, split], dim=1)
+        result = []
+        sizes = grid_list if grid_list is not None else grid_sizes.tolist()
+        for f, h, w in sizes:
+            seq_len = f * h * w
+            if token_count != seq_len:
+                raise ValueError(
+                    "fused RoPE/PRoPE only supports unpadded complete grids: "
+                    f"tokens={token_count}, grid={f}x{h}x{w}"
+                )
+            if start_frame < 0 or start_frame + f > freqs_t.shape[0]:
+                raise ValueError(
+                    f"EchoRoPE temporal range [{start_frame}, {start_frame + f - 1}] "
+                    f"is outside RoPE table length {freqs_t.shape[0]}"
+                )
+            temporal_idx = torch.arange(
+                start_frame, start_frame + f, device=freqs.device, dtype=torch.long
+            )
+            result.append(
+                torch.cat(
+                    [
+                        freqs_t[temporal_idx].view(f, 1, 1, -1).expand(f, h, w, -1),
+                        freqs_h[:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                        freqs_w[:w].view(1, 1, w, -1).expand(f, h, w, -1),
+                    ],
+                    dim=-1,
+                ).reshape(seq_len, pairs)
+            )
+        return torch.stack(result)
 
     @staticmethod
     def _window_relative_positions(
@@ -1175,15 +1257,71 @@ class CausalWanSelfAttention(nn.Module):
             window_start = new_ring_start + max(0, new_local_end - self.max_attention_size)
             window_end = new_ring_start + new_local_end
             k_window_raw = kv_cache["k"][:, window_start:window_end]
-            roped_query, roped_k_window, _ = self._rope_q_and_window_k(
-                q=q,
-                k_window=k_window_raw,
-                grid_sizes=grid_sizes,
-                freqs=freqs,
-                frame_seqlen=frame_seqlen,
-                num_new_tokens=num_new_tokens,
-                grid_list=grid_list,
+            fused_rope_prope = (
+                self.fuse_rope_prope
+                and self.camera_attention_mode == "fused_prope"
+                and prope_cache is not None
             )
+            if fused_rope_prope:
+                num_window_frames = k_window_raw.shape[1] // frame_seqlen
+                num_new_frames = num_new_tokens // frame_seqlen
+                if self.use_echorope:
+                    pos = self._window_relative_positions(
+                        current_start_frame=max(0, num_window_frames - num_new_frames),
+                        num_new_frames=num_new_frames,
+                        num_context_frames=num_window_frames,
+                        num_query_memory_frames=0,
+                        num_sink_frames=0,
+                        pmax=self._echorope_pmax_frames(freqs, min_frames=num_new_frames),
+                        num_frame_per_block=getattr(
+                            self, "num_frame_per_block_attr", num_new_frames
+                        ),
+                    )
+                else:
+                    # Match _rope_q_and_window_k's block-relative fallback.
+                    pos = {
+                        "q_start": num_window_frames - num_new_frames,
+                        "local_start": 0,
+                    }
+                q_grid_list = (
+                    None if grid_list is None else [(num_new_frames, h, w) for _, h, w in grid_list]
+                )
+                k_grid_list = (
+                    None
+                    if grid_list is None
+                    else [(num_window_frames, h, w) for _, h, w in grid_list]
+                )
+                q_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+                k_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+                if grid_list is None:
+                    q_grid[:, 0] = num_new_frames
+                    k_grid[:, 0] = num_window_frames
+                rope_freqs_q = self._echorope_freqs(
+                    token_count=q.shape[1],
+                    grid_sizes=q_grid,
+                    grid_list=q_grid_list,
+                    freqs=freqs,
+                    start_frame=pos["q_start"],
+                )
+                rope_freqs_kv = self._echorope_freqs(
+                    token_count=k_window_raw.shape[1],
+                    grid_sizes=k_grid,
+                    grid_list=k_grid_list,
+                    freqs=freqs,
+                    start_frame=pos["local_start"],
+                )
+                roped_query, roped_k_window = q, k_window_raw
+            else:
+                rope_freqs_q = rope_freqs_kv = None
+                roped_query, roped_k_window, _ = self._rope_q_and_window_k(
+                    q=q,
+                    k_window=k_window_raw,
+                    grid_sizes=grid_sizes,
+                    freqs=freqs,
+                    frame_seqlen=frame_seqlen,
+                    num_new_tokens=num_new_tokens,
+                    grid_list=grid_list,
+                )
             visible_cam_viewmats = None
             visible_cam_K = None
             if kv_cam_viewmats is not None or kv_cam_K is not None:
@@ -1201,6 +1339,8 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cam_K=visible_cam_K,
                 prope_cache=prope_cache,
                 kv_window=(window_start, window_end),
+                rope_freqs_q=rope_freqs_q,
+                rope_freqs_kv=rope_freqs_kv,
             )
             x = attention(attn_q, attn_k, attn_v)
             if apply_fn_o is not None:
@@ -1756,6 +1896,7 @@ class CausalWanAttentionBlock(nn.Module):
         frame_seq_length = int(kwargs.get("frame_seq_length", 880))
         rope_train_frames = kwargs.get("rope_train_frames", None)
         use_echorope = bool(kwargs.get("use_echorope", True))
+        fuse_rope_prope = bool(kwargs.get("fuse_rope_prope", False))
         self.camera_attention_mode = normalize_camera_attention_mode(
             kwargs.get("camera_attention_mode", "parallel")
         )
@@ -1777,6 +1918,7 @@ class CausalWanAttentionBlock(nn.Module):
             use_echorope=use_echorope,
             camera_attention_mode=self.camera_attention_mode,
             camera_translation_transform=self.camera_translation_transform,
+            fuse_rope_prope=fuse_rope_prope,
         )
         self.norm3 = (
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -1990,6 +2132,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         use_echorope=True,
         camera_attention_mode="parallel",
         camera_translation_transform="linear",
+        fuse_rope_prope=False,
+        rope_dtype="float64",
         flow_objective="flow_matching",
         anyflow_gate=0.25,
         anyflow_deltatime_type="r",
@@ -2016,6 +2160,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         )
         self.rope_train_frames = None if rope_train_frames is None else int(rope_train_frames)
         self.use_echorope = bool(use_echorope)
+        self.fuse_rope_prope = bool(fuse_rope_prope)
+        if str(rope_dtype).strip().lower() in {"float16", "fp16"} or rope_dtype == torch.float16:
+            self.rope_dtype = torch.float16
+            self.rope_complex_dtype = torch.complex32
+        elif str(rope_dtype).strip().lower() in {"float32", "fp32"} or rope_dtype == torch.float32:
+            self.rope_dtype = torch.float32
+            self.rope_complex_dtype = torch.complex64
+        else:
+            self.rope_dtype = torch.float64
+            self.rope_complex_dtype = torch.complex128
         self.camera_attention_mode = normalize_camera_attention_mode(camera_attention_mode)
         self.camera_translation_transform = normalize_camera_translation_transform(
             camera_translation_transform
@@ -2063,6 +2217,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     use_echorope=self.use_echorope,
                     camera_attention_mode=self.camera_attention_mode,
                     camera_translation_transform=self.camera_translation_transform,
+                    fuse_rope_prope=self.fuse_rope_prope,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -2085,7 +2240,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 rope_params(1024, 2 * (d // 6)),
             ],
             dim=1,
-        )
+        ).to(self.rope_complex_dtype)
 
         self.init_weights()
         # Create the second time MLP only for AnyFlow, after all base modules
@@ -2369,8 +2524,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         Camera viewmats/K (in y_camera) are concatenated to cover both halves.
         """
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+        if self.freqs.device != device or self.freqs.dtype != self.rope_complex_dtype:
+            self.freqs = self.freqs.to(device=device, dtype=self.rope_complex_dtype)
         self.num_frame_per_block = int(num_frame_per_block)
 
         # Bring (B, C_in, F, H, W) into the canonical list-of-clip form used by
@@ -2621,8 +2776,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         clean / noisy halves are no longer same-length-paired.
         """
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+        if self.freqs.device != device or self.freqs.dtype != self.rope_complex_dtype:
+            self.freqs = self.freqs.to(device=device, dtype=self.rope_complex_dtype)
         self.num_frame_per_block = int(num_frame_per_block)
 
         def _as_list(z):
@@ -2956,8 +3111,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 aug_r=aug_r,
             )
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+        if self.freqs.device != device or self.freqs.dtype != self.rope_complex_dtype:
+            self.freqs = self.freqs.to(device=device, dtype=self.rope_complex_dtype)
         if kv_cache is not None:
             self.num_frame_per_block = self._infer_num_frame_per_block_from_t(t)
 
@@ -3079,10 +3234,33 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             _is_circular_cache(cache) for cache in kv_cache
         )
         # PRoPE projection matrices depend only on the camera tensors staged
-        # above, so every block would otherwise rebuild the same ones. Scope
-        # the memo to this forward; the ring window slides on the next commit.
+        # above, so every block would otherwise rebuild the same ones.
+        #
+        # The fused RoPE/PRoPE path can also retain its matrices across the
+        # four denoise calls and one detached commit that use the same
+        # uncommitted circular-cache window. Replace the memo as soon as the
+        # next window is selected, so camera matrices never bleed into a
+        # subsequent chunk and the cache remains bounded to one window.
         if circular_inference_cache and self.camera_attention_mode == "fused_prope":
-            block_kwargs["prope_cache"] = {}
+            if self.fuse_rope_prope:
+                cache0 = kv_cache[0]
+                capacity = int(cache0["_circular_capacity"])
+                local_end = _cache_index(cache0, "local_end_index")
+                ring_start = int(cache0["_circular_ring_start"])
+                new_local_end = min(capacity, local_end + x.shape[1])
+                evicted = max(0, local_end + x.shape[1] - capacity)
+                new_ring_start = (ring_start + evicted) % capacity
+                matrix_key = (
+                    new_ring_start + max(0, new_local_end - self.blocks[0].self_attn.max_attention_size),
+                    new_ring_start + new_local_end,
+                )
+                persisted = cache0.get("_fused_rope_prope_matrix_cache")
+                if not isinstance(persisted, dict) or persisted.get("window") != matrix_key:
+                    persisted = {"window": matrix_key, "matrices": {}}
+                    cache0["_fused_rope_prope_matrix_cache"] = persisted
+                block_kwargs["prope_cache"] = persisted["matrices"]
+            else:
+                block_kwargs["prope_cache"] = {}
 
         cache_update_infos = []
         for block_index, block in enumerate(self.blocks):

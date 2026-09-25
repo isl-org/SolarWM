@@ -220,13 +220,17 @@ class Wan5BVAE:
             torch.is_autocast_enabled(device_type),
             torch.get_autocast_dtype(device_type),
         )
-        cached = self._scale_cache.get(key)
+        cache = getattr(self, "_scale_cache", None)
+        if cache is None:
+            cache = {}
+            self._scale_cache = cache
+        cached = cache.get(key)
         if cached is None:
             cached = (
                 self._mean.to(device=reference.device, dtype=reference.dtype),
                 1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
             )
-            self._scale_cache[key] = cached
+            cache[key] = cached
         return [cached[0], cached[1]]
 
     def encode(self, pixels_bcthw: Any) -> Any:
@@ -449,13 +453,17 @@ class WanA14BVAE:
             torch.is_autocast_enabled(device_type),
             torch.get_autocast_dtype(device_type),
         )
-        cached = self._scale_cache.get(key)
+        cache = getattr(self, "_scale_cache", None)
+        if cache is None:
+            cache = {}
+            self._scale_cache = cache
+        cached = cache.get(key)
         if cached is None:
             cached = (
                 self._mean.to(device=reference.device, dtype=reference.dtype),
                 1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
             )
-            self._scale_cache[key] = cached
+            cache[key] = cached
         return [cached[0], cached[1]]
 
     def encode(self, pixels_bcthw: Any) -> Any:

@@ -288,6 +288,25 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "inference.stage2_xpu_compile_blocks is supported only for "
             "standalone Stage2 camera-length inference",
         )
+    fuse_rope_prope = runtime.get("stage2_fuse_rope_prope", False)
+    _require(
+        isinstance(fuse_rope_prope, bool),
+        "runtime.stage2_fuse_rope_prope must be boolean",
+    )
+    if fuse_rope_prope:
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_fuse_rope_prope is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    rope_dtype = runtime.get("stage2_rope_dtype")
+    if rope_dtype is not None:
+        _require(
+            str(rope_dtype).strip().lower() in {"float64", "fp64", "float32", "fp32", "float16", "fp16"},
+            f"runtime.stage2_rope_dtype must be one of float64, float32, float16; got {rope_dtype}",
+        )
     cache_mode = str(inference.get("kv_cache_mode", "circular")).strip().lower()
     if (
         str(config.get("action", "")).strip().lower() == "infer"
@@ -475,6 +494,12 @@ def _validate_common_model(config: Mapping[str, Any], route: Route, profile: Fam
         transform in {"linear", "logd4"},
         "model.camera_translation_transform must be linear or logd4",
     )
+    rope_dtype = model.get("rope_dtype")
+    if rope_dtype is not None:
+        _require(
+            str(rope_dtype).strip().lower() in {"float64", "fp64", "float32", "fp32", "float16", "fp16"},
+            f"model.rope_dtype must be one of float64, float32, float16; got {rope_dtype}",
+        )
     causal = bool(model.get("causal"))
     _require(
         causal is (route.stage in {"stage1", "stage2"}),

@@ -35,7 +35,29 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes, freqs, rope_dtype=None):
+    if rope_dtype is not None:
+        if str(rope_dtype).strip().lower() in {"float16", "fp16"} or rope_dtype == torch.float16:
+            rope_real_dtype = torch.float16
+            rope_complex_dtype = torch.complex32
+        elif str(rope_dtype).strip().lower() in {"float32", "fp32"} or rope_dtype == torch.float32:
+            rope_real_dtype = torch.float32
+            rope_complex_dtype = torch.complex64
+        elif str(rope_dtype).strip().lower() in {"float64", "fp64"} or rope_dtype == torch.float64:
+            rope_real_dtype = torch.float64
+            rope_complex_dtype = torch.complex128
+        else:
+            raise ValueError(f"Unsupported rope_dtype: {rope_dtype}")
+        if freqs.dtype != rope_complex_dtype:
+            freqs = freqs.to(rope_complex_dtype)
+    else:
+        if freqs.dtype == torch.complex32:
+            rope_real_dtype = torch.float16
+        elif freqs.dtype == torch.complex64:
+            rope_real_dtype = torch.float32
+        else:
+            rope_real_dtype = torch.float64
+
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -47,7 +69,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+        x_i = torch.view_as_complex(x[i, :seq_len].to(rope_real_dtype).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
                 freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),

@@ -198,8 +198,13 @@ def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
 
     model_config = config.get("model", {})
     train = config.get("train", {})
-    if not isinstance(model_config, Mapping) or not isinstance(train, Mapping):
-        raise BackendContractError("model and train must be mappings")
+    runtime = config.get("runtime", {})
+    if (
+        not isinstance(model_config, Mapping)
+        or not isinstance(train, Mapping)
+        or not isinstance(runtime, Mapping)
+    ):
+        raise BackendContractError("model, train, and runtime must be mappings")
     layout = WanAssetLayout.from_config(config)
     objective = str(train.get("objective", "flow_matching"))
     overrides: dict[str, Any] = {
@@ -212,6 +217,10 @@ def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
         "camera_translation_transform": str(
             model_config.get("camera_translation_transform", "linear")
         ),
+        "fuse_rope_prope": bool(runtime.get("stage2_fuse_rope_prope", False)),
+        "rope_dtype": str(
+            runtime.get("stage2_rope_dtype", model_config.get("rope_dtype", "float64"))
+        ).strip().lower(),
         "flow_objective": objective,
     }
     optional = ("max_prior_clean_chunks", "rope_train_frames")
