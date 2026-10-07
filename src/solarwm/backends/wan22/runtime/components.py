@@ -175,7 +175,12 @@ class Wan5BVAE:
         0.7744,
     )
 
-    def __init__(self, weights: str | Path) -> None:
+    def __init__(
+        self,
+        weights: str | Path,
+        *,
+        xpu_channels_last: bool = True,
+    ) -> None:
         import torch
 
         from .modeling.vae import _video_vae
@@ -183,6 +188,7 @@ class Wan5BVAE:
         self._mean = torch.tensor(self.mean, dtype=torch.float32)
         self._std = torch.tensor(self.std, dtype=torch.float32)
         self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+        self._xpu_channels_last = xpu_channels_last
         try:
             self.module = (
                 _video_vae(
@@ -197,7 +203,21 @@ class Wan5BVAE:
             raise BackendContractError(f"cannot load Wan VAE {weights}: {exc}") from exc
 
     def to(self, device: Any, *, dtype: Any | None = None) -> Wan5BVAE:
+        import torch
+
         self.module.to(device=device, dtype=dtype)
+        device_type = torch.device(device).type
+        use_xpu_bfloat16 = (
+            device_type == "xpu"
+            and dtype == torch.bfloat16
+        )
+        self.module.configure_xpu_bfloat16_decode(use_xpu_bfloat16)
+        if device_type == "xpu" and self._xpu_channels_last:
+            for child in self.module.modules():
+                if isinstance(child, torch.nn.Conv3d):
+                    child.to(memory_format=torch.channels_last_3d)
+                elif isinstance(child, torch.nn.Conv2d):
+                    child.to(memory_format=torch.channels_last)
         return self
 
     def _scale(self, reference: Any) -> list[Any]:
@@ -226,9 +246,12 @@ class Wan5BVAE:
             self._scale_cache = cache
         cached = cache.get(key)
         if cached is None:
+            std = self._std.to(device=reference.device, dtype=reference.dtype)
             cached = (
                 self._mean.to(device=reference.device, dtype=reference.dtype),
-                1.0 / self._std.to(device=reference.device, dtype=reference.dtype),
+                # Preserve the checkpoint's required bf16-then-reciprocal rounding
+                # while preventing autocast from widening this elementwise scale.
+                (1.0 / std).to(dtype=reference.dtype),
             )
             cache[key] = cached
         return [cached[0], cached[1]]
@@ -309,9 +332,11 @@ class Wan5BVAE:
                 )
             # Match decode_streaming_chunks' contiguous BCTHW tile layout exactly.
             clip = latents_btchw.permute(0, 2, 1, 3, 4).contiguous()
+            if clip.device.type == "xpu" and self._xpu_channels_last:
+                clip = clip.to(memory_format=torch.channels_last_3d)
             with torch.autocast(device_type=clip.device.type, dtype=clip.dtype):
                 decoded = cached_decode(clip, self._scale(clip))
-            return decoded.float().clamp_(-1, 1).permute(0, 2, 1, 3, 4).contiguous()
+            return decoded.clamp_(-1, 1).permute(0, 2, 1, 3, 4).contiguous()
 
         try:
             yield decode_tile

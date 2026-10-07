@@ -3135,7 +3135,13 @@ class CudaWanStage2GenerationAdapter:
                     self.diffusion.module.eval().requires_grad_(False).to(
                         device=self.device, dtype=inference_dtype
                     )
-                    self.vae = Wan5BVAE(layout.vae)
+                    runtime_options = values.get("runtime", {})
+                    self.vae = Wan5BVAE(
+                        layout.vae,
+                        xpu_channels_last=bool(
+                            runtime_options.get("stage2_vae_channels_last", True)
+                        ),
+                    )
                     self.vae.to(self.device, dtype=inference_dtype)
                 self._stage2_inference_buffers = (
                     _allocate_stage2_inference_buffers(

@@ -182,6 +182,21 @@ def load_base_weights(model: Any, directory: str | Path) -> WeightLoadReport:
     return report
 
 
+def _normalize_fused_kernel(value: Any) -> str | None:
+    if value is None:
+        return None
+    val = str(value).strip().lower()
+    if val in ("none", ""):
+        return None
+    if val in ("reference", "fused_rope_prope_sdpa_reference"):
+        return "reference"
+    if val in ("fused_rope_prope_sdpa", "sdpa", "fused_sdpa"):
+        return "fused_rope_prope_sdpa"
+    if val in ("fused_rope_prope_sage", "sage", "fused_sage"):
+        return "fused_rope_prope_sage"
+    raise BackendContractError(f"unsupported fused_kernel={value!r}")
+
+
 def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
     """Construct the configured camera transformer without loading weights.
 
@@ -218,6 +233,13 @@ def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
             model_config.get("camera_translation_transform", "linear")
         ),
         "fuse_rope_prope": bool(runtime.get("stage2_fuse_rope_prope", False)),
+        "fused_kernel": (
+            _normalize_fused_kernel(
+                runtime.get("stage2_fused_kernel")
+                or model_config.get("stage2_fused_kernel")
+                or model_config.get("fused_kernel")
+            )
+        ),
         "rope_dtype": str(
             runtime.get("stage2_rope_dtype", model_config.get("rope_dtype", "float64"))
         ).strip().lower(),

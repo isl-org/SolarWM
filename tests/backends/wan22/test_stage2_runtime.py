@@ -1220,7 +1220,7 @@ def test_stage2_cuda_adapter_admits_multiple_logical_dp_groups(
         lambda _: SimpleNamespace(module=movable),
     )
     monkeypatch.setattr(stage2, "WanTextEncoder", lambda *_, **__: movable)
-    monkeypatch.setattr(stage2, "Wan5BVAE", lambda *_: movable)
+    monkeypatch.setattr(stage2, "Wan5BVAE", lambda *_, **__: movable)
     config = {
         "model": {"family": "wan22_ti2v_5b"},
         "distributed": {"sequence_parallel_size": 1},

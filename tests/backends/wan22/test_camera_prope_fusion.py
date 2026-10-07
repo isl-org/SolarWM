@@ -134,3 +134,78 @@ def test_cached_fused_q_and_kv_transforms_are_reused_and_correct() -> None:
     assert first[0] is second[0]
     assert first[1] is second[1]
     assert set(cache) == {"q_rope", ("kv_rope", (0, kv_tokens))}
+
+
+def test_causal_self_attention_fused_kernels_execution() -> None:
+    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+        return
+
+    from solarwm.backends.wan22.runtime.modeling.causal_model import CausalWanSelfAttention, rope_params
+
+    dev = "xpu"
+    dim, num_heads = 256, 2
+    head_dim = dim // num_heads
+    frame_seqlen = 16
+    local_attn_size = 4
+    cache_tokens = local_attn_size * frame_seqlen
+    capacity = cache_tokens
+    physical_cache_tokens = cache_tokens * 2
+
+    for kernel in ("reference", "fused_rope_prope_sdpa", "fused_rope_prope_sage"):
+        attn = CausalWanSelfAttention(
+            dim=dim,
+            num_heads=num_heads,
+            local_attn_size=local_attn_size,
+            sink_size=0,
+            camera_attention_mode="fused_prope",
+            camera_translation_transform="linear",
+            fused_kernel=kernel,
+            rope_dtype="float64",
+            frame_seq_length=frame_seqlen,
+        ).to(device=dev, dtype=torch.bfloat16)
+
+        q_tokens = 2 * frame_seqlen
+        q = torch.randn(1, q_tokens, dim, dtype=torch.bfloat16, device=dev)
+        grid_sizes = torch.tensor([[2, 4, 4]], device=dev)
+        d = head_dim
+        freqs = torch.cat(
+            [
+                rope_params(1024, d - 4 * (d // 6)),
+                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, 2 * (d // 6)),
+            ],
+            dim=1,
+        ).to(device=dev, dtype=torch.complex128)
+
+        cam_viewmats = torch.eye(4, device=dev, dtype=torch.float64).repeat(1, q_tokens, 1, 1)
+        cam_K = torch.eye(3, device=dev, dtype=torch.float64).repeat(1, q_tokens, 1, 1)
+
+        kv_cache = {
+            "k": torch.zeros(1, physical_cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "v": torch.zeros(1, physical_cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "global_end_index": 0,
+            "local_end_index": 0,
+            "_circular_kv_cache": True,
+            "_circular_capacity": capacity,
+            "_circular_ring_start": 0,
+        }
+        kv_cam_vm = torch.eye(4, device=dev, dtype=torch.float64).repeat(1, physical_cache_tokens, 1, 1)
+        kv_cam_K = torch.eye(3, device=dev, dtype=torch.float64).repeat(1, physical_cache_tokens, 1, 1)
+
+        out, cache_update = attn(
+            q,
+            seq_lens=None,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            kv_cache=kv_cache,
+            current_start=0,
+            cam_viewmats=cam_viewmats,
+            cam_K=cam_K,
+            kv_cam_viewmats=kv_cam_vm,
+            kv_cam_K=kv_cam_K,
+            frame_seqlen=frame_seqlen,
+            cache_update_policy="commit_detached",
+        )
+        assert out.shape == (1, q_tokens, dim)
+        assert cache_update[0] == q_tokens
+

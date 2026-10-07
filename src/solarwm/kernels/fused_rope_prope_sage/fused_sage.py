@@ -224,23 +224,24 @@ def _build_tables(fr, q_grid_sizes, k_grid_sizes, seq_q, seq_k, q_start_frame,
     # fp16 (cos, sin) for the Q/K rotation -- see _transform_tile
     cs_q = torch.empty((batch, seq_q, 2 * c), dtype=torch.float16, device=dev)
     cs_k = torch.empty((batch, seq_k, 2 * c), dtype=torch.float16, device=dev)
-    grid_q = q_grid_sizes.contiguous()
-    grid_k = k_grid_sizes.contiguous()
+    grid_q = q_grid_sizes.to(device=dev).contiguous()
+    grid_k = k_grid_sizes.to(device=dev).contiguous()
     tb = _TABLE_BLOCK_T
     n_qb, n_kb = triton.cdiv(seq_q, tb), triton.cdiv(seq_k, tb)
 
-    vmq = q_viewmats.contiguous()
-    vmk = kv_viewmats.contiguous()
+    vmq = q_viewmats.to(torch.float32).contiguous()
+    vmk = kv_viewmats.to(torch.float32).contiguous()
     has_k = q_Ks is not None and cameras
-    ksq = q_Ks.contiguous() if has_k else vmq
-    ksk = kv_Ks.contiguous() if has_k else vmk
+    ksq = q_Ks.to(torch.float32).contiguous() if has_k else vmq
+    ksk = kv_Ks.to(torch.float32).contiguous() if has_k else vmk
+    rot_f32 = rot.to(torch.float32) if rot is not None else None
     f32 = dict(dtype=torch.float32, device=dev)
     q_tabs = torch.empty((3, batch, nq, 16), **f32)       # P^T, P, scratch
     k_tabs = torch.empty((3, batch, nkv, 16), **f32)      # P^-1, rotated P^-1, scratch
     p_kv_k = k_tabs[1] if rot is not None else k_tabs[0]
     ncam = (nq, nkv) if cameras else (0, 0)
     _sage_tables_kernel[(ncam[0] + ncam[1] + n_qb + n_kb, batch)](
-        vmq, ksq, vmk, ksk, rot if rot is not None else vmq,
+        vmq, ksq, vmk, ksk, rot_f32 if rot_f32 is not None else vmq,
         q_tabs[0], q_tabs[1], k_tabs[0], p_kv_k, q_tabs[2], k_tabs[2],
         fr, grid_q, grid_k, cs_q, cs_k,
         ncam[0], ncam[1], n_qb, seq_q, seq_k, q_start_frame, k_start_frame, fr.shape[0],

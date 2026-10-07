@@ -24,6 +24,15 @@ import copy
 import math
 import os
 
+try:
+    from solarwm.kernels.fused_rope_prope_sage import (
+        fused_rope_prope_sdpa_split,
+        fused_rope_prope_sage,
+    )
+except ImportError:
+    fused_rope_prope_sdpa_split = None
+    fused_rope_prope_sage = None
+
 # Lazily-imported FlexAttention symbols. Some torch builds don't ship
 # torch.nn.attention.flex_attention; we only require it when stage1 TF mode
 # is actually used (the inference / KV-cache path doesn't need it).
@@ -654,6 +663,8 @@ class CausalWanSelfAttention(nn.Module):
         camera_attention_mode="parallel",
         camera_translation_transform="linear",
         fuse_rope_prope=False,
+        fused_kernel=None,
+        rope_dtype="float64",
     ):
         assert dim % num_heads == 0
         super().__init__()
@@ -670,6 +681,8 @@ class CausalWanSelfAttention(nn.Module):
             raise ValueError(f"rope_train_frames must be positive, got {self.rope_train_frames}")
         self.use_echorope = bool(use_echorope)
         self.fuse_rope_prope = bool(fuse_rope_prope)
+        self.fused_kernel = fused_kernel
+        self.rope_dtype = rope_dtype
         self.camera_attention_mode = normalize_camera_attention_mode(camera_attention_mode)
         self.camera_translation_transform = normalize_camera_translation_transform(
             camera_translation_transform
@@ -1201,6 +1214,47 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = int(frame_seqlen)
         if kv_cache is None:
+            if self.fused_kernel is not None and self.camera_attention_mode == "fused_prope":
+                if self.fused_kernel in ("fused_rope_prope_sdpa", "sdpa", "fused_sdpa"):
+                    if fused_rope_prope_sdpa_split is None:
+                        raise RuntimeError("fused_rope_prope_sdpa is not available")
+                    kernel_fn = fused_rope_prope_sdpa_split
+                elif self.fused_kernel in ("fused_rope_prope_sage", "sage", "fused_sage"):
+                    if fused_rope_prope_sage is None:
+                        raise RuntimeError("fused_rope_prope_sage is not available")
+                    kernel_fn = fused_rope_prope_sage
+                elif self.fused_kernel in ("reference", "fused_rope_prope_sdpa_reference"):
+                    from solarwm.kernels.fused_rope_prope_sdpa.reference import (
+                        fused_rope_prope_sdpa_reference,
+                    )
+                    kernel_fn = fused_rope_prope_sdpa_reference
+                else:
+                    raise ValueError(f"unknown fused_kernel={self.fused_kernel!r}")
+                q_vm = cam_viewmats.float() if cam_viewmats is not None else None
+                q_k = cam_K.float() if cam_K is not None else None
+                x_out = kernel_fn(
+                    q=q,
+                    k=k,
+                    v=v,
+                    freqs=freqs,
+                    q_grid_sizes=grid_sizes.to(device=q.device),
+                    k_grid_sizes=grid_sizes.to(device=q.device),
+                    q_viewmats=q_vm,
+                    q_Ks=q_k,
+                    kv_viewmats=q_vm,
+                    kv_Ks=q_k,
+                    q_start_frame=0,
+                    k_start_frame=0,
+                    rope_dtype=self.rope_dtype,
+                    camera_translation_transform=self.camera_translation_transform,
+                )
+                if cache_head_parallel:
+                    x_out = sequence_model_parallel_all_gather(x_out, dim=2)
+                elif sp_enabled:
+                    x_out = sequence_model_parallel_all_to_all_4D(x_out, scatter_dim=1, gather_dim=2)
+                x_out = self.o(x_out.flatten(2))
+                return x_out, (current_start + q.shape[1], q.shape[1], None)
+
             # Stage0.5 trains on the whole bidirectional window, so an empty
             # empty cache is equivalent to full attention over the current K/V.
             num_new_tokens = q.shape[1]
@@ -1257,6 +1311,90 @@ class CausalWanSelfAttention(nn.Module):
             window_start = new_ring_start + max(0, new_local_end - self.max_attention_size)
             window_end = new_ring_start + new_local_end
             k_window_raw = kv_cache["k"][:, window_start:window_end]
+
+            if self.fused_kernel is not None and self.camera_attention_mode == "fused_prope":
+                num_window_frames = k_window_raw.shape[1] // frame_seqlen
+                num_new_frames = num_new_tokens // frame_seqlen
+                if self.use_echorope:
+                    pos = self._window_relative_positions(
+                        current_start_frame=max(0, num_window_frames - num_new_frames),
+                        num_new_frames=num_new_frames,
+                        num_context_frames=num_window_frames,
+                        num_query_memory_frames=0,
+                        num_sink_frames=0,
+                        pmax=self._echorope_pmax_frames(freqs, min_frames=num_new_frames),
+                        num_frame_per_block=getattr(
+                            self, "num_frame_per_block_attr", num_new_frames
+                        ),
+                    )
+                else:
+                    pos = {
+                        "q_start": num_window_frames - num_new_frames,
+                        "local_start": 0,
+                    }
+                q_grid = grid_sizes.clone()
+                q_grid[:, 0] = num_new_frames
+                k_grid = grid_sizes.clone()
+                k_grid[:, 0] = num_window_frames
+
+                visible_cam_viewmats = None
+                visible_cam_K = None
+                if kv_cam_viewmats is not None or kv_cam_K is not None:
+                    if kv_cam_viewmats is None or kv_cam_K is None:
+                        raise ValueError("fused_prope KV-cache requires both shared camera tensors")
+                    visible_cam_viewmats = kv_cam_viewmats[:, window_start:window_end]
+                    visible_cam_K = kv_cam_K[:, window_start:window_end]
+
+                if self.fused_kernel in ("fused_rope_prope_sdpa", "sdpa", "fused_sdpa"):
+                    if fused_rope_prope_sdpa_split is None:
+                        raise RuntimeError("fused_rope_prope_sdpa is not available")
+                    kernel_fn = fused_rope_prope_sdpa_split
+                elif self.fused_kernel in ("fused_rope_prope_sage", "sage", "fused_sage"):
+                    if fused_rope_prope_sage is None:
+                        raise RuntimeError("fused_rope_prope_sage is not available")
+                    kernel_fn = fused_rope_prope_sage
+                elif self.fused_kernel in ("reference", "fused_rope_prope_sdpa_reference"):
+                    from solarwm.kernels.fused_rope_prope_sdpa.reference import (
+                        fused_rope_prope_sdpa_reference,
+                    )
+                    kernel_fn = fused_rope_prope_sdpa_reference
+                else:
+                    raise ValueError(f"unknown fused_kernel={self.fused_kernel!r}")
+
+                q_vm = cam_viewmats.float() if cam_viewmats is not None else None
+                q_k = cam_K.float() if cam_K is not None else None
+                kv_vm = visible_cam_viewmats.float() if visible_cam_viewmats is not None else None
+                kv_k = visible_cam_K.float() if visible_cam_K is not None else None
+
+                x = kernel_fn(
+                    q=q,
+                    k=k_window_raw,
+                    v=kv_cache["v"][:, window_start:window_end],
+                    freqs=freqs,
+                    q_grid_sizes=q_grid.to(device=q.device),
+                    k_grid_sizes=k_grid.to(device=q.device),
+                    q_viewmats=q_vm,
+                    q_Ks=q_k,
+                    kv_viewmats=kv_vm,
+                    kv_Ks=kv_k,
+                    q_start_frame=pos["q_start"],
+                    k_start_frame=pos["local_start"],
+                    rope_dtype=self.rope_dtype,
+                    camera_translation_transform=self.camera_translation_transform,
+                )
+                if cache_head_parallel:
+                    x = sequence_model_parallel_all_gather(x, dim=2)
+                elif sp_enabled:
+                    x = sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+                x = self.o(x.flatten(2))
+                update = {
+                    "action": "circular_insert",
+                    "ring_start": new_ring_start,
+                    "local_end_index": new_local_end,
+                    "current_end": current_end,
+                }
+                return x, (current_end, new_local_end, update)
+
             fused_rope_prope = (
                 self.fuse_rope_prope
                 and self.camera_attention_mode == "fused_prope"
@@ -1919,6 +2057,8 @@ class CausalWanAttentionBlock(nn.Module):
             camera_attention_mode=self.camera_attention_mode,
             camera_translation_transform=self.camera_translation_transform,
             fuse_rope_prope=fuse_rope_prope,
+            fused_kernel=kwargs.get("fused_kernel", None),
+            rope_dtype=kwargs.get("rope_dtype", "float64"),
         )
         self.norm3 = (
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -2133,6 +2273,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         camera_attention_mode="parallel",
         camera_translation_transform="linear",
         fuse_rope_prope=False,
+        fused_kernel=None,
         rope_dtype="float64",
         flow_objective="flow_matching",
         anyflow_gate=0.25,
@@ -2161,6 +2302,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.rope_train_frames = None if rope_train_frames is None else int(rope_train_frames)
         self.use_echorope = bool(use_echorope)
         self.fuse_rope_prope = bool(fuse_rope_prope)
+        self.fused_kernel = fused_kernel
         if str(rope_dtype).strip().lower() in {"float16", "fp16"} or rope_dtype == torch.float16:
             self.rope_dtype = torch.float16
             self.rope_complex_dtype = torch.complex32
@@ -2218,6 +2360,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     camera_attention_mode=self.camera_attention_mode,
                     camera_translation_transform=self.camera_translation_transform,
                     fuse_rope_prope=self.fuse_rope_prope,
+                    fused_kernel=self.fused_kernel,
+                    rope_dtype=self.rope_dtype,
                 )
                 for layer_idx in range(num_layers)
             ]

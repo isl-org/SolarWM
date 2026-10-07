@@ -261,6 +261,20 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "runtime.stage2_xpu_profiler is supported only for "
             "standalone Stage2 camera-length inference",
         )
+    vae_channels_last = runtime.get("stage2_vae_channels_last", True)
+    _require(
+        isinstance(vae_channels_last, bool),
+        "runtime.stage2_vae_channels_last must be boolean",
+    )
+    if "stage2_vae_channels_last" in runtime:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_vae_channels_last is supported "
+            "only for standalone Stage2 camera-length inference",
+        )
     inference = _mapping(config, "inference")
     vae_pipeline = inference.get("stage2_xpu_vae_pipeline", True)
     _require(
@@ -307,6 +321,39 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             str(rope_dtype).strip().lower() in {"float64", "fp64", "float32", "fp32", "float16", "fp16"},
             f"runtime.stage2_rope_dtype must be one of float64, float32, float16; got {rope_dtype}",
         )
+    stage2_fused_kernel = runtime.get("stage2_fused_kernel")
+    if stage2_fused_kernel is None:
+        stage2_fused_kernel = _mapping(config, "model").get("stage2_fused_kernel")
+    if stage2_fused_kernel is None:
+        stage2_fused_kernel = _mapping(config, "model").get("fused_kernel")
+    if stage2_fused_kernel is not None:
+        allowed = {
+            "none",
+            "reference",
+            "fused_rope_prope_sdpa_reference",
+            "fused_rope_prope_sdpa",
+            "sdpa",
+            "fused_sdpa",
+            "fused_rope_prope_sage",
+            "sage",
+            "fused_sage",
+        }
+        val = str(stage2_fused_kernel).strip().lower()
+        _require(
+            val in allowed,
+            f"stage2_fused_kernel must be one of {sorted(allowed)}; got {stage2_fused_kernel}",
+        )
+        if val != "none":
+            _require(
+                str(config.get("action", "")).strip().lower() == "infer"
+                and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+                and str(inference.get("length", "fixed")).strip().lower() == "camera",
+                "stage2_fused_kernel is supported only for standalone Stage2 camera-length inference",
+            )
+            _require(
+                str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() == "fused_prope",
+                "stage2_fused_kernel requires model.camera_attention_mode=fused_prope",
+            )
     cache_mode = str(inference.get("kv_cache_mode", "circular")).strip().lower()
     if (
         str(config.get("action", "")).strip().lower() == "infer"

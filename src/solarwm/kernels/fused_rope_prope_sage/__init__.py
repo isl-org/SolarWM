@@ -9,8 +9,11 @@ from .fused_sdpa import fused_rope_prope_sdpa_split
 from .fused_sage import fused_rope_prope_sage
 from .unfused_kernel import fused_rope_prope_sdpa_reference
 
+fused_rope_prope_sdpa = fused_rope_prope_sdpa_split
+
 __all__ = [
     "fused_rope_prope_sage",
+    "fused_rope_prope_sdpa",
     "fused_rope_prope_sdpa_split",
     "fused_rope_prope_sdpa_reference",
 ]

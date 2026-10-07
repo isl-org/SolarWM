@@ -107,6 +107,7 @@ def build_rope_table(
     batch = grid_sizes.shape[0]
     out = torch.empty(batch, seq_len, 2 * c, dtype=freqs_real.dtype,
                       device=freqs_real.device)
+    grid_sizes = grid_sizes.to(device=freqs_real.device).contiguous()
     block_t = 64
     _rope_table_kernel[(triton.cdiv(seq_len, block_t), batch)](
         freqs_real, out, grid_sizes,
@@ -574,9 +575,9 @@ def _prope_tables_triton(
     ``P^T`` and ``P^-1`` only; see ``_prope_matrix_kernel``.
     """
     batch, ncam = viewmats.shape[:2]
-    vm = viewmats.contiguous()
-    ks = None if Ks is None else Ks.contiguous()
-    rot = None if rotation is None else rotation.reshape(16).contiguous().to(vm.dtype)
+    vm = viewmats.to(torch.float32).contiguous()
+    ks = None if Ks is None else Ks.to(torch.float32).contiguous()
+    rot = None if rotation is None else rotation.reshape(16).contiguous().to(torch.float32)
     shape = (batch, ncam, 16)
     p_t = torch.empty(shape, dtype=torch.float32, device=viewmats.device)
     p_inv = torch.empty(shape, dtype=torch.float32, device=viewmats.device)
@@ -711,3 +712,6 @@ def fused_rope_prope_sdpa_split(
     o = F.scaled_dot_product_attention(q_eff, k_eff, v_eff, scale=scale, is_causal=False)
 
     return rope_prope_transform(o, p_q, None, in_layout="HND", out_layout="NHD")
+
+
+fused_rope_prope_sdpa = fused_rope_prope_sdpa_split

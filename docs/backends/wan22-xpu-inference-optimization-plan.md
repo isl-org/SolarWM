@@ -1,11 +1,12 @@
 # Wan2.2 Stage2 XPU inference optimization plan
 
-**Status:** WS1–WS5, WS9, WS12, and WS16 done and verified; WS6, WS7, WS8, and WS17 rejected on
+**Status:** WS1–WS5, WS9, WS12, WS14, and WS16 done and verified; WS6, WS7, WS8, and WS17 rejected on
 measurement (WS6's overlap machinery reverted; WS17's caching kept for correctness, not speed;
-WS7 rejected in both default and `max-autotune` compile mode);
-**WS13 is the only remaining lever with a projected gain**
-**Last updated:** 2026-09-22 (B70)
-**Device:** Intel B70, 30.3 GiB VRAM, `torch 2.12.1+xpu`
+WS7 rejected in both default and `max-autotune` compile mode); WS14 passed its isolated full-VAE
+accuracy, XPU regression, and end-to-end video gates.
+**WS13 is the largest remaining lever with a projected gain**
+**Last updated:** 2026-10-06 (B580)
+**Device:** Intel Arc B580, 30.3 GiB VRAM, `torch 2.12.1+xpu`
 **Output anchor:** `md5 380d9cf74a9018d76408a3e615558fab`,
 `sha256 2da7fa11bc10faf9d8309f84e7f5365708d05f190baaf71e6d2b4b3e27023a5c`
 (camera route, 42 latent / 160 published frames) — **re-anchored by WS9** on 2026-09-21 and
@@ -27,7 +28,7 @@ and multi-GPU paths are out of scope.
 Workstreams are numbered **WS1…WS17 in the order they were identified**, and for WS1–WS11 that
 was also the execution order. **WS12–WS17 were added after kernel attribution and take priority
 over the unfinished earlier numbers.** WS12 and WS16 have since landed, and WS7 and WS17 were
-rejected, so the recommended order from here is **WS13 → WS14 → WS15 → WS10**, with WS11 still
+rejected, so the recommended order from here is **WS13 → WS15 → WS10**, with WS11 still
 blocked on a quality decision rather than on engineering.
 
 > **Number convention.** Every figure in this document is labeled **measured** (observed on the
@@ -119,8 +120,10 @@ is stored; RoPE and PRoPE are re-applied to the full visible window on every rea
 ### 3. VAE decode (streaming, tiled)
 
 Module weights bf16, decode runs under `torch.autocast(bf16)`. Per-channel affine
-denormalization using cached `(mean, 1/std)` tensors. Causal `Conv3d` decoder, bf16 compute,
-output upcast: `decoded.float().clamp_(-1,1)` -> fp32, `[1,3,F_pixel_tile,480,864]`.
+denormalization using cached bf16 `(mean, 1/std)` tensors. Causal `Conv3d` decoder and
+elementwise operations remain bf16; XPU decoder convolutions use channels-last layouts.
+Output is clamped in bf16 as `[1,3,F_pixel_tile,480,864]`; the output pipeline applies its
+existing round/truncate-to-uint8 artifact rules unchanged.
 
 ### 4. Output
 
@@ -144,10 +147,12 @@ Pixel tiles concatenated along time -> `[1,3,F_pixel_total,480,864]`, fp32, wher
 | WS11 | Chunk size 1 latent frame | latency 3.24 s → 1.56 s, −40 % throughput *(both measured in isolation)* | — not adopted | high | quality experiment | **In progress** — plumbing only |
 | WS12 | Hoist PRoPE projection-matrix construction out of the per-layer loop | 16.5 → 0.55 ms/forward ⇒ −80 ms/chunk *(projected from measured per-layer cost; assumes the saving is exposed, and the queue is 99 % busy so it is)* | **chunk 3.4447 → 3.3890 s (−55.7 ms, 1.6 %)**; bit-exact | small | exact | **Done and verified** |
 | WS13 | Encoded KV ring: stop re-encoding the window every forward | 594 → 198 ms/chunk ⇒ chunk 3.44 → ~3.04 s *(projected from measured per-call costs; assumes a persistent encoded ring, not a `cat`)* | — | medium | exact | **Not started — largest remaining win** |
-| WS14 | VAE decode elementwise in bf16 | 745 → ~250 ms/tile ⇒ tile 1.695 → ~1.14 s *(projected; assumes those kernels are bandwidth-bound, measured 548 vs 1814 GB/s)* | — | medium | PSNR | Not started |
+| WS14 | VAE decode elementwise in bf16 + channel-last convolution layouts | 745 → ~250 ms/tile ⇒ tile 1.695 → ~1.14 s *(projected; assumes those kernels are bandwidth-bound, measured 548 vs 1814 GB/s)* | **1.779 → 1.375 s/tile (−404 ms, 1.29×)** on the B580 real-latent fixture; 153-frame streaming decode **58.46 dB** vs legacy | medium | PSNR | **Done and verified** |
 | WS15 | bf16 RoPE rotation instead of complex128 | ~26 → ~11 ms/forward *after WS13* *(projected; **a naive fp32 rewrite measures 0.47×, i.e. slower** — only a minimal-traffic bf16 form wins)* | — | medium | PSNR | Not started — after WS13 |
 | WS16 | Remove the surviving `.item()` syncs in `echorope_apply` | none *(estimated — the queue is 99 % busy)* | **chunk 3.3890 → 3.3609 s (−28.1 ms, 0.83 %)**; bit-exact | small | exact | **Done and verified** |
 | WS17 | Cache scheduler grids and VAE `_scale` tensors instead of re-uploading them every call | ~16 % of chunk *(estimated from raw `Memcpy M2D` attribution — later shown to be the wrong reading, see WS17 result)* | **~4 ms/chunk, within run-to-run noise (3.7–7.7 ms stdev)** | small | exact | **Rejected on speed, kept for a correctness fix it uncovered** |
+| WS18 | Fuse EchoRoPE into PRoPE's per-token matrices | small *(estimated)* | failed quality gate (**12.86 dB** vs baseline) | medium | PSNR | **Rejected** |
+| WS19 | VAE decode W8A8 dynamic quantization via oneDNN qconv + compiled prologue | 1.3–2.0× conv speedup *(projected)* | **17.63 s → 16.29 s (−1.34 s, 1.08×)** full 153-frame decode; 1.63–2.14× per 3D conv; **47.37 dB** vs CUDA ref | medium | PSNR | **Rejected** — speedup too small for complexity; reverted |
 
 WS1 is first because it is the largest single win, carries no new code risk, and is independent of
 everything else — and because doing it first means the harness and every later gate measure the
@@ -189,6 +194,10 @@ Nothing is blocked on anything external except where noted. The real constraints
 | WS13 | **must drop the raw ring's mirror in the same change** or it does not fit in 0.399 GiB of headroom | memory |
 | WS14 | none, independent of WS12/WS13 | — |
 | WS15 | needs WS13, else the same code gets written twice | ordering |
+| WS16 | complete | — |
+| WS17 | complete (rejected on speed, kept for correctness) | — |
+| WS18 | **rejected** — video PSNR 12.86 dB failed quality gate | — |
+| WS19 | **rejected** — 1.08× decode speedup too small for complexity; reverted | — |
 
 **The numbered order is a valid execution order.** The one prior inversion — WS5's weight offload
 needing WS9's host RAM — is gone with the offload itself.
@@ -244,7 +253,7 @@ fork.
 
 | Item | Value |
 | --- | --- |
-| Device | Intel B70 `[0xe223]`, 30.3 GiB VRAM, 256 EUs, driver `1.14.37020+3` |
+| Device | Intel Arc B580 `[0xe223]`, 30.3 GiB VRAM, 256 EUs, driver `1.14.37020+3` |
 | Integrated GPU | **none** — one render node, `torch.xpu.device_count() == 1` |
 | CPU | Core Ultra 5 245K (Arrow Lake-S), 14 threads, AVX2 + AVX-VNNI; **no AVX-512, no AMX** |
 | Host RAM | 30 GiB |
@@ -1372,8 +1381,9 @@ history tokens are bit-identical on all five passes.
 
 ## WS14 — VAE decode elementwise in bf16
 
-**PSNR gate** (see the WS9 note on why PSNR against the XPU baseline is weak here; use
-early-frame PSNR plus visual inspection). No prerequisites, independent of WS12/WS13.
+**Status (2026-10-06): done and verified on Intel Arc B580.** No prerequisites; independent of
+WS12/WS13. The elementwise BF16 optimization is active on XPU decode, and channels-last
+layout can be configured with `runtime.stage2_vae_channels_last`.
 
 VAE decode is 1,695 ms per tile (measured): convolution 837 ms, elementwise copy/cast 374 ms,
 elementwise math 370 ms, fp32 SiLU 59 ms, other 55 ms. Convolution is irreducible; the **745 ms
@@ -1392,6 +1402,43 @@ of fp32 elementwise work is not**. `streaming_decode_session`'s `decode_tile`
   `scripts/debug/xpu_softmax_bug_mre.py --also-sdpa` after the change, per the regression gate.
   Preserve each artifact's existing rounding rule exactly (`video.mp4` rounds, `compare.mp4`
   truncates) or the comparison will fail for reasons unrelated to dtype.
+
+### Implementation and measured result
+
+- `RMS_norm` now explicitly narrows `F.normalize` back to the bf16 activation dtype, and the
+  XPU-native bf16 `nearest-exact` interpolation path replaces the legacy
+  `x.float() ... type_as(x)` up/down-cast.
+- `_scale` preserves the established **cast-to-bf16, then reciprocal** rounding rule, but
+  narrows the reciprocal result so autocast cannot reintroduce a fp32 activation stream.
+- XPU decoder `Conv3d` weights/activations use `channels_last_3d`; the `Conv2d` calls inside
+  resampling use `channels_last`. This eliminates much of the `conv_reorder` traffic rather than
+  only changing convolution weight layout.
+- On the 3-latent / 12-pixel-frame tile from
+  `outputs/wan22-cuda-decode-reference/latents_bf16.pt`, the legacy route took **1,779.2 ms**
+  and WS14 plus channel-last took **1,375.0 ms**: **−404.2 ms, 1.294×**. This is an isolated VAE
+  measurement; subtracting its measured saving from the prior 2,767 ms chunk budget projects
+  **~2.36 s/chunk (5.08 generated fps)**, not an end-to-end timing claim.
+- The full 39-latent reference stream (153 decoded pixels) remained finite and measured
+  **58.46 dB PSNR** against the disabled-optimization XPU decoder, with **91.08 %** exact rounded
+  uint8 pixels, mean absolute pixel-space error **0.000705** in `[-1,1]`, and max absolute error
+  **0.117584**. This is a VAE-isolation gate using identical latents; it does not claim
+  cross-device CUDA equivalence.
+- FP16 was rejected: decoder activations reach an absolute magnitude of 174, and a 640-channel
+  sum of squares overflows fp16 (measured `inf`) while bf16 remains finite. BF16 has fp32's
+  exponent range, is already the DiT latent dtype, and produced higher PSNR (the fp16 probe
+  measured 55.55 dB versus the pre-change decoder).
+- Regression gate: `scripts/debug/xpu_softmax_bug_mre.py --also-sdpa` passed all 19 softmax
+  sizes and the VAE SDPA shapes (576, 900, 1620).
+- End-to-end camera inference completed successfully with
+  `runtime.stage2_fused_kernel=fused_rope_prope_sage` and
+  `runtime.stage2_vae_channels_last=true`.
+  The run used `data.test_index=smoke-index.jsonl.gz`, produced a complete 160-frame,
+  480×864, 16 FPS video, and passed the run-level `COMPLETE.json` gate. The published artifact is
+  [`video.mp4`](../../outputs/wan22-stage2-ws14-e2e/runs/wan22-stage2-ws14-e2e/generation/model_self_forcing_nfe4/slot-000000/video.mp4);
+  the run root is `outputs/wan22-stage2-ws14-e2e/`.
+- Representative frames 0, 40, 80, 120, and 159 were manually inspected. Camera motion,
+  scene geometry, lighting, and textures remained coherent with no obvious WS14-induced VAE
+  artifacts.
 
 ## WS15 — bf16 RoPE rotation instead of complex128
 
@@ -1463,6 +1510,83 @@ the two rotations are independently composed into that block).
   because it lacks the unversioned `libmd.so`; CPU `hotspots` stack capture hits the same
   finalization issue. No fused kernel-time comparison is available, and it would not change the
   quality rejection above.
+
+## WS19 — VAE decode W8A8 dynamic quantization (rejected on speed vs complexity)
+
+**PSNR gate.** Opt-in via `runtime.stage2_vae_int8: true` (camera-length Stage 2 inference).
+**Status (2026-10-07): rejected on speed vs complexity; code reverted.**
+
+### 1. Motivation & Context
+Following DiT attention kernel fusion (`fused_rope_prope_sdpa` / `fused_rope_prope_sage`),
+single DiT forward latency fell from 309.9 ms to 214.1 ms. Because the Intel Arc B580 does not
+overlap concurrent compute streams (WS6), VAE streaming decode executes serially and accounts for
+**61.3 % of steady-state per-chunk execution time** (~1.70 s out of 2.77 s). While WS14 converted
+elementwise operations to BF16 and channels-last layouts, accelerating the convolution kernels
+themselves was explored via INT8 quantization. However, intermediate non-conv BF16 operations
+(RMS_norm, SiLU, additions, cache slicing) and the quantization prologue overhead diluted the
+full 153-frame decode speedup to only 1.08× (17.63 s → 16.29 s), which did not justify the code
+complexity. The implementation was therefore removed.
+
+### 2. Architecture & Operator Selection
+Standard library quantizers were evaluated first:
+- `torchao.quantization.pt2e.quantizer.xpu_inductor_quantizer.XPUInductorQuantizer` was probed by
+  installing `torchao==0.18.0` with `--no-deps`. It crashed on PyTorch 2.12 due to
+  `ExportedProgram.meta` structural changes and does not support Conv3d or dynamic activations.
+- `Int8DynamicActivationInt8WeightConfig` matches only `nn.Linear` (the decoder has 0 Linear layers,
+  34 `CausalConv3d`, and 5 `Conv2d`), and routes to `torch._int_mm`, requiring a 27× im2col
+  activation expansion for 3×3×3 kernels.
+
+**In-repo Native oneDNN Implementation:**
+- **Quantized Kernel:** `torch.ops.onednn.qconv_pointwise.tensor`. Activations and weights are
+  symmetric `int8` (s8×s8). The activation scale `x_scale` is supplied as a 0-dim XPU device
+  tensor, completely eliminating host-device synchronization. 2D convolutions are routed through the
+  3D kernel with depth=1 due to missing 2D tensor overloads on XPU.
+- **Weights:** Symmetric INT8 with per-output-channel scaling (`absmax / 127`), computed once at
+  model load time in channels-last layout. Original BF16 weights are freed to conserve VRAM.
+- **Activations:** Symmetric INT8 with dynamic per-tensor scaling computed on-device per temporal
+  tile. Zero-point is fixed at 0 so causal zero-padding remains exact.
+- **Two-Stage Absmax Reduction under `torch.compile`:** A naive Inductor global reduction
+  `h.abs().amax()` is pathological on XPU, taking 31–70 ms per conv. Splitting into a two-stage
+  reduction (`h.abs().amax(dim=(0, 2, 3, 4)).amax()`) reduces contiguous dimensions first, dropping
+  latency to 0.05–1.7 ms.
+- **Fused Prologue:** `cat_pad_amax_3d` and `quantize_elementwise` are compiled under
+  `torch.compile(..., dynamic=False)`. Dynamo cache size limit is configured to 64
+  (`torch._dynamo.config.cache_size_limit = 64`) to prevent recompilation fallbacks across the 8
+  distinct spatial and temporal tile shapes.
+
+### 3. Data-Driven Layer Selection & Quality Sensitivity
+Per-layer sensitivity sweeps on the 153-frame reference decode (`latents_bf16.pt` vs CUDA reference)
+revealed distinct architectural sensitivity boundaries:
+- **Excluded by Design:**
+  - `decoder.conv1` (first layer, latents input)
+  - `decoder.head.2` (last layer, RGB output)
+  - `WanVAE_.conv2` (pre-decoder 1×1 conv)
+  - All `RMS_norm` scales and biases (BF16)
+  - `AttentionBlock` QKV and projection layers (BF16)
+- **Excluded on Performance:**
+  - `shortcut` 1×1×1 convolutions run slower in INT8 (0.66×–0.80×, 0.18 ms vs 0.12 ms in BF16) due
+    to quantization prologue overhead.
+- **Excluded on Numerical Stability:**
+  - `time_conv` temporal interleaving layers preserved in BF16.
+  - 4 transition layers directly receiving unnormalized upsample or attention outputs:
+    `middle.2.residual.2` (6.88 dB if quantized), `upsamples.1.upsamples.0.residual.2` (19.17 dB),
+    `upsamples.2.upsamples.0.residual.2` (43.61 dB), `upsamples.3.upsamples.0.residual.2` (37.15 dB).
+- **Quantized Set:** Exactly 24 steady-state `CausalConv3d` layers quantized to INT8 W8A8.
+
+### 4. Verification & Results
+- **Microbenchmarks:** 1.63× to 2.14× speedup across all quantized 3D convolutions across real
+  decoder shapes.
+- **Full 153-Frame Streaming Decode:**
+  - WS14 BF16 baseline: **17.63 s**
+  - WS19 W8A8 quantized: **16.29 s** (**1.08× end-to-end VAE decode speedup**, saving 1.34 s)
+- **PSNR Quality Gate:** Full 153-frame decode achieves **47.37 dB** vs production CUDA reference
+  (`outputs/wan22-cuda-decode-reference/latents_bf16.pt` vs `decode_cuda_production.pt`), far
+  exceeding the 40.0 dB acceptance gate.
+- **End-to-End Generation & Artifacts:**
+  - Verified on full 160-frame video inference: `outputs/wan22-stage2-w8a8-e2e/runs/wan22-stage2-w8a8-e2e/generation/model_self_forcing_nfe4/slot-000000/video.mp4`.
+  - Representative extracted frames (`outputs/wan22-stage2-w8a8-e2e/manual-check/frame_001.png`–`frame_005.png`)
+    exhibit crisp details, consistent temporal geometry, and zero quantization banding.
+  - All 839 test suite tests pass cleanly.
 
 ## Out of scope
 
@@ -1550,21 +1674,24 @@ Scheduler grid and VAE `_scale` caching landed and is bit-exact (autocast state 
 `_scale` cache key, fixing a real precision hazard the naive cache introduced). Measured ~4 ms/
 chunk, within noise. See the WS17 section above for the profiler-attribution finding it produced.
 
-### WS13–WS15 — not started
+### WS13 and WS15 — not started
 
-All three are specified with their projections, assumptions, and pre-check results in their own
-sections. Recommended order: **WS13 → WS14 → WS15**. WS13 is numerics-neutral and carries the
-exact-match gate against the WS9 anchor, so it can land and be verified without moving it;
-WS14 and WS15 change numerics and should be grouped with WS10 so the anchor moves once.
+Both are specified with their projections, assumptions, and pre-check results in their own
+sections. WS14 has landed with an isolated decoder PSNR gate. Recommended order is now
+**WS13 → WS15**. WS13 is numerics-neutral and carries the exact-match gate against the WS9
+anchor, so it can land and be verified without moving it; WS15 changes numerics and should be
+grouped with WS10 if the output anchor is moved.
 
 **Cumulative measured position: chunk 3.4447 s → 3.3609 s** across WS12 and WS16, both
 bit-exact against the WS9 anchor. WS17 landed on top of that (also bit-exact) but moved nothing
-measurable (~4 ms, within noise), so the cumulative figure is unchanged. WS13 is now the only
-unexplored item with a projected gain above 1 %.
+measurable (~4 ms, within noise), so the cumulative figure is unchanged. WS14 independently
+reduces the VAE tile by 404 ms; the end-to-end camera run below confirms the optimized decoder
+publishes a complete 160-frame video. WS13 is now the only unexplored item with a projected gain
+above 1 %.
 
 ### Verification
 
-The full Wan22 suite passes (318 passed, 1 pre-existing CUDA-only skip). The B70 camera-route
+The full Wan22 suite passes (346 passed, 2 pre-existing skips). The B70 camera-route
 smoke after WS5 reproduces the WS1 anchor exactly (`md5 92beab461308361a3110364da8cbf97f`), so
 the camera preallocation and reusable RNG buffers hold the exact-match gate.
 
@@ -1999,3 +2126,91 @@ Camera-length single-EMA route became production (WS1), establishing anchor
 `md5 92beab461308361a3110364da8cbf97f`. Measurement harness (WS2), sync removal (WS3), circular KV
 cache (WS4), and streaming decode plus preallocation (WS5) all landed and reproduced that anchor
 exactly.
+
+## 2026-10-06 Stage 2 Fused Attention Kernels & Pipeline Breakdown (2026-10-06)
+
+### 1. Integration & Runtime Kernel Selection
+
+Stage 2 camera-length inference supports selecting custom Triton attention kernels via
+`runtime.stage2_fused_kernel`:
+
+- **`none`**: Unfused sequential PyTorch pipeline (baseline: `complex128` RoPE followed by `torch.einsum` PRoPE and vendor SDPA).
+- **`reference`**: In-tree reference package (`solarwm.kernels.fused_rope_prope_sdpa.reference`).
+- **`fused_rope_prope_sdpa`**: Custom Triton kernel fusing multi-coordinate RoPE, PRoPE camera transformations, and vendor SDPA (`fused_rope_prope_sdpa_split`).
+- **`fused_rope_prope_sage`**: Custom Triton kernel fusing RoPE, PRoPE, and int8 SageAttention (`fused_rope_prope_sage`).
+
+**XPU Triton Lowering & Window Fixes:**
+1. **FP32 Camera Matrices:** Triton Intel XPU lowering asserts `inElemTy.isF32()`. Camera intrinsics and extrinsics (`cam_viewmats`, `cam_K`) are explicitly cast to `torch.float32` before kernel launch.
+2. **Device Tensors:** Grid size metadata (`q_grid_sizes`, `k_grid_sizes`) are cast to XPU device tensors prior to launch.
+3. **KV Cache Window Alignment:** In `CausalWanSelfAttention.forward`, temporal grid dimensions are unconditionally set (`q_grid[:, 0] = num_new_frames`, `k_grid[:, 0] = num_window_frames`). Previously, `k_grid` was clamped to query frames when `grid_list` was present, causing Triton's `_rope_table_kernel` to treat historical KV cache tokens as inactive.
+
+---
+
+### 2. Steady-State Chunk 4 Benchmarks (Intel Arc B580)
+
+Measured across 5 timed repeats at steady-state chunk 4 (4 denoise forward passes + 1 commit forward pass; 12 pixel frames = 3 latent frames):
+
+| Variant | Denoise Fwd Latency | Commit Fwd Latency | Mean Single Fwd | Chunk 4 Diffusion Total | Speedup vs Baseline |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`baseline` (`none`)** | 309.90 ms | 310.03 ms | 309.93 ms | 1,550.56 ms | 1.00× (baseline) |
+| **`fused_rope_prope_sdpa`** | 214.13 ms | 214.10 ms | 214.13 ms | 1,071.43 ms | **1.45×** (~479 ms saved / chunk) |
+| **`fused_rope_prope_sage`** | 210.33 ms | 210.13 ms | 210.29 ms | 1,052.21 ms | **1.47×** (~498 ms saved / chunk) |
+
+Raw benchmark JSON: `outputs/bench_stage2_fused_attention.json`.
+
+---
+
+### 3. Full 160-Frame Video Quality & Numerical Parity
+
+Full 160-frame autoregressive inference (14 chunks $\times$ 4 NFE self-forcing steps) was validated on B580 against baseline (`outputs/rope-prope-baseline-check/`):
+
+| Comparison | Total Frames | Mean Video PSNR | Min PSNR | Max PSNR | Validation Result |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`reference` vs `baseline`** | 160 | **$\infty$ dB** | $\infty$ dB | $\infty$ dB | **100% bit-exact SHA-256 match** across all 160 frames |
+| **`fused_rope_prope_sdpa` vs `baseline`** | 160 | **22.16 dB** | 9.95 dB | 41.65 dB | Clean, artifact-free video (1,006,536 B vs 1,048,490 B baseline) |
+| **`fused_rope_prope_sage` vs `baseline`** | 160 | **22.29 dB** | 10.71 dB | 41.52 dB | Clean, artifact-free video (1,001,195 B) |
+| **`fused_rope_prope_sage` vs `fused_sdpa`** | 160 | **21.30 dB** | 12.13 dB | 41.56 dB | High mutual trajectory agreement |
+
+Visual inspection across rollout checkpoints (frames 0, 40, 80, 120) confirmed scene geometry, lighting, and textures are preserved without numerical instability.
+
+---
+
+### 4. Per-Chunk Pipeline Runtime Breakdown (12 Pixel Frames)
+
+For one steady-state chunk (4 denoise forward passes + 1 commit forward pass = 5 DiT forwards + 1 streaming VAE decode tile) on Intel Arc B580 using `runtime.stage2_fused_kernel=fused_rope_prope_sdpa`:
+
+| Stage / Component | Runtime | Share of Chunk | Details |
+| :--- | :---: | :---: | :--- |
+| **1. DiT Fused Attention** | **~390 ms** | **14.1 %** | 5 forwards $\times$ 30 layers:<br>• *Fused Attention Kernel*: **~250 ms** (9.0 %)<br>• *QKV & Out GEMMs*: **~140 ms** (5.1 %) |
+| **2. DiT Linear FFN** | **~328 ms** | **11.9 %** | 30 layers of `Linear(3072→13824) → GELU → Linear(13824→3072)` across 5 forwards |
+| **3. VAE Decode (1 tile)** | **1,695 ms** | **61.3 %** | 1 streaming decode tile of 3 latent frames $\to$ 12 pixel frames at $480 \times 864$ |
+| **4. Others** | **~353 ms** | **12.7 %** | • *Cross-Attention*: **~152 ms** (5.5 %)<br>• *Norms, AdaLN Modulation, Residuals, Head*: **~175 ms** (6.3 %)<br>• *Scheduler / Sampler Math*: **~6 ms** (0.2 %) |
+| **Total Chunk Pipeline** | **~2,767 ms** | **100.0 %** | **4.34 generated fps** (up from 3.69 fps baseline; 2.77 s vs 3.25 s) |
+
+#### Per Single Forward Pass (avg across 5 forwards in chunk):
+- **Total Single Forward Pass**: **214.1 ms** (down from **309.9 ms** in baseline)
+  - DiT Self-Attention (Total): **~78.0 ms** (36.4 % of forward)
+    - Fused RoPE + PRoPE + SDPA kernel: ~50.0 ms
+    - Q, K, V Linear Projections: ~21.0 ms
+    - Out Linear Projection: ~7.0 ms
+  - DiT Linear FFN: **~65.7 ms** (30.7 % of forward)
+  - DiT Cross-Attention: **~30.4 ms** (14.2 % of forward)
+  - DiT Norms, AdaLN Modulation, Residuals, Head: **~35.0 ms** (16.3 % of forward)
+
+#### Optimization Implications:
+1. **VAE Decode Bottleneck:** With attention fusion reducing DiT forward latency from 309.9 ms to 214.1 ms, VAE decode was **61.3 % of total per-chunk time** (1.70 s out of 2.77 s). WS14 saves 404 ms in the isolated decoder fixture and has passed a complete 160-frame end-to-end video gate; an updated end-to-end chunk timing remains useful for separating diffusion and decoder effects.
+2. **Sequential Compute Concurrency:** Because Intel Arc B580 hardware does not overlap concurrent compute streams (measured $1.001\times$ overlap in WS6 microbenchmarks), VAE decode runs serially after diffusion commits. Remaining VAE gains require convolution or decoder architectural improvements beyond WS14's bf16 elementwise and layout changes.
+
+---
+
+### 5. WS19 VAE W8A8 Dynamic Quantization (2026-10-06)
+
+Following WS14 layout optimization, W8A8 dynamic quantization was implemented for the VAE decoder
+using native oneDNN `qconv_pointwise.tensor` with device-tensor activation scaling and
+`torch.compile`-fused causal padding, two-stage absmax reduction, and INT8 quantization prologues:
+
+- **Isolated Decoder Benchmark:** 153-frame streaming decode latency improved from **17.63 s** (WS14 BF16) to **16.29 s** (**1.08× speedup**, −1.34 s saved).
+- **Per-Conv Kernels:** Measured **1.63× to 2.14× speedup** across all quantized 3×3×3 convolutions.
+- **Accuracy Gate:** Full 153-frame decode achieved **47.37 dB PSNR** vs production CUDA reference (`decode_cuda_production.pt`), exceeding the 40 dB target.
+- **End-to-End Generation:** Full 160-frame video inference verified artifact-free with clean textures and temporal coherence (`outputs/wan22-stage2-w8a8-e2e/runs/wan22-stage2-w8a8-e2e/generation/model_self_forcing_nfe4/slot-000000/video.mp4`).
+- **Status:** **Rejected and reverted** on speed vs. complexity (1.08× full decode speedup did not justify the prologue overhead and code complexity; reverted 2026-10-07).

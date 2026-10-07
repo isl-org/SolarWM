@@ -54,19 +54,24 @@ class RMS_norm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        self.preserve_input_dtype = False
 
     def forward(self, x):
-        return (
-            F.normalize(x, dim=(1 if self.channel_first else -1)) * self.scale * self.gamma
-            + self.bias
-        )
+        normalized = F.normalize(x, dim=(1 if self.channel_first else -1))
+        if self.preserve_input_dtype:
+            normalized = normalized.to(dtype=x.dtype)
+        return normalized * self.scale * self.gamma + self.bias
 
 
 class Upsample(nn.Upsample):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.native_bfloat16 = False
+
     def forward(self, x):
-        """
-        Fix bfloat16 support for nearest neighbor interpolation.
-        """
+        if self.native_bfloat16 and x.dtype == torch.bfloat16:
+            return super().forward(x)
+        # Older XPU backends did not support nearest-exact interpolation in bf16.
         return super().forward(x.float()).type_as(x)
 
 
@@ -865,6 +870,15 @@ class WanVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+
+    def configure_xpu_bfloat16_decode(self, enabled: bool) -> None:
+        """Enable native bf16 elementwise decoder operations on supported XPUs."""
+
+        for module in self.modules():
+            if isinstance(module, RMS_norm):
+                module.preserve_input_dtype = enabled
+            elif isinstance(module, Upsample):
+                module.native_bfloat16 = enabled
 
 
 def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
