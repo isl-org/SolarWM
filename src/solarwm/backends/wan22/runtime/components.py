@@ -583,6 +583,7 @@ class WanDiffusion:
         current_start: int = 0,
         cache_start: int = 0,
         cache_update_policy: str = "none",
+        radial_step: int | None = None,
     ) -> Any:
         sequence_length = sequence_length or (self.frame_sequence_length * self.num_output_frames)
         output = self.module(
@@ -597,6 +598,7 @@ class WanDiffusion:
             current_start=int(current_start),
             cache_start=int(cache_start),
             cache_update_policy=str(cache_update_policy),
+            radial_step=radial_step,
             r=r_timestep_tokens,
         )
         return output.permute(0, 2, 1, 3, 4)

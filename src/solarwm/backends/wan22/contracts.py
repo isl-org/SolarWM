@@ -315,6 +315,20 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "runtime.stage2_fuse_rope_prope is supported only for "
             "standalone Stage2 camera-length inference",
         )
+    encoded_kv_ring = runtime.get("stage2_encoded_kv_ring", True)
+    _require(
+        isinstance(encoded_kv_ring, bool),
+        "runtime.stage2_encoded_kv_ring must be boolean",
+    )
+    if "stage2_encoded_kv_ring" in runtime:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_encoded_kv_ring is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
     rope_dtype = runtime.get("stage2_rope_dtype")
     if rope_dtype is not None:
         _require(
@@ -354,6 +368,55 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
                 str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() == "fused_prope",
                 "stage2_fused_kernel requires model.camera_attention_mode=fused_prope",
             )
+    radial_attention = runtime.get("stage2_radial_attention", False)
+    _require(
+        isinstance(radial_attention, bool),
+        "runtime.stage2_radial_attention must be boolean",
+    )
+    radial_decay = runtime.get("stage2_radial_decay", 0.8)
+    _require(
+        isinstance(radial_decay, (int, float)) and 0.0 < float(radial_decay) <= 2.0,
+        "runtime.stage2_radial_decay must be in (0, 2]",
+    )
+    radial_sink_frames = runtime.get("stage2_radial_sink_frames", 1)
+    _require(
+        isinstance(radial_sink_frames, int) and radial_sink_frames >= 0,
+        "runtime.stage2_radial_sink_frames must be a non-negative integer",
+    )
+    radial_dense_blocks = runtime.get("stage2_radial_dense_blocks", 1)
+    _require(
+        isinstance(radial_dense_blocks, int) and radial_dense_blocks >= 0,
+        "runtime.stage2_radial_dense_blocks must be a non-negative integer",
+    )
+    radial_dense_steps = runtime.get("stage2_radial_dense_steps", 1)
+    _require(
+        isinstance(radial_dense_steps, int) and radial_dense_steps >= 0,
+        "runtime.stage2_radial_dense_steps must be a non-negative integer",
+    )
+    if radial_attention:
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "stage2 radial attention is supported only for standalone Stage2 camera-length inference",
+        )
+        _require(
+            str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() == "fused_prope",
+            "stage2 radial attention requires model.camera_attention_mode=fused_prope",
+        )
+        _require(
+            stage2_fused_kernel is not None
+            and str(stage2_fused_kernel).strip().lower()
+            in {
+                "fused_rope_prope_sdpa",
+                "sdpa",
+                "fused_sdpa",
+                "fused_rope_prope_sage",
+                "sage",
+                "fused_sage",
+            },
+            "stage2 radial attention requires a fused SDPA or Sage kernel",
+        )
     cache_mode = str(inference.get("kv_cache_mode", "circular")).strip().lower()
     if (
         str(config.get("action", "")).strip().lower() == "infer"

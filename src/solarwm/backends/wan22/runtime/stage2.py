@@ -1245,6 +1245,7 @@ def _stage2_self_forcing_latents(
                             current_start=start * frame_tokens,
                             cache_start=0,
                             cache_update_policy=denoise_cache_policy,
+                            radial_step=step_index,
                         )
                         x0 = provider.diffusion.flow_to_x0(latents, flow, timestep)
                     if start == 0:
@@ -1302,6 +1303,7 @@ def _stage2_self_forcing_latents(
                         current_start=start * frame_tokens,
                         cache_start=0,
                         cache_update_policy="commit_detached",
+                        radial_step=len(step_values),
                     )
                 if callable(latent_tile_callback):
                     latent_tile_callback(output[:, start:end], start=start, end=end)
@@ -2431,7 +2433,25 @@ class Wan5BStage2Runtime:
             and str(inference.get("length", "fixed")).strip().lower() == "camera"
             and str(inference.get("kv_cache_mode", "circular")).strip().lower() == "circular"
         )
-        physical_cache_tokens = cache_tokens * 2 if circular else cache_tokens
+        fused_kernel = (
+            self.config.get("runtime", {}).get("stage2_fused_kernel")
+            or self.config.get("model", {}).get("stage2_fused_kernel")
+            or self.config.get("model", {}).get("fused_kernel")
+            or getattr(self._root(self.student.module), "fused_kernel", None)
+        )
+        if fused_kernel is not None:
+            fused_kernel = str(fused_kernel).strip().lower()
+        is_sage = fused_kernel in ("fused_rope_prope_sage", "sage", "fused_sage")
+
+        unmirrored_ring = circular and bool(
+            self.config.get("runtime", {}).get("stage2_encoded_kv_ring", True)
+        )
+        encoded_kv_ring = unmirrored_ring and not is_sage
+        physical_cache_tokens = (
+            cache_tokens
+            if unmirrored_ring
+            else (cache_tokens * 2 if circular else cache_tokens)
+        )
         caches = [
             {
                 "k": torch.zeros(
@@ -2462,6 +2482,23 @@ class Wan5BStage2Runtime:
                 cache["_circular_kv_cache"] = True
                 cache["_circular_capacity"] = cache_tokens
                 cache["_circular_ring_start"] = 0
+                if encoded_kv_ring:
+                    cache["k_encoded"] = torch.zeros(
+                        batch_size,
+                        cache_tokens,
+                        num_heads,
+                        head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    cache["v_encoded"] = torch.zeros(
+                        batch_size,
+                        cache_tokens,
+                        num_heads,
+                        head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
         caches[0]["_fused_prope_camera_metadata"] = {
             "viewmats": torch.zeros(
                 batch_size,

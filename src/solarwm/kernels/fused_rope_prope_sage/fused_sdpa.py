@@ -35,6 +35,170 @@ import triton
 import triton.language as tl
 
 from .unfused_kernel import normalize_rope_precision, prepare_prope_matrices
+from .radial_attention import (
+    RadialAttentionConfig,
+    build_radial_block_mask,
+    build_sage_block_indices,
+)
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
+except ImportError:  # pragma: no cover
+    _torch_flex_attention = None
+
+
+_RADIAL_FLEX = None
+
+
+def _radial_flex_attention(q, k, v, *, scale, block_mask):
+    global _RADIAL_FLEX
+    if _torch_flex_attention is None:
+        raise RuntimeError("radial attention requires torch.nn.attention.flex_attention")
+    if q.device.type == "cpu":
+        return _torch_flex_attention(q, k, v, score_mod=None, block_mask=block_mask, scale=scale)
+    if _RADIAL_FLEX is None:
+        _RADIAL_FLEX = torch.compile(_torch_flex_attention, dynamic=False)
+    return _RADIAL_FLEX(q, k, v, score_mod=None, block_mask=block_mask, scale=scale)
+
+
+@triton.jit
+def _radial_bf16_kernel(
+    Q,
+    K,
+    V,
+    O,
+    BLOCK_INDICES,
+    BLOCK_COUNTS,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    qo_len,
+    kv_len,
+    sm_scale,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    """BF16 online-softmax attention over selected 32-token KV blocks."""
+    pid_m = tl.program_id(0)
+    h = tl.program_id(1)
+    b = tl.program_id(2)
+    start_m = pid_m * BLOCK_M
+
+    qd = tl.make_tensor_descriptor(
+        Q + b * stride_qb + h * stride_qh,
+        (qo_len, D),
+        (stride_qn, 1),
+        (BLOCK_M, D),
+    )
+    kd = tl.make_tensor_descriptor(
+        K + b * stride_kb + h * stride_kh,
+        (kv_len, D),
+        (stride_kn, 1),
+        (BLOCK_N, D),
+    )
+    vd = tl.make_tensor_descriptor(
+        V + b * stride_vb + h * stride_vh,
+        (kv_len, D),
+        (stride_vn, 1),
+        (BLOCK_N, D),
+    )
+    od = tl.make_tensor_descriptor(
+        O + b * stride_ob + h * stride_oh,
+        (qo_len, D),
+        (stride_on, 1),
+        (BLOCK_M, D),
+    )
+
+    q = qd.load([start_m, 0])
+    acc = tl.zeros((BLOCK_M, D), tl.float32)
+    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_M,), tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    q_block = start_m // 128
+    count = tl.load(BLOCK_COUNTS + q_block)
+
+    for block_id in tl.range(0, count):
+        block_n = tl.load(BLOCK_INDICES + q_block * MAX_BLOCKS + block_id)
+        start_n = block_n * BLOCK_N
+        scores = tl.dot(q, tl.trans(kd.load([start_n, 0])), out_dtype=tl.float32)
+        scores *= sm_scale * 1.44269504
+        scores = tl.where(
+            (start_n + offs_n)[None, :] < kv_len,
+            scores,
+            -float("inf"),
+        )
+        m_new = tl.maximum(m_i, tl.max(scores, 1))
+        alpha = tl.math.exp2(m_i - m_new)
+        probabilities = tl.math.exp2(scores - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(probabilities, 1)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(
+            probabilities.to(tl.bfloat16),
+            vd.load([start_n, 0]),
+            acc,
+        )
+        m_i = m_new
+
+    od.store([start_m, 0], (acc / l_i[:, None]).to(O.dtype.element_ty))
+
+
+def _radial_bf16_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: Optional[float],
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    block_n: int = 64,
+) -> torch.Tensor:
+    """Launch the XPU Triton fallback; tensors are ``[B, H, L, D]``."""
+    batch, heads, qo_len, head_dim = q.shape
+    kv_len = k.shape[2]
+    block_m = 128 if qo_len >= 128 else 32
+    warps = 16 if block_m == 128 else 4
+    output = torch.empty_like(q)
+    _radial_bf16_kernel[(triton.cdiv(qo_len, block_m), heads, batch)](
+        q,
+        k,
+        v,
+        output,
+        block_indices,
+        block_counts,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        qo_len,
+        kv_len,
+        head_dim**-0.5 if scale is None else float(scale),
+        D=head_dim,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        MAX_BLOCKS=int(block_indices.shape[-1]),
+        num_warps=warps,
+        num_stages=2,
+        grf_mode="256",
+    )
+    return output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -694,6 +858,10 @@ def fused_rope_prope_sdpa_split(
     rope_dtype: Union[str, torch.dtype] = "float64",
     camera_translation_transform: str = "linear",
     scale: Optional[float] = None,
+    radial_config: Optional[RadialAttentionConfig] = None,
+    radial_query_start_frame: int = 0,
+    radial_kv_start_frame: int = 0,
+    radial_tokens_per_frame: Optional[int] = None,
 ) -> torch.Tensor:
     """RoPE+PRoPE fused into the Q/K/V stream, SDPA, then fused output PRoPE."""
     cs_q, cs_k, p_q_t, p_kv_inv, p_q = _prepare(
@@ -709,7 +877,57 @@ def fused_rope_prope_sdpa_split(
     k_eff = rope_prope_transform(k, p_kv_inv, cs_k, mode, out_layout="HND")
     v_eff = rope_prope_transform(v, p_kv_inv, None, out_layout="HND")
 
-    o = F.scaled_dot_product_attention(q_eff, k_eff, v_eff, scale=scale, is_causal=False)
+    if radial_config is None or not radial_config.enabled:
+        o = F.scaled_dot_product_attention(q_eff, k_eff, v_eff, scale=scale, is_causal=False)
+    else:
+        tokens_per_frame = (
+            int(radial_tokens_per_frame)
+            if radial_tokens_per_frame is not None
+            else int(q_grid_sizes[0, 1].item() * q_grid_sizes[0, 2].item())
+        )
+        if q_eff.device.type == "xpu":
+            block_counts, block_indices = build_sage_block_indices(
+                query_tokens=q_eff.shape[2],
+                kv_tokens=k_eff.shape[2],
+                tokens_per_frame=tokens_per_frame,
+                query_start_frame=radial_query_start_frame,
+                kv_start_frame=radial_kv_start_frame,
+                config=radial_config,
+                device=q_eff.device,
+                kv_block_size=64,
+            )
+            o = _radial_bf16_attention(
+                q_eff,
+                k_eff,
+                v_eff,
+                scale=scale,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                block_n=64,
+            )
+        else:
+            block_mask, q_pad, kv_pad, _ = build_radial_block_mask(
+                query_tokens=q_eff.shape[2],
+                kv_tokens=k_eff.shape[2],
+                tokens_per_frame=tokens_per_frame,
+                query_start_frame=radial_query_start_frame,
+                kv_start_frame=radial_kv_start_frame,
+                config=radial_config,
+                device=q_eff.device,
+            )
+            if q_pad:
+                q_eff = F.pad(q_eff, (0, 0, 0, q_pad))
+            if kv_pad:
+                k_eff = F.pad(k_eff, (0, 0, 0, kv_pad))
+                v_eff = F.pad(v_eff, (0, 0, 0, kv_pad))
+            o = _radial_flex_attention(
+                q_eff,
+                k_eff,
+                v_eff,
+                scale=scale,
+                block_mask=block_mask,
+            )
+            o = o[:, :, : q.shape[1], :]
 
     return rope_prope_transform(o, p_q, None, in_layout="HND", out_layout="NHD")
 

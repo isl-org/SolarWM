@@ -10,15 +10,18 @@
 # sequence-parallel paths the causal routes need.
 from .attention import attention
 from .camera_prope import (
+    _prepare_apply_fns_all_dim,
     prope_apply_fns_separate_cached,
     prope_qkv,
     prope_qkv_separate,
+    transform_relative_viewmats,
 )
 from .model import WanRMSNorm, WanLayerNorm, WanCrossAttention, rope_params, sinusoidal_embedding_1d
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from ..camera import normalize_camera_translation_transform
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import copy
 import math
@@ -28,10 +31,24 @@ try:
     from solarwm.kernels.fused_rope_prope_sage import (
         fused_rope_prope_sdpa_split,
         fused_rope_prope_sage,
+        rope_prope_transform,
+        ROPE_MODE,
+        normalize_rope_precision,
+        _prope_tables_triton,
+        _prope_tables,
+        build_rope_table,
+        _freqs_real,
     )
 except ImportError:
     fused_rope_prope_sdpa_split = None
     fused_rope_prope_sage = None
+    rope_prope_transform = None
+    ROPE_MODE = None
+    normalize_rope_precision = None
+    _prope_tables_triton = None
+    _prope_tables = None
+    build_rope_table = None
+    _freqs_real = None
 
 # Lazily-imported FlexAttention symbols. Some torch builds don't ship
 # torch.nn.attention.flex_attention; we only require it when stage1 TF mode
@@ -145,6 +162,31 @@ def _write_mirrored_ring(storage, *, start: int, values) -> None:
         remainder = length - first
         storage[:, :remainder] = values[:, first:]
         storage[:, capacity : capacity + remainder] = values[:, first:]
+
+
+def _read_ring_slice(ring: torch.Tensor, start: int, length: int) -> torch.Tensor:
+    """Read a logical slice of ``length`` tokens starting at ``start`` from circular ``ring``."""
+    capacity = ring.shape[1]
+    start = start % capacity
+    if start + length <= capacity:
+        return ring[:, start : start + length]
+    part1 = capacity - start
+    part2 = length - part1
+    return torch.cat([ring[:, start:], ring[:, :part2]], dim=1)
+
+
+def _write_ring(ring: torch.Tensor, start: int, values: torch.Tensor) -> None:
+    """Write ``values`` into unmirrored circular ``ring`` starting at ``start``."""
+    capacity = ring.shape[1]
+    start = start % capacity
+    length = values.shape[1]
+    if start + length <= capacity:
+        ring[:, start : start + length].copy_(values)
+    else:
+        part1 = capacity - start
+        part2 = length - part1
+        ring[:, start:].copy_(values[:, :part1])
+        ring[:, :part2].copy_(values[:, part1:])
 
 
 def echorope_apply(
@@ -665,6 +707,11 @@ class CausalWanSelfAttention(nn.Module):
         fuse_rope_prope=False,
         fused_kernel=None,
         rope_dtype="float64",
+        radial_attention=False,
+        radial_decay=0.8,
+        radial_sink_frames=1,
+        radial_dense_blocks=1,
+        radial_dense_steps=1,
     ):
         assert dim % num_heads == 0
         super().__init__()
@@ -683,6 +730,11 @@ class CausalWanSelfAttention(nn.Module):
         self.fuse_rope_prope = bool(fuse_rope_prope)
         self.fused_kernel = fused_kernel
         self.rope_dtype = rope_dtype
+        self.radial_attention = bool(radial_attention)
+        self.radial_decay = float(radial_decay)
+        self.radial_sink_frames = int(radial_sink_frames)
+        self.radial_dense_blocks = int(radial_dense_blocks)
+        self.radial_dense_steps = int(radial_dense_steps)
         self.camera_attention_mode = normalize_camera_attention_mode(camera_attention_mode)
         self.camera_translation_transform = normalize_camera_translation_transform(
             camera_translation_transform
@@ -699,6 +751,33 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.num_frame_per_block_attr = 3
         self.layer_idx = -1
+
+    def _radial_kwargs(
+        self,
+        *,
+        q_start_frame: int,
+        k_start_frame: int,
+        radial_step: int | None = None,
+        tokens_per_frame: int | None = None,
+    ):
+        if not self.radial_attention or (
+            self.layer_idx >= 0 and self.layer_idx < self.radial_dense_blocks
+        ) or (radial_step is not None and radial_step < self.radial_dense_steps):
+            return {}
+        from solarwm.kernels.fused_rope_prope_sage import RadialAttentionConfig
+
+        return {
+            "radial_config": RadialAttentionConfig(
+                enabled=True,
+                decay_factor=self.radial_decay,
+                sink_frames=self.radial_sink_frames,
+            ),
+            "radial_query_start_frame": int(q_start_frame),
+            "radial_kv_start_frame": int(k_start_frame),
+            "radial_tokens_per_frame": (
+                None if tokens_per_frame is None else int(tokens_per_frame)
+            ),
+        }
 
     def _apply_fused_prope(
         self,
@@ -1101,6 +1180,7 @@ class CausalWanSelfAttention(nn.Module):
         frame_seqlen=None,
         prope_cache=None,
         grid_list=None,
+        radial_step=None,
     ):
         """
         Args:
@@ -1247,6 +1327,12 @@ class CausalWanSelfAttention(nn.Module):
                     k_start_frame=0,
                     rope_dtype=self.rope_dtype,
                     camera_translation_transform=self.camera_translation_transform,
+                    **self._radial_kwargs(
+                        q_start_frame=0,
+                        k_start_frame=0,
+                        radial_step=radial_step,
+                        tokens_per_frame=frame_seqlen,
+                    ),
                 )
                 if cache_head_parallel:
                     x_out = sequence_model_parallel_all_gather(x_out, dim=2)
@@ -1304,6 +1390,387 @@ class CausalWanSelfAttention(nn.Module):
             new_local_end = min(capacity, local_end_index + num_new_tokens)
             new_ring_start = (ring_start + num_evicted) % capacity
             write_start = (ring_start + local_end_index) % capacity
+
+            is_unmirrored = kv_cache["k"].shape[1] == capacity
+            has_encoded_ring = "k_encoded" in kv_cache
+            if is_unmirrored or has_encoded_ring:
+                with torch.no_grad():
+                    if is_unmirrored:
+                        _write_ring(kv_cache["k"], start=write_start, values=k.detach())
+                        _write_ring(kv_cache["v"], start=write_start, values=v.detach())
+                    else:
+                        _write_mirrored_ring(kv_cache["k"], start=write_start, values=k.detach())
+                        _write_mirrored_ring(kv_cache["v"], start=write_start, values=v.detach())
+
+                num_window_tokens = new_local_end - max(0, new_local_end - self.max_attention_size)
+                num_hist_tokens = max(0, num_window_tokens - num_new_tokens)
+                num_window_frames = num_window_tokens // frame_seqlen
+                num_new_frames = num_new_tokens // frame_seqlen
+                num_hist_frames = num_hist_tokens // frame_seqlen
+
+                if self.fused_kernel is not None and self.camera_attention_mode == "fused_prope":
+                    if is_unmirrored:
+                        window_start = (new_ring_start + max(0, new_local_end - self.max_attention_size)) % capacity
+                        k_window_raw = _read_ring_slice(kv_cache["k"], start=window_start, length=num_window_tokens)
+                        v_window_raw = _read_ring_slice(kv_cache["v"], start=window_start, length=num_window_tokens)
+                        visible_cam_viewmats = None
+                        visible_cam_K = None
+                        if kv_cam_viewmats is not None or kv_cam_K is not None:
+                            if kv_cam_viewmats is None or kv_cam_K is None:
+                                raise ValueError("fused_prope KV-cache requires both shared camera tensors")
+                            visible_cam_viewmats = _read_ring_slice(kv_cam_viewmats, start=window_start, length=num_window_tokens)
+                            visible_cam_K = _read_ring_slice(kv_cam_K, start=window_start, length=num_window_tokens)
+                    else:
+                        window_start = new_ring_start + max(0, new_local_end - self.max_attention_size)
+                        window_end = new_ring_start + new_local_end
+                        k_window_raw = kv_cache["k"][:, window_start:window_end]
+                        v_window_raw = kv_cache["v"][:, window_start:window_end]
+                        visible_cam_viewmats = None
+                        visible_cam_K = None
+                        if kv_cam_viewmats is not None or kv_cam_K is not None:
+                            if kv_cam_viewmats is None or kv_cam_K is None:
+                                raise ValueError("fused_prope KV-cache requires both shared camera tensors")
+                            visible_cam_viewmats = kv_cam_viewmats[:, window_start:window_end]
+                            visible_cam_K = kv_cam_K[:, window_start:window_end]
+
+                    if self.use_echorope:
+                        pos = self._window_relative_positions(
+                            current_start_frame=max(0, num_window_frames - num_new_frames),
+                            num_new_frames=num_new_frames,
+                            num_context_frames=num_window_frames,
+                            num_query_memory_frames=0,
+                            num_sink_frames=0,
+                            pmax=self._echorope_pmax_frames(freqs, min_frames=num_new_frames),
+                            num_frame_per_block=getattr(
+                                self, "num_frame_per_block_attr", num_new_frames
+                            ),
+                        )
+                    else:
+                        pos = {
+                            "q_start": num_window_frames - num_new_frames,
+                            "local_start": 0,
+                        }
+                    q_grid = grid_sizes.clone()
+                    q_grid[:, 0] = num_new_frames
+                    k_grid = grid_sizes.clone()
+                    k_grid[:, 0] = num_window_frames
+                    radial_kwargs = self._radial_kwargs(
+                        q_start_frame=pos["q_start"],
+                        k_start_frame=pos["local_start"],
+                        radial_step=radial_step,
+                        tokens_per_frame=frame_seqlen,
+                    )
+
+                    if self.fused_kernel in ("fused_rope_prope_sdpa", "sdpa", "fused_sdpa"):
+                        if fused_rope_prope_sdpa_split is None:
+                            raise RuntimeError("fused_rope_prope_sdpa is not available")
+                        if has_encoded_ring and not radial_kwargs:
+                            history_key = (global_end_index, new_ring_start, num_hist_tokens)
+                            if num_hist_tokens > 0 and kv_cache.get("_encoded_history_key") != history_key:
+                                k_hist_raw = (
+                                    _read_ring_slice(kv_cache["k"], start=new_ring_start, length=num_hist_tokens)
+                                    if is_unmirrored
+                                    else kv_cache["k"][:, window_start : window_start + num_hist_tokens]
+                                )
+                                v_hist_raw = (
+                                    _read_ring_slice(kv_cache["v"], start=new_ring_start, length=num_hist_tokens)
+                                    if is_unmirrored
+                                    else kv_cache["v"][:, window_start : window_start + num_hist_tokens]
+                                )
+                                if kv_cam_viewmats is not None:
+                                    hist_cam_viewmats = (
+                                        _read_ring_slice(kv_cam_viewmats, start=new_ring_start, length=num_hist_tokens)
+                                        if is_unmirrored
+                                        else kv_cam_viewmats[:, window_start : window_start + num_hist_tokens]
+                                    )
+                                    hist_cam_K = (
+                                        _read_ring_slice(kv_cam_K, start=new_ring_start, length=num_hist_tokens)
+                                        if is_unmirrored
+                                        else kv_cam_K[:, window_start : window_start + num_hist_tokens]
+                                    )
+                                else:
+                                    hist_cam_viewmats = hist_cam_K = None
+
+                                hist_prope_key = ("fused_sdpa_hist_prope", history_key)
+                                cached_hist_prope = prope_cache.get(hist_prope_key) if prope_cache is not None else None
+                                if cached_hist_prope is None:
+                                    fr = _freqs_real(freqs, self.rope_dtype)
+                                    hist_grid = grid_sizes.clone()
+                                    hist_grid[:, 0] = num_hist_frames
+                                    cs_k_hist = build_rope_table(
+                                        fr, hist_grid.to(device=q.device), num_hist_tokens, start_frame=0
+                                    )
+                                    if (
+                                        self.camera_translation_transform in (None, "linear")
+                                        and q.device.type == "xpu"
+                                        and hist_cam_viewmats is not None
+                                    ):
+                                        _, p_hist_inv, _ = _prope_tables_triton(
+                                            hist_cam_viewmats.float(),
+                                            hist_cam_K.float() if hist_cam_K is not None else None,
+                                        )
+                                    elif hist_cam_viewmats is not None:
+                                        _, p_hist_inv, _ = _prope_tables(
+                                            hist_cam_viewmats.float(),
+                                            hist_cam_K.float() if hist_cam_K is not None else None,
+                                            self.camera_translation_transform,
+                                        )
+                                    else:
+                                        p_hist_inv = None
+                                    cached_hist_prope = (cs_k_hist, p_hist_inv)
+                                    if prope_cache is not None:
+                                        prope_cache[hist_prope_key] = cached_hist_prope
+                                else:
+                                    cs_k_hist, p_hist_inv = cached_hist_prope
+
+                                mode = ROPE_MODE[normalize_rope_precision(self.rope_dtype)[0]]
+                                k_hist_enc = rope_prope_transform(
+                                    k_hist_raw, p_hist_inv, cs_k_hist, mode, out_layout="NHD"
+                                )
+                                v_hist_enc = rope_prope_transform(
+                                    v_hist_raw, p_hist_inv, None, out_layout="NHD"
+                                )
+                                kv_cache["k_encoded"][:, :num_hist_tokens].copy_(k_hist_enc)
+                                kv_cache["v_encoded"][:, :num_hist_tokens].copy_(v_hist_enc)
+                                kv_cache["_encoded_history_key"] = history_key
+
+                            new_prope_key = ("fused_sdpa_new_prope", num_hist_frames, num_new_frames)
+                            cached_new_prope = prope_cache.get(new_prope_key) if prope_cache is not None else None
+                            if cached_new_prope is None:
+                                fr = _freqs_real(freqs, self.rope_dtype)
+                                cs_new = build_rope_table(
+                                    fr, q_grid.to(device=q.device), num_new_tokens, start_frame=num_hist_frames
+                                )
+                                if (
+                                    self.camera_translation_transform in (None, "linear")
+                                    and q.device.type == "xpu"
+                                    and cam_viewmats is not None
+                                ):
+                                    p_q_t, p_new_inv, p_q = _prope_tables_triton(
+                                        cam_viewmats.float(),
+                                        cam_K.float() if cam_K is not None else None,
+                                    )
+                                elif cam_viewmats is not None:
+                                    p_q_t, _, p_q = _prope_tables(
+                                        cam_viewmats.float(),
+                                        cam_K.float() if cam_K is not None else None,
+                                        self.camera_translation_transform,
+                                    )
+                                    _, p_new_inv, _ = _prope_tables(
+                                        cam_viewmats.float(),
+                                        cam_K.float() if cam_K is not None else None,
+                                        self.camera_translation_transform,
+                                    )
+                                else:
+                                    p_q_t = p_new_inv = p_q = None
+                                cached_new_prope = (cs_new, p_q_t, p_new_inv, p_q)
+                                if prope_cache is not None:
+                                    prope_cache[new_prope_key] = cached_new_prope
+                            else:
+                                cs_new, p_q_t, p_new_inv, p_q = cached_new_prope
+
+                            mode = ROPE_MODE[normalize_rope_precision(self.rope_dtype)[0]]
+                            q_eff = rope_prope_transform(q, p_q_t, cs_new, mode, out_layout="HND")
+                            k_new_enc = rope_prope_transform(k, p_new_inv, cs_new, mode, out_layout="NHD")
+                            v_new_enc = rope_prope_transform(v, p_new_inv, None, out_layout="NHD")
+                            kv_cache["k_encoded"][:, num_hist_tokens:num_window_tokens].copy_(k_new_enc)
+                            kv_cache["v_encoded"][:, num_hist_tokens:num_window_tokens].copy_(v_new_enc)
+
+                            attn_k = kv_cache["k_encoded"][:, :num_window_tokens].transpose(1, 2)
+                            attn_v = kv_cache["v_encoded"][:, :num_window_tokens].transpose(1, 2)
+                            o = F.scaled_dot_product_attention(q_eff, attn_k, attn_v, is_causal=False)
+                            x = rope_prope_transform(o, p_q, None, in_layout="HND", out_layout="NHD")
+                            if cache_head_parallel:
+                                x = sequence_model_parallel_all_gather(x, dim=2)
+                            elif sp_enabled:
+                                x = sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+                            x = self.o(x.flatten(2))
+                            update = {
+                                "action": "circular_insert",
+                                "ring_start": new_ring_start,
+                                "local_end_index": new_local_end,
+                                "current_end": current_end,
+                            }
+                            return x, (current_end, new_local_end, update)
+                        else:
+                            kernel_fn = fused_rope_prope_sdpa_split
+                    elif self.fused_kernel in ("fused_rope_prope_sage", "sage", "fused_sage"):
+                        if fused_rope_prope_sage is None:
+                            raise RuntimeError("fused_rope_prope_sage is not available")
+                        kernel_fn = fused_rope_prope_sage
+                    elif self.fused_kernel in ("reference", "fused_rope_prope_sdpa_reference"):
+                        from solarwm.kernels.fused_rope_prope_sdpa.reference import (
+                            fused_rope_prope_sdpa_reference,
+                        )
+                        kernel_fn = fused_rope_prope_sdpa_reference
+                    else:
+                        raise ValueError(f"unknown fused_kernel={self.fused_kernel!r}")
+
+                    q_vm = cam_viewmats.float() if cam_viewmats is not None else None
+                    q_k = cam_K.float() if cam_K is not None else None
+                    kv_vm = visible_cam_viewmats.float() if visible_cam_viewmats is not None else None
+                    kv_k = visible_cam_K.float() if visible_cam_K is not None else None
+
+                    x = kernel_fn(
+                        q=q,
+                        k=k_window_raw,
+                        v=v_window_raw,
+                        freqs=freqs,
+                        q_grid_sizes=q_grid.to(device=q.device),
+                        k_grid_sizes=k_grid.to(device=q.device),
+                        q_viewmats=q_vm,
+                        q_Ks=q_k,
+                        kv_viewmats=kv_vm,
+                        kv_Ks=kv_k,
+                        q_start_frame=pos["q_start"],
+                        k_start_frame=pos["local_start"],
+                        rope_dtype=self.rope_dtype,
+                        camera_translation_transform=self.camera_translation_transform,
+                        **radial_kwargs,
+                    )
+                    if cache_head_parallel:
+                        x = sequence_model_parallel_all_gather(x, dim=2)
+                    elif sp_enabled:
+                        x = sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+                    x = self.o(x.flatten(2))
+                    update = {
+                        "action": "circular_insert",
+                        "ring_start": new_ring_start,
+                        "local_end_index": new_local_end,
+                        "current_end": current_end,
+                    }
+                    return x, (current_end, new_local_end, update)
+
+                history_key = (global_end_index, new_ring_start, num_hist_tokens)
+                if num_hist_tokens > 0 and kv_cache.get("_encoded_history_key") != history_key:
+                    k_hist_raw = _read_ring_slice(kv_cache["k"], start=new_ring_start, length=num_hist_tokens)
+                    v_hist_raw = _read_ring_slice(kv_cache["v"], start=new_ring_start, length=num_hist_tokens)
+                    if kv_cam_viewmats is not None:
+                        hist_cam_viewmats = _read_ring_slice(kv_cam_viewmats, start=new_ring_start, length=num_hist_tokens)
+                        hist_cam_K = _read_ring_slice(kv_cam_K, start=new_ring_start, length=num_hist_tokens)
+                    else:
+                        hist_cam_viewmats = hist_cam_K = None
+
+                    hist_grid_list = (
+                        None if grid_list is None else [(num_hist_frames, h, w) for _, h, w in grid_list]
+                    )
+                    hist_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+                    if grid_list is None:
+                        hist_grid[:, 0] = num_hist_frames
+                    rope_fn = echorope_apply if self.use_echorope else block_relativistic_rope
+                    roped_k_hist = rope_fn(
+                        k_hist_raw, hist_grid, freqs, start_frame=0, grid_list=hist_grid_list
+                    ).type_as(v_hist_raw)
+
+                    if hist_cam_viewmats is not None and self.camera_attention_mode == "fused_prope":
+                        hist_kv_key = ("hist_kv", history_key)
+                        apply_fn_kv_hist = prope_cache.get(hist_kv_key) if prope_cache is not None else None
+                        if apply_fn_kv_hist is None:
+                            _, apply_fn_kv_hist, _ = _prepare_apply_fns_all_dim(
+                                head_dim=self.head_dim,
+                                viewmats=transform_relative_viewmats(
+                                    hist_cam_viewmats, self.camera_translation_transform
+                                ),
+                                Ks=hist_cam_K,
+                                patches_x=None,
+                                patches_y=None,
+                                image_width=None,
+                                image_height=None,
+                            )
+                            if prope_cache is not None:
+                                prope_cache[hist_kv_key] = apply_fn_kv_hist
+                        k_hist_encoded = apply_fn_kv_hist(roped_k_hist.transpose(1, 2)).transpose(1, 2)
+                        v_hist_encoded = apply_fn_kv_hist(v_hist_raw.transpose(1, 2)).transpose(1, 2)
+                    else:
+                        k_hist_encoded = roped_k_hist
+                        v_hist_encoded = v_hist_raw
+
+                    kv_cache["k_encoded"][:, :num_hist_tokens].copy_(k_hist_encoded)
+                    kv_cache["v_encoded"][:, :num_hist_tokens].copy_(v_hist_encoded)
+                    kv_cache["_encoded_history_key"] = history_key
+
+                # RoPE for Q and new K (start frame = num_hist_frames)
+                q_grid_list = (
+                    None if grid_list is None else [(num_new_frames, h, w) for _, h, w in grid_list]
+                )
+                q_grid = grid_sizes if grid_list is not None else grid_sizes.clone()
+                if grid_list is None:
+                    q_grid[:, 0] = num_new_frames
+                rope_fn = echorope_apply if self.use_echorope else block_relativistic_rope
+                roped_query = rope_fn(
+                    q, q_grid, freqs, start_frame=num_hist_frames, grid_list=q_grid_list
+                ).type_as(v)
+                roped_k_new = rope_fn(
+                    k, q_grid, freqs, start_frame=num_hist_frames, grid_list=q_grid_list
+                ).type_as(v)
+
+                # PRoPE for Q and new K/V
+                if cam_viewmats is not None and self.camera_attention_mode == "fused_prope":
+                    entry_q = prope_cache.get("q") if prope_cache is not None else None
+                    if entry_q is None:
+                        apply_fn_q, _, apply_fn_o = _prepare_apply_fns_all_dim(
+                            head_dim=self.head_dim,
+                            viewmats=transform_relative_viewmats(
+                                cam_viewmats, self.camera_translation_transform
+                            ),
+                            Ks=cam_K,
+                            patches_x=None,
+                            patches_y=None,
+                            image_width=None,
+                            image_height=None,
+                        )
+                        if prope_cache is not None:
+                            prope_cache["q"] = (apply_fn_q, apply_fn_o)
+                    else:
+                        apply_fn_q, apply_fn_o = entry_q
+
+                    apply_fn_kv_new = prope_cache.get("new_kv") if prope_cache is not None else None
+                    if apply_fn_kv_new is None:
+                        _, apply_fn_kv_new, _ = _prepare_apply_fns_all_dim(
+                            head_dim=self.head_dim,
+                            viewmats=transform_relative_viewmats(
+                                cam_viewmats, self.camera_translation_transform
+                            ),
+                            Ks=cam_K,
+                            patches_x=None,
+                            patches_y=None,
+                            image_width=None,
+                            image_height=None,
+                        )
+                        if prope_cache is not None:
+                            prope_cache["new_kv"] = apply_fn_kv_new
+
+                    attn_q = apply_fn_q(roped_query.transpose(1, 2)).transpose(1, 2)
+                    k_new_encoded = apply_fn_kv_new(roped_k_new.transpose(1, 2)).transpose(1, 2)
+                    v_new_encoded = apply_fn_kv_new(v.transpose(1, 2)).transpose(1, 2)
+                else:
+                    attn_q = roped_query
+                    k_new_encoded = roped_k_new
+                    v_new_encoded = v
+                    apply_fn_o = None
+
+                kv_cache["k_encoded"][:, num_hist_tokens:num_window_tokens].copy_(k_new_encoded)
+                kv_cache["v_encoded"][:, num_hist_tokens:num_window_tokens].copy_(v_new_encoded)
+
+                attn_k = kv_cache["k_encoded"][:, :num_window_tokens]
+                attn_v = kv_cache["v_encoded"][:, :num_window_tokens]
+
+                x = attention(attn_q, attn_k, attn_v)
+                if apply_fn_o is not None:
+                    x = apply_fn_o(x.transpose(1, 2)).transpose(1, 2)
+                if cache_head_parallel:
+                    x = sequence_model_parallel_all_gather(x, dim=2)
+                elif sp_enabled:
+                    x = sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+                x = self.o(x.flatten(2))
+                update = {
+                    "action": "circular_insert",
+                    "ring_start": new_ring_start,
+                    "local_end_index": new_local_end,
+                    "current_end": current_end,
+                }
+                return x, (current_end, new_local_end, update)
+
             with torch.no_grad():
                 _write_mirrored_ring(kv_cache["k"], start=write_start, values=k.detach())
                 _write_mirrored_ring(kv_cache["v"], start=write_start, values=v.detach())
@@ -1381,6 +1848,12 @@ class CausalWanSelfAttention(nn.Module):
                     k_start_frame=pos["local_start"],
                     rope_dtype=self.rope_dtype,
                     camera_translation_transform=self.camera_translation_transform,
+                    **self._radial_kwargs(
+                        q_start_frame=pos["q_start"],
+                        k_start_frame=pos["local_start"],
+                        radial_step=radial_step,
+                        tokens_per_frame=frame_seqlen,
+                    ),
                 )
                 if cache_head_parallel:
                     x = sequence_model_parallel_all_gather(x, dim=2)
@@ -2059,6 +2532,11 @@ class CausalWanAttentionBlock(nn.Module):
             fuse_rope_prope=fuse_rope_prope,
             fused_kernel=kwargs.get("fused_kernel", None),
             rope_dtype=kwargs.get("rope_dtype", "float64"),
+            radial_attention=kwargs.get("radial_attention", False),
+            radial_decay=kwargs.get("radial_decay", 0.8),
+            radial_sink_frames=kwargs.get("radial_sink_frames", 1),
+            radial_dense_blocks=kwargs.get("radial_dense_blocks", 1),
+            radial_dense_steps=kwargs.get("radial_dense_steps", 1),
         )
         self.norm3 = (
             WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -2114,6 +2592,7 @@ class CausalWanAttentionBlock(nn.Module):
         frame_seqlen=None,
         prope_cache=None,
         grid_list=None,
+        radial_step=None,
     ):
         # ``e`` is expanded per token, so its axis here is the token axis rather
         # than the physical video-frame axis. Keep the original modulation
@@ -2140,6 +2619,7 @@ class CausalWanAttentionBlock(nn.Module):
             cache_start=cache_start,
             sink_recache_after_switch=sink_recache_after_switch,
             cache_update_policy=cache_update_policy,
+            radial_step=radial_step,
             block_mask=block_mask,
             frame_indices=frame_indices,
             cam_viewmats=(
@@ -2275,6 +2755,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         fuse_rope_prope=False,
         fused_kernel=None,
         rope_dtype="float64",
+        radial_attention=False,
+        radial_decay=0.8,
+        radial_sink_frames=1,
+        radial_dense_blocks=1,
+        radial_dense_steps=1,
         flow_objective="flow_matching",
         anyflow_gate=0.25,
         anyflow_deltatime_type="r",
@@ -2303,6 +2788,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.use_echorope = bool(use_echorope)
         self.fuse_rope_prope = bool(fuse_rope_prope)
         self.fused_kernel = fused_kernel
+        self.radial_attention = bool(radial_attention)
+        self.radial_decay = float(radial_decay)
+        self.radial_sink_frames = int(radial_sink_frames)
+        self.radial_dense_blocks = int(radial_dense_blocks)
+        self.radial_dense_steps = int(radial_dense_steps)
         if str(rope_dtype).strip().lower() in {"float16", "fp16"} or rope_dtype == torch.float16:
             self.rope_dtype = torch.float16
             self.rope_complex_dtype = torch.complex32
@@ -2362,6 +2852,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     fuse_rope_prope=self.fuse_rope_prope,
                     fused_kernel=self.fused_kernel,
                     rope_dtype=self.rope_dtype,
+                    radial_attention=self.radial_attention,
+                    radial_decay=self.radial_decay,
+                    radial_sink_frames=self.radial_sink_frames,
+                    radial_dense_blocks=self.radial_dense_blocks,
+                    radial_dense_steps=self.radial_dense_steps,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -2569,10 +3064,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             # K/V.  It has no logical pointer of its own; the detached K/V
             # commit below is the sole owner of the ring pointer.
             with torch.no_grad():
-                _write_mirrored_ring(
-                    state["viewmats"], start=write_start, values=cam_viewmats.detach()
-                )
-                _write_mirrored_ring(state["K"], start=write_start, values=cam_K.detach())
+                if state["viewmats"].shape[1] == capacity:
+                    _write_ring(
+                        state["viewmats"], start=write_start, values=cam_viewmats.detach()
+                    )
+                    _write_ring(state["K"], start=write_start, values=cam_K.detach())
+                else:
+                    _write_mirrored_ring(
+                        state["viewmats"], start=write_start, values=cam_viewmats.detach()
+                    )
+                    _write_mirrored_ring(state["K"], start=write_start, values=cam_K.detach())
             return (
                 cam_viewmats,
                 cam_K,
@@ -3183,6 +3684,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_start=0,
         cache_update_policy="commit_detached",
         r=None,
+        radial_step=None,
         **kwargs,
     ):
         """
@@ -3366,6 +3868,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cam_K=kv_cam_K,
             cache_update_policy=cache_update_policy,
             frame_seqlen=frame_seqlen if (kv_cache is not None or not sp_enabled) else None,
+            radial_step=radial_step,
             # ``grid_sizes`` is a CPU tensor built from Python shapes, so read
             # it once here rather than inside every block's rope calls.
             grid_list=[tuple(int(v) for v in row) for row in grid_sizes.tolist()],
@@ -3386,7 +3889,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # next window is selected, so camera matrices never bleed into a
         # subsequent chunk and the cache remains bounded to one window.
         if circular_inference_cache and self.camera_attention_mode == "fused_prope":
-            if self.fuse_rope_prope:
+            if self.fuse_rope_prope or getattr(self, "fused_kernel", None) is not None:
                 cache0 = kv_cache[0]
                 capacity = int(cache0["_circular_capacity"])
                 local_end = _cache_index(cache0, "local_end_index")

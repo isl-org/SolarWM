@@ -243,6 +243,11 @@ def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
         "rope_dtype": str(
             runtime.get("stage2_rope_dtype", model_config.get("rope_dtype", "float64"))
         ).strip().lower(),
+        "radial_attention": bool(runtime.get("stage2_radial_attention", False)),
+        "radial_decay": float(runtime.get("stage2_radial_decay", 0.8)),
+        "radial_sink_frames": int(runtime.get("stage2_radial_sink_frames", 1)),
+        "radial_dense_blocks": int(runtime.get("stage2_radial_dense_blocks", 1)),
+        "radial_dense_steps": int(runtime.get("stage2_radial_dense_steps", 1)),
         "flow_objective": objective,
     }
     optional = ("max_prior_clean_chunks", "rope_train_frames")

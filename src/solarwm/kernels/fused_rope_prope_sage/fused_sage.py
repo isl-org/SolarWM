@@ -77,6 +77,7 @@ from .fused_sdpa import (
     _unpack4,
     prope4,
 )
+from .radial_attention import RadialAttentionConfig, build_sage_block_indices
 
 #: K is quantised in blocks of this many tokens, which is also the attention's
 #: inner tile width, so one scale is loaded per iteration.
@@ -434,6 +435,7 @@ def _sage_kv_kernel(
 @triton.jit
 def _sage_attn_kernel(
     Q, KI8, V, KS, O,
+    BLOCK_INDICES, BLOCK_COUNTS,
     stride_qb, stride_qh, stride_qn,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -441,6 +443,7 @@ def _sage_attn_kernel(
     stride_ob, stride_oh, stride_on,
     qo_len, kv_len, sm_scale,
     D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    SPARSE: tl.constexpr, MAX_BLOCKS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     h = tl.program_id(1)
@@ -467,23 +470,40 @@ def _sage_attn_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     scales = KS + b * stride_sb + h * stride_sh
 
-    for start_n in tl.range(0, kv_len, BLOCK_N):
-        k_scale = tl.load(scales + start_n // BLOCK_N)
-        # int8 x int8 -> int32 DPAS: twice the bfloat16 K per instruction.
-        # tl.trans of the [BLOCK_N, D] tile folds into a transposed block load;
-        # both scales are scalars -- a per-row Q scale is 1.17x more accurate
-        # but makes IGC spill, doubling the time.
-        s = tl.dot(q_i8, tl.trans(kd.load([start_n, 0])), out_dtype=tl.int32).to(tl.float32)
-        s = s * (qk_scale * k_scale)
-        s = tl.where((start_n + offs_n)[None, :] < kv_len, s, -float("inf"))
+    if SPARSE:
+        q_block = start_m // 128
+        count = tl.load(BLOCK_COUNTS + q_block)
+        for block_id in tl.range(0, count):
+            block_n = tl.load(BLOCK_INDICES + q_block * MAX_BLOCKS + block_id)
+            start_n = block_n * BLOCK_N
+            s = tl.dot(q_i8, tl.trans(kd.load([start_n, 0])), out_dtype=tl.int32).to(tl.float32)
+            s = s * (qk_scale * tl.load(scales + block_n))
+            s = tl.where((start_n + offs_n)[None, :] < kv_len, s, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(tl.bfloat16), vd.load([start_n, 0]), acc)
+            m_i = m_new
+    else:
+        for start_n in tl.range(0, kv_len, BLOCK_N):
+            k_scale = tl.load(scales + start_n // BLOCK_N)
+            # int8 x int32 DPAS: twice the bfloat16 K per instruction.
+            # tl.trans of the [BLOCK_N, D] tile folds into a transposed block load;
+            # both scales are scalars -- a per-row Q scale is 1.17x more accurate
+            # but makes IGC spill, doubling the time.
+            s = tl.dot(q_i8, tl.trans(kd.load([start_n, 0])), out_dtype=tl.int32).to(tl.float32)
+            s = s * (qk_scale * k_scale)
+            s = tl.where((start_n + offs_n)[None, :] < kv_len, s, -float("inf"))
 
-        m_new = tl.maximum(m_i, tl.max(s, 1))
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(s - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1)
-        acc = acc * alpha[:, None]
-        acc = tl.dot(p.to(tl.bfloat16), vd.load([start_n, 0]), acc)
-        m_i = m_new
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.math.exp2(m_i - m_new)
+            p = tl.math.exp2(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(tl.bfloat16), vd.load([start_n, 0]), acc)
+            m_i = m_new
 
     od.store([start_m, 0], (acc / l_i[:, None]).to(O.dtype.element_ty))
 
@@ -510,20 +530,27 @@ def _attend_int8(
     k_scale: torch.Tensor,
     v: torch.Tensor,
     block_n: int = SAGE_BLOCK_N,
+    block_indices: Optional[torch.Tensor] = None,
+    block_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The attention core on pre-quantised K, all ``[B, H, L, D]``."""
     batch, heads, qo_len, d = q.shape
     kv_len = k_int8.shape[2]
     block_m, warps = _attn_config(qo_len, heads, batch)
     out = torch.empty_like(q)
+    sparse = block_indices is not None and block_counts is not None
+    max_blocks = int(block_indices.shape[-1]) if sparse else 1
+    indices = block_indices if sparse else torch.zeros((1,), dtype=torch.int32, device=q.device)
+    counts = block_counts if sparse else torch.zeros((1,), dtype=torch.int32, device=q.device)
     _sage_attn_kernel[(triton.cdiv(qo_len, block_m), heads, batch)](
-        q, k_int8, v, k_scale, out,
+        q, k_int8, v, k_scale, out, indices, counts,
         q.stride(0), q.stride(1), q.stride(2),
         k_int8.stride(0), k_int8.stride(1), k_int8.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
         k_scale.stride(0), k_scale.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         qo_len, kv_len, d ** -0.5, D=d, BLOCK_M=block_m, BLOCK_N=block_n,
+        SPARSE=sparse, MAX_BLOCKS=max_blocks,
         num_warps=warps, num_stages=2, grf_mode="256",
     )
     return out
@@ -692,6 +719,10 @@ def fused_rope_prope_sage(
     rope_dtype: Union[str, torch.dtype] = "float64",
     camera_translation_transform: str = "linear",
     rotate: bool = True,
+    radial_config: Optional[RadialAttentionConfig] = None,
+    radial_query_start_frame: int = 0,
+    radial_kv_start_frame: int = 0,
+    radial_tokens_per_frame: Optional[int] = None,
 ) -> torch.Tensor:
     """RoPE+PRoPE fused into the Q/K/V stream, int8 attention, fused output PRoPE.
 
@@ -767,7 +798,30 @@ def fused_rope_prope_sage(
     )
 
     # 4. attention
-    o = _attend_int8(q_eff, k_int8, k_scale, v_eff)
+    radial_indices = radial_counts = None
+    if radial_config is not None and radial_config.enabled:
+        tokens_per_frame = (
+            int(radial_tokens_per_frame)
+            if radial_tokens_per_frame is not None
+            else int(q_grid_sizes[0, 1].item() * q_grid_sizes[0, 2].item())
+        )
+        radial_counts, radial_indices = build_sage_block_indices(
+            query_tokens=seq_q,
+            kv_tokens=seq_k,
+            tokens_per_frame=tokens_per_frame,
+            query_start_frame=radial_query_start_frame,
+            kv_start_frame=radial_kv_start_frame,
+            config=radial_config,
+            device=dev,
+        )
+    o = _attend_int8(
+        q_eff,
+        k_int8,
+        k_scale,
+        v_eff,
+        block_indices=radial_indices,
+        block_counts=radial_counts,
+    )
 
     # 5. output projection, back to [B, L, H, D]; the reference's own kernel,
     # launched without its autotuner

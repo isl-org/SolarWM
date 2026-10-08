@@ -190,6 +190,7 @@ def attention(
                 "Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance."
             )
         attn_mask = None
+        out_dtype = q.dtype
 
         q = q.transpose(1, 2).to(dtype)
         k = k.transpose(1, 2).to(dtype)
@@ -200,4 +201,4 @@ def attention(
         )
 
         out = out.transpose(1, 2).contiguous()
-        return out
+        return out.to(dtype=out_dtype)
