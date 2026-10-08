@@ -758,9 +758,18 @@ def _validate_stage(config: Mapping[str, Any], route: Route, profile: FamilyProf
         _int(model.get("num_output_frames", 0), "model.num_output_frames") == latent_frames,
         "model.num_output_frames must match data.latent_frames",
     )
+    frame_block = _int(model.get("num_frame_per_block", 0), "model.num_frame_per_block")
+    interactive_inference = (
+        str(config.get("action", "")).strip().lower() == "infer"
+        and route.stage == "stage2"
+        and str(_mapping(config, "inference").get("length", "fixed")).strip().lower()
+        == "camera"
+        and bool(_mapping(config, "inference").get("interactive", False))
+    )
     _require(
-        _int(model.get("num_frame_per_block", 0), "model.num_frame_per_block") == 3,
-        "Wan training requires three latent frames per block",
+        frame_block == 3 or (interactive_inference and frame_block == 1),
+        "Wan training requires three latent frames per block; "
+        "one-frame blocks are only allowed for interactive camera inference",
     )
     _require(
         str(train.get("timestep_mode", ""))

@@ -1,0 +1,112 @@
+{
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "SolarWMInteractive",
+      "pos": [
+        120,
+        120
+      ],
+      "size": [
+        420,
+        300
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "config_path",
+          "type": "STRING",
+          "widget": {
+            "name": "config_path"
+          },
+          "link": null
+        },
+        {
+          "name": "initial_image",
+          "type": "STRING",
+          "widget": {
+            "name": "initial_image"
+          },
+          "link": null
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "name": "max_latent_frames",
+          "type": "INT",
+          "widget": {
+            "name": "max_latent_frames"
+          },
+          "link": null
+        },
+        {
+          "name": "translation_speed",
+          "type": "FLOAT",
+          "widget": {
+            "name": "translation_speed"
+          },
+          "link": null
+        },
+        {
+          "name": "rotation_speed",
+          "type": "FLOAT",
+          "widget": {
+            "name": "rotation_speed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SOLARWM_SESSION_CONFIG",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SolarWMInteractive"
+      },
+      "widgets_values": [
+        "/home/ssheorey/code/SolarWM/configs/examples/wan22_ti2v_5b/infer_stage2_sgf_interactive_xpu.local.yaml",
+        "/home/ssheorey/code/SolarWM/assets/eastshade.webp",
+        "A moving camera through the scene",
+        42,
+        120,
+        1.0,
+        0.7
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}
