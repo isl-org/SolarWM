@@ -2539,39 +2539,156 @@ for spatial ringing, temporal flicker, and camera-boundary artifacts.
 ### Workstream 21: Wan2.2 VAE Decode Optimization & Block-256 QuaRot W8A8 Dynamic Quantization
 
 #### Motivation and Architecture Analysis
-Wan2.2 VAE decode is a critical pipeline bottleneck on Intel Arc B580 (Xe2):
+Wan2.2 VAE decode is a primary pipeline bottleneck during Stage 2 autoregressive generation on Intel Arc B580 (Xe2):
 - **Decoder Topology:** 34 3D convolutions (mostly $3\times 3\times 3$), 3 2D upsampling convolutions (`resample.1`), and 1 self-attention block across 4 stages.
-- **Microbenchmarking Breakdown:**
-  - 28 primary $3\times 3\times 3$ residual convolutions account for >70% of total compute time.
-  - Upstream Python `F.pad(x, (1, 1, 1, 1, 2, 0))` creates explicit DRAM allocations of >100M elements per call.
-  - Upstream `torch.cat([cache_x, x], dim=2)` along non-contiguous time dimension incurs continuous tensor copying.
-  - The 3 `resample.1` 2D convolutions process large spatial activation tensors (up to $4 \times 512 \times 240 \times 432 \approx 212\text{M}$ elements).
+- **Upstream Bottlenecks:**
+  - Upstream Python `F.pad(x, (1, 1, 1, 1, 2, 0))` in `CausalConv3d` allocates fresh zero-padded memory buffers (>100M elements per call) instead of using hardware convolution padding.
+  - Upstream temporal cache concatenation `torch.cat([cache_x, x], dim=2)` along a non-contiguous time dimension forces frequent DRAM reallocation and copying during continuous streaming.
+  - Large spatial activation tensors at late stages ($BT=4, C=512, 240\times 432 \approx 212\text{M}$ elements) create severe reduction overhead for dynamic per-tensor quantizers.
 
 #### Block-256 QuaRot Dynamic Quantization Design
 To eliminate activation outlier spikes and enable native oneDNN INT8 XMX tensor operations without accuracy loss:
 1. **Sylvester-Hadamard Matrix ($H_{256}$):**
    - Exact algebraic orthogonality: $H_{256}^T = H_{256}$, $H_{256} @ H_{256} = I$.
-   - Pre-multiplies weights along input channels ($IC$): $W' = W R_{IC}$.
-   - Dynamically rotates activation channels: $X' = X R_{IC}$.
-   - Mathematical invariance: $(X R) * (R^T W) = X * W$.
+   - Weights are pre-rotated along input channels ($IC$): $W' = W R_{IC}$ and quantized to per-OC symmetric INT8 with scale $w_{\text{scale}} = \max |W'| / 127.0$.
+   - Activations are dynamically rotated across channel blocks: $X' = X R_{IC}$.
+   - Exact mathematical invariance: $(X R) * (R^T W) = X * W$.
 2. **Channel Projection:**
    - Evaluated native oneDNN XMX GEMM (`x.view(-1, 256) @ H_256`) vs Triton fused norm epilogue (`tl.dot`).
    - XMX GEMM achieves **0.316 ms** ($C=512$) vs **2.096 ms** for naive Triton epilogue (which reloaded $H_{256}$ repeatedly across independent thread blocks).
-3. **Execution Scope:**
-   - 28 primary $3\times 3\times 3$ convolutions in `ResidualBlock`.
-   - Hardware spatial padding via oneDNN `padding=[0, 1, 1]`, eliminating intermediate zero-padded memory copies.
-   - Preallocated contiguous temporal cache buffer, replacing dynamic `torch.cat` on streaming chunk boundaries.
-   - 2D `resample.1` layers remain BF16 because dynamic absmax reduction over 212M elements adds ~16 ms overhead, exceeding raw INT8 compute savings.
 
-#### Verification & Accuracy Results (Arc B580 vs Production CUDA Reference)
+#### Quantization Scope: What Was Quantized vs What Was Retained in BF16
+
+##### 1. Quantized Layers (28 Primary $3\times 3\times 3$ Residual Convolutions)
+All 28 primary convolutions in the decoder's `ResidualBlock` instances are quantized to INT8 (W8A8):
+- `decoder.middle.0.residual.2` (1024 $\to$ 1024, $3\times 3\times 3$)
+- `decoder.middle.0.residual.6` (1024 $\to$ 1024, $3\times 3\times 3$)
+- `decoder.middle.2.residual.2` (1024 $\to$ 1024, $3\times 3\times 3$)
+- `decoder.middle.2.residual.6` (1024 $\to$ 1024, $3\times 3\times 3$)
+- `decoder.upsamples.{0,1,2,3}.upsamples.{0,1,2}.residual.2` (12 convolutions across stages 0–3, $C \in \{1024, 512, 256\}$)
+- `decoder.upsamples.{0,1,2,3}.upsamples.{0,1,2}.residual.6` (12 convolutions across stages 0–3, $C \in \{1024, 512, 256\}$)
+
+**Optimizations applied to quantized convolutions:**
+- **Native oneDNN XMX INT8 Execution:** Executed via `torch.ops.onednn.qconv_pointwise.tensor`.
+- **Hardware Spatial Padding:** Passed `padding=[0, 1, 1]` directly to oneDNN, eliminating `F.pad` intermediate DRAM allocations and achieving bit-exact match ($0.0$ diff).
+- **Contiguous Cache Buffer Reuse:** Replaced streaming `torch.cat` with preallocated contiguous buffer copying (`copy_` into $[B, C, 3, H, W]$), speeding up cache update from $0.780\text{ ms} \to 0.200\text{ ms}$ ($3.9\times$).
+
+##### 2. Retained in Native BF16 (Not Quantized)
+Microbenchmarks demonstrated that quantizing the following layers causes net latency regressions or precision risks:
+- **3× 2D Spatial Upsampling Convolutions (`upsamples.{0,1,2}.upsamples.3.resample.1`):**
+  - Architecture: `Conv2d(kernel_size=(3, 3), padding=(1, 1))`.
+  - Reason: In PyTorch XPU, native `qconv2d_pointwise.tensor` is unsupported by the driver (must be routed through 3D qconv with $D=1$). At the final upsample stage ($BT=4, C=512, 240\times 432$), the activation contains ~212M elements. Dynamic scalar absmax reduction and Hadamard GEMM on 212M elements takes ~16 ms, whereas raw BF16 Conv2d compute takes only 15.96 ms. Quantization caused a net regression (**25.41 ms INT8 vs 15.96 ms BF16**).
+- **2× Shortcut $1\times 1\times 1$ Convolutions (`upsamples.{2,3}.upsamples.0.shortcut`):**
+  - Architecture: `CausalConv3d(kernel_size=(1, 1, 1))`.
+  - Reason: BF16 execution takes only **0.129 ms**. INT8 rotation + reduction prologue adds 0.294 ms overhead, making INT8 slower (**0.423 ms INT8 vs 0.129 ms BF16**).
+- **2× Temporal Convolutions (`upsamples.{1,2}.upsamples.3.time_conv`):**
+  - Architecture: `CausalConv3d(kernel_size=(3, 1, 1))`.
+  - Reason: BF16 execution takes **0.460 ms**; INT8 takes **0.444 ms** (saving $\le 0.016\text{ ms}$ per call), which does not justify the quantization risk on temporal expansion layers.
+- **Boundary Layers (`decoder.conv1` and `decoder.head.2`):**
+  - `conv1` ($16 \to 1024$): Input channel count ($16$) is not a multiple of block size 256; acts as the critical entry projection from latent space.
+  - `head.2` ($256 \to 12$): Direct projection to pixel space; kept in BF16 to prevent color banding and high-frequency pixel artifacts.
+- **Self-Attention Block (`middle.1`):**
+  - Single-head spatial attention at low resolution ($30\times 54$); executes in $<0.5\text{ ms}$ via native SDPA.
+
+---
+
+#### Measured Latency & Speedup Benchmarks (Intel Arc B580)
+
+##### A. Steady-State Chunk 4 Latency (3 Latent Frames $\to$ 12 Pixel Frames)
+Measured across 10 timed repeats at steady-state chunk 4 after rolling out chunks 0–3 to establish full streaming temporal caches:
+
+| Configuration | Chunk 4 Latency (12 pixel frames) | Per Pixel Frame Latency | Speedup vs Baseline | Speedup vs WS20 Fused |
+| :--- | :---: | :---: | :---: | :---: |
+| **Upstream PyTorch Baseline** (channels_first, unfused, BF16) | 1,442.56 ms | 120.21 ms | 1.00× | — |
+| **WS20 Fused Norm + SiLU** (channels_last, Triton fused, BF16) | 1,075.40 ms | 89.62 ms | 1.34× | 1.00× |
+| **QuaRot W8A8 + HW Pad + Cache Reuse** (Current) | **856.99 ms** | **71.42 ms** | **1.68×** | **1.255×** |
+
+##### B. Full 153-Frame Continuous Streaming Decode (39 Chunks of 1 Latent Frame)
 Full 153-frame decode from `outputs/wan22-cuda-decode-reference/latents_bf16.pt` compared against bit-exact CUDA production reference `decode_cuda_production.pt`:
 
-| Optimization Stage | Latency (153 frames) | Speedup | PSNR vs CUDA Ref | Status |
-| :--- | ---: | ---: | ---: | :--- |
-| Upstream PyTorch Baseline | 15.04 s | 1.00× | 57.76 dB | Baseline |
-| WS20 Fused RMSNorm + SiLU | 14.15 s | 1.06× | 57.76 dB | Production Default |
-| **QuaRot W8A8 + HW Spatial Padding** | **13.15 s** | **1.14×** | **48.56 dB** | Verified (>40 dB gate) |
+| Optimization Stage | Latency (153 frames) | Per-Chunk Latency | Per-Frame Latency | Speedup | PSNR vs CUDA Ref | Status |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| Upstream PyTorch Baseline | 18.710 s | 479.8 ms | 122.3 ms | 1.00× | 51.53 dB | Baseline |
+| Channels-Last (`torch.channels_last_3d`) | 17.700 s | 453.8 ms | 115.7 ms | 1.06× | 51.52 dB | Intermediate |
+| WS20 Fused Norm+SiLU (Triton Xe2) | 14.080 s | 361.0 ms | 92.0 ms | 1.33× | 51.74 dB | Production Default |
+| **QuaRot W8A8 + HW Spatial Pad** | **11.385 s** | **291.9 ms** | **74.4 ms** | **1.64×** | **48.56 dB** | **Verified (>40 dB gate)** |
 
-- **Quality Gate:** Exceeds the 40.0 dB acceptance threshold by **+8.56 dB**.
-- **Configuration:** Optional and opt-in via `runtime.stage2_vae_int8_quarot: true` (default `false`).
+##### C. Operator-Level Microbenchmarks on Arc B580
+| Operator | Shape $[B, C, T, H, W]$ | BF16 oneDNN | QuaRot INT8 (XMX `qconv` + Rotation) | Speedup |
+| :--- | :--- | :---: | :---: | :---: |
+| **Stage 1 Conv3d** ($3\times 3\times 3$) | $[1, 1024, 3, 30, 54]$ | 5.262 ms | **1.178 ms** | **4.47×** |
+| **Stage 2 Conv3d** ($3\times 3\times 3$) | $[1, 512, 3, 60, 108]$ | 2.794 ms | **1.199 ms** | **2.33×** |
+| **Stage 3 Conv3d** ($3\times 3\times 3$) | $[1, 256, 3, 120, 216]$ | 2.517 ms | **1.895 ms** | **1.33×** |
+| **RMSNorm + SiLU** (Stage 1) | $[1, 1024, 1, 30, 54]$ | 41.331 ms | **3.579 ms** (Triton fused) | **11.55×** |
+| **RMSNorm + SiLU** (Stage 2) | $[1, 512, 1, 60, 108]$ | 38.655 ms | **0.046 ms** (Triton fused) | **>800×** |
+| **RMSNorm + SiLU** (Stage 3) | $[1, 256, 1, 120, 216]$ | 38.729 ms | **0.079 ms** (Triton fused) | **>400×** |
+
+---
+
+#### Generated Video Artifacts for Manual Checking
+
+Generated video and frame comparisons are available in `outputs/wan22-quarot-video-check/`:
+- **`quarot_w8a8_decoded.mp4`** (948 KB): Full 153-frame standalone H.264 video at $480 \times 864$ (16 fps) decoded using QuaRot W8A8 dynamic quantization on Arc B580.
+- **`quarot_vs_cuda_ref_compare.mp4`** (1.9 MB): Synchronized side-by-side comparison video ($480 \times 1728$, 16 fps). Left half = bit-exact production CUDA reference; Right half = Intel Arc B580 QuaRot INT8 decoded video.
+- **High-Resolution Comparison Frame Stills:**
+  - `compare_frame_000.png` (Frame 0, chunk 0)
+  - `compare_frame_020.png` (Frame 20, chunk 5)
+  - `compare_frame_040.png` (Frame 40, chunk 10)
+  - `compare_frame_080.png` (Frame 80, chunk 20)
+  - `compare_frame_120.png` (Frame 120, chunk 30)
+  - `compare_frame_150.png` (Frame 150, chunk 38)
+- **End-to-End Rollout Artifacts:** Prior 81-frame autoregressive rollout artifacts are also preserved in `outputs/wan22-stage2-w8a8-e2e/generate/realcam_vid/f51a6709d0525ad3.mp4` and `outputs/wan22-stage2-w8a8-e2e/compare/realcam_vid/f51a6709d0525ad3.mp4`.
+
+---
+
+### Workstream 22: DiT Operator Fusions for Intel Arc XPU (2026-10-08)
+
+#### 1. Context & Memory Stalls on Elementwise Layers
+In the steady-state Chunk 4 Intel VTune GPU-Hotspots profile on Arc B580:
+- **Elementwise / Copies / Casts:** 0.584 s (**30.77% of total GPU time**).
+- **Execution Unit Idle/Stalled:** **56.8% of cycles**, caused by memory bandwidth starvation on low-intensity elementwise operations ($\ll 10\text{ FLOP/B}$).
+- Standard eager execution materialized intermediate normalized tensors, intermediate scaled AdaLN tensors, and unactivated FFN intermediate buffers across High Bandwidth Memory (HBM).
+
+#### 2. Implemented Operator Fusions (`solarwm.kernels.dit_fused`)
+Preserving native oneDNN XMX GEMMs (which run 2.6× faster than Triton GEMMs on Arc hardware), we implemented memory-bound fusions:
+1. **Target 1: Fused LayerNorm + AdaLN Modulation** (`triton_layernorm_adaln`):
+   Fuses un-affine LayerNorm + dynamic token modulation scale & shift in a single streaming pass:
+   $$\text{out} = \left(\frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}}\right) \cdot (1 + \text{scale}) + \text{shift}$$
+   Eliminates DRAM round-trips for the intermediate un-affine normalized tensor and intermediate un-shifted scaled tensor.
+2. **Target 2: Fused Gated Residual Accumulation** (`fused_gated_residual_add_`):
+   In-place vector fused multiply-accumulate via native oneAPI `torch.addcmul_`:
+   $$x \leftarrow x + y \cdot \text{gate}$$
+   Bypasses materializing the scaled projection output tensor in DRAM.
+3. **Target 3: Fused Q/K WanRMSNorm** (`triton_rmsnorm`):
+   Fuses sum-of-squares reduction + rsqrt + weight multiplication in registers:
+   $$\text{out} = \frac{x}{\sqrt{\frac{1}{D}\sum x^2 + \epsilon}} \cdot \text{weight}$$
+4. **Target 4: Fused FFN GEMM + oneDNN GELU Epilogue** (`onednn_linear_gelu_tanh`):
+   Fuses Linear projection GEMM + GELU(tanh) activation directly in oneDNN's XMX accumulator register epilogue via `torch.ops.mkldnn._linear_pointwise(x, weight, bias, 'gelu', [], 'tanh')`. Eliminates writing out the 33.6 MB un-activated intermediate buffer from `fc1`.
+
+All custom kernels and oneDNN pointwise wrappers are decorated with `@torch.compiler.disable` to ensure clean interoperability when block-level `torch.compile` is active.
+
+#### 3. Benchmark Results on Intel Arc B580 (`scripts/debug/benchmark_dit_fusions.py`)
+
+##### A. Microbenchmarks (Production Shapes: $B=1, L=1215, C=3072, D_{\text{ffn}}=13824$ BF16)
+| Operator Target | Kernel Implementation | Eager Latency | Fused Latency | Measured Speedup | DRAM Traffic Saved / Site |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **1. AdaLN + LayerNorm** | Custom Triton kernel (`triton_layernorm_adaln`) | 0.258 ms | **0.139 ms** | **1.86×** | 21.36 MB |
+| **2. Gated Residual Add** | Native oneAPI vector (`torch.addcmul_`) | 0.048 ms | **0.029 ms** | **1.67×** | 14.24 MB |
+| **3. WanRMSNorm** | Custom Triton kernel (`triton_rmsnorm`) | 0.103 ms | **0.046 ms** | **2.25×** | 14.24 MB |
+| **4. FFN Linear + GELU** | oneDNN XMX Epilogue (`_linear_pointwise`) | 0.984 ms | **0.864 ms** | **1.14×** | 32.03 MB |
+
+##### B. Full Production DiT Attention Block Forward Pass
+Evaluated on full `CausalWanAttentionBlock` ($dim=3072, ffn\_dim=13824, num\_heads=24, L=1215$ BF16):
+- **Eager DiT Block Forward:** **5.295 ms**
+- **Fused DiT Block Forward:** **5.068 ms**
+- **Block Latency Savings:** **0.227 ms per block pass (1.045× speedup)**
+- **Projected Chunk Latency Savings:** **27.2 ms saved per rollout chunk** (30 blocks $\times$ 4 denoise steps = 120 block passes).
+- **HBM Memory Traffic Eliminated:**
+  - **131.72 MB saved per block pass**
+  - **15.44 GB of HBM traffic eliminated per rollout chunk**!
+
+#### 4. Configuration & Verification
+- **Configuration Contract:** Controlled by `runtime.stage2_dit_fused_ops: bool = False` (default off for zero-regression safety).
+- **Unit Tests:** Verified in `tests/kernels/test_dit_fused_ops.py` (13/13 passing, cosine similarity $> 0.999$, zero NaNs across multi-step rollout chaining).
+
 

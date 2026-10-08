@@ -100,6 +100,10 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if getattr(self, "fused_ops", False) and x.is_xpu and x.dtype == torch.bfloat16:
+            from solarwm.kernels.dit_fused import triton_rmsnorm
+
+            return triton_rmsnorm(x, self.weight, eps=self.eps)
         return self._norm(x).type_as(x) * self.weight
 
     def _norm(self, x):

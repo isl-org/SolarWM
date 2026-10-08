@@ -1,0 +1,78 @@
+{
+  "baseline (none)": {
+    "avg_denoise_per_step_ms": [
+      318.55106990163523,
+      236.90443128968278,
+      236.87588780497512,
+      236.4305656713744
+    ],
+    "mean_denoise_fwd_ms": 257.1904886669169,
+    "mean_commit_fwd_ms": 237.24963624651232,
+    "mean_all_fwd_ms": 253.20231818283597,
+    "mean_chunk_total_ms": 1266.870556709667
+  },
+  "fused_rope_prope_sdpa (dense)": {
+    "avg_denoise_per_step_ms": [
+      216.13535129775605,
+      202.70476024597883,
+      202.68685882911086,
+      202.33955389509597
+    ],
+    "mean_denoise_fwd_ms": 205.96663106698543,
+    "mean_commit_fwd_ms": 201.40939733634391,
+    "mean_all_fwd_ms": 205.05518432085714,
+    "mean_chunk_total_ms": 1026.1535518802702,
+    "fwd_speedup": 1.2486997885753262,
+    "fwd_savings_ms": 51.22385759993148,
+    "chunk_speedup": 1.2345818560860793,
+    "chunk_savings_ms": 240.71700482939673
+  },
+  "fused_rope_prope_sdpa (radial)": {
+    "avg_denoise_per_step_ms": [
+      216.67752120022973,
+      215.9698490674297,
+      215.10351666559777,
+      215.27783867592612
+    ],
+    "mean_denoise_fwd_ms": 215.75718140229583,
+    "mean_commit_fwd_ms": 214.55491691206893,
+    "mean_all_fwd_ms": 215.51672850425044,
+    "mean_chunk_total_ms": 1078.4305340300004,
+    "fwd_speedup": 1.1920367470288995,
+    "fwd_savings_ms": 41.43330726462108,
+    "chunk_speedup": 1.174735429620564,
+    "chunk_savings_ms": 188.44002267966653
+  },
+  "fused_rope_prope_sage (dense)": {
+    "avg_denoise_per_step_ms": [
+      209.7321959833304,
+      209.59122898057103,
+      209.76180334885916,
+      210.02196179081997
+    ],
+    "mean_denoise_fwd_ms": 209.77679752589515,
+    "mean_commit_fwd_ms": 209.70174872005978,
+    "mean_all_fwd_ms": 209.76178776472807,
+    "mean_chunk_total_ms": 1049.5916507206857,
+    "fwd_speedup": 1.226019710950964,
+    "fwd_savings_ms": 47.41369114102176,
+    "chunk_speedup": 1.2070127995395068,
+    "chunk_savings_ms": 217.27890598898125
+  },
+  "fused_rope_prope_sage (radial)": {
+    "avg_denoise_per_step_ms": [
+      209.8326754445831,
+      201.0601293295622,
+      200.96344128251076,
+      200.84400894120336
+    ],
+    "mean_denoise_fwd_ms": 203.17506374946484,
+    "mean_commit_fwd_ms": 200.83146573354801,
+    "mean_all_fwd_ms": 202.70634414628148,
+    "mean_chunk_total_ms": 1014.355186217775,
+    "fwd_speedup": 1.2658565668474873,
+    "fwd_savings_ms": 54.015424917452066,
+    "chunk_speedup": 1.2489417650965495,
+    "chunk_savings_ms": 252.51537049189199
+  }
+}

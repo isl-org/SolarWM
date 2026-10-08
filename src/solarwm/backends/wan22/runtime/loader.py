@@ -233,6 +233,7 @@ def build_camera_transformer_architecture(config: Mapping[str, Any]) -> Any:
             model_config.get("camera_translation_transform", "linear")
         ),
         "fuse_rope_prope": bool(runtime.get("stage2_fuse_rope_prope", False)),
+        "dit_fused_ops": bool(runtime.get("stage2_dit_fused_ops", False)),
         "fused_kernel": (
             _normalize_fused_kernel(
                 runtime.get("stage2_fused_kernel")

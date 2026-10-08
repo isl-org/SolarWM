@@ -1,0 +1,40 @@
+{
+  "device": "Intel(R) Graphics [0xe223]",
+  "primitives": {
+    "adaln_layernorm": {
+      "eager_ms": 0.2583,
+      "fused_ms": 0.1388,
+      "speedup": 1.86,
+      "traffic_saved_mb": 21.36
+    },
+    "gated_residual_add": {
+      "eager_ms": 0.0481,
+      "fused_ms": 0.0288,
+      "speedup": 1.67,
+      "traffic_saved_mb": 14.24
+    },
+    "rmsnorm": {
+      "eager_ms": 0.1029,
+      "fused_ms": 0.0457,
+      "speedup": 2.25,
+      "traffic_saved_mb": 14.24
+    },
+    "linear_gelu_epilogue": {
+      "eager_ms": 0.9836,
+      "fused_ms": 0.8641,
+      "speedup": 1.14,
+      "traffic_saved_mb": 32.04
+    }
+  },
+  "block": {
+    "eager_block_ms": 5.295,
+    "fused_block_ms": 5.068,
+    "speedup": 1.045,
+    "saved_per_block_ms": 0.227,
+    "projected_chunk_saved_ms": 27.2
+  },
+  "traffic_savings": {
+    "saved_per_block_mb": 131.72,
+    "total_chunk_saved_gb": 15.44
+  }
+}

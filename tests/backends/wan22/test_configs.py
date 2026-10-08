@@ -468,6 +468,30 @@ def test_stage2_camera_xpu_block_compile_is_opt_in_and_camera_only() -> None:
         create_backend(family="wan22_ti2v_5b").validate_config(fixed)
 
 
+def test_stage2_compile_modes_and_vae_compile() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["inference"]["stage2_xpu_compile_blocks"] = True
+    config["inference"]["stage2_xpu_compile_mode"] = "max-autotune"
+    config["runtime"]["stage2_vae_compile"] = True
+    config["runtime"]["stage2_vae_compile_mode"] = "max-autotune"
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    config["runtime"]["stage2_vae_compile"] = "true"
+    with pytest.raises(BackendContractError, match="stage2_vae_compile must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+    config["runtime"]["stage2_vae_compile"] = True
+
+    config["runtime"]["stage2_vae_compile_mode"] = ""
+    with pytest.raises(BackendContractError, match="stage2_vae_compile_mode must be a non-empty string"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+    config["runtime"]["stage2_vae_compile_mode"] = "max-autotune"
+
+    config["inference"]["stage2_xpu_compile_mode"] = ""
+    with pytest.raises(BackendContractError, match="stage2_xpu_compile_mode must be a non-empty string"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
 def test_stage2_measurements_reject_non_camera_or_training_routes() -> None:
     config = load_config(
         EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_81f.yaml"

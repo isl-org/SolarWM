@@ -303,6 +303,48 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "runtime.stage2_vae_int8_quarot is supported "
             "only for standalone Stage2 camera-length inference",
         )
+    vae_compile = runtime.get("stage2_vae_compile", False)
+    _require(
+        isinstance(vae_compile, bool),
+        "runtime.stage2_vae_compile must be boolean",
+    )
+    if "stage2_vae_compile" in runtime:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_vae_compile is supported "
+            "only for standalone Stage2 camera-length inference",
+        )
+    vae_compile_mode = runtime.get("stage2_vae_compile_mode", "max-autotune")
+    _require(
+        isinstance(vae_compile_mode, str) and bool(vae_compile_mode.strip()),
+        "runtime.stage2_vae_compile_mode must be a non-empty string",
+    )
+    if "stage2_vae_compile_mode" in runtime:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_vae_compile_mode is supported "
+            "only for standalone Stage2 camera-length inference",
+        )
+    dit_fused_ops = runtime.get("stage2_dit_fused_ops", False)
+    _require(
+        isinstance(dit_fused_ops, bool),
+        "runtime.stage2_dit_fused_ops must be boolean",
+    )
+    if "stage2_dit_fused_ops" in runtime:
+        inference = _mapping(config, "inference")
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "runtime.stage2_dit_fused_ops is supported "
+            "only for standalone Stage2 camera-length inference",
+        )
     inference = _mapping(config, "inference")
     vae_pipeline = inference.get("stage2_xpu_vae_pipeline", True)
     _require(
@@ -328,6 +370,19 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
             and str(inference.get("length", "fixed")).strip().lower() == "camera",
             "inference.stage2_xpu_compile_blocks is supported only for "
+            "standalone Stage2 camera-length inference",
+        )
+    compile_mode = inference.get("stage2_xpu_compile_mode", "max-autotune")
+    _require(
+        isinstance(compile_mode, str) and bool(compile_mode.strip()),
+        "inference.stage2_xpu_compile_mode must be a non-empty string",
+    )
+    if "stage2_xpu_compile_mode" in inference:
+        _require(
+            str(config.get("action", "")).strip().lower() == "infer"
+            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+            and str(inference.get("length", "fixed")).strip().lower() == "camera",
+            "inference.stage2_xpu_compile_mode is supported only for "
             "standalone Stage2 camera-length inference",
         )
     fuse_rope_prope = runtime.get("stage2_fuse_rope_prope", False)

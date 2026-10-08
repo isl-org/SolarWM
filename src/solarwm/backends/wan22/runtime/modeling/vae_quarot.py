@@ -164,6 +164,7 @@ def quantize_conv_weight_quarot(
     return qw, w_scale, zero_w
 
 
+@torch.compiler.disable
 def _quarot_causal_conv3d_forward(
     self: CausalConv3d,
     x: torch.Tensor,

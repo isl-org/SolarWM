@@ -3173,6 +3173,10 @@ class CudaWanStage2GenerationAdapter:
                         device=self.device, dtype=inference_dtype
                     )
                     runtime_options = values.get("runtime", {})
+                    if hasattr(self.diffusion.module, "dit_fused_ops"):
+                        self.diffusion.module.dit_fused_ops = bool(
+                            runtime_options.get("stage2_dit_fused_ops", False)
+                        )
                     self.vae = Wan5BVAE(
                         layout.vae,
                         xpu_channels_last=bool(
@@ -3183,6 +3187,12 @@ class CudaWanStage2GenerationAdapter:
                         ),
                         xpu_vae_int8_quarot=bool(
                             runtime_options.get("stage2_vae_int8_quarot", False)
+                        ),
+                        stage2_vae_compile=bool(
+                            runtime_options.get("stage2_vae_compile", False)
+                        ),
+                        stage2_vae_compile_mode=str(
+                            runtime_options.get("stage2_vae_compile_mode", "max-autotune")
                         ),
                     )
                     self.vae.to(self.device, dtype=inference_dtype)
@@ -3224,7 +3234,15 @@ class CudaWanStage2GenerationAdapter:
                     return
                 with self._stage2_measurements.phase("weight_load", weight_role=role):
                     super()._load_role(role)
+                if hasattr(self.diffusion.module, "dit_fused_ops"):
+                    self.diffusion.module.dit_fused_ops = bool(
+                        self.config.get("runtime", {}).get("stage2_dit_fused_ops", False)
+                    )
                 if _stage2_xpu_compile_blocks_enabled(self.config):
+                    compile_mode = (
+                        self.config.get("inference", {}).get("stage2_xpu_compile_mode")
+                        or "max-autotune"
+                    )
                     with self._stage2_measurements.phase(
                         "compile_transformer_blocks",
                         weight_role=role,
@@ -3232,6 +3250,7 @@ class CudaWanStage2GenerationAdapter:
                         _compile_stage2_xpu_transformer_blocks(
                             self.diffusion,
                             device=self.device,
+                            mode=compile_mode,
                         )
 
             def _conditions(
@@ -3312,7 +3331,9 @@ def _stage2_xpu_compile_blocks_enabled(config: Mapping[str, Any]) -> bool:
 _STAGE2_XPU_DYNAMO_VARIANTS = 32
 
 
-def _compile_stage2_xpu_transformer_blocks(diffusion: Any, *, device: Any) -> None:
+def _compile_stage2_xpu_transformer_blocks(
+    diffusion: Any, *, device: Any, mode: str | None = None
+) -> None:
     """Wrap Stage2 transformer blocks with ``torch.compile`` after weight loading.
 
     This intentionally targets individual blocks, rather than the diffusion
@@ -3359,7 +3380,10 @@ def _compile_stage2_xpu_transformer_blocks(diffusion: Any, *, device: Any) -> No
         # `dynamic=False` keeps the known fixed camera rollout shapes specialized.
         # current_start remains a Python integer and may produce per-offset
         # variants; that is preferable to widening the complete model graph.
-        compiled = [torch.compile(block, dynamic=False) for block in blocks]
+        compile_kwargs: dict[str, Any] = {"dynamic": False}
+        if mode is not None:
+            compile_kwargs["mode"] = mode
+        compiled = [torch.compile(block, **compile_kwargs) for block in blocks]
     except Exception as exc:
         raise BackendContractError(
             "Stage2 XPU transformer-block compilation failed before modifying the model: "

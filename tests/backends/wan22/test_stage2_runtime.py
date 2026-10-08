@@ -55,6 +55,15 @@ def test_stage2_xpu_compile_wraps_only_transformer_blocks(monkeypatch: pytest.Mo
     _compile_stage2_xpu_transformer_blocks(diffusion, device=torch.device("xpu"))
     assert len(compiled) == 2
 
+    # Test passing mode="max-autotune"
+    compiled.clear()
+    blocks2 = torch.nn.ModuleList((torch.nn.Linear(2, 2),))
+    diffusion2 = SimpleNamespace(module=SimpleNamespace(blocks=blocks2))
+    _compile_stage2_xpu_transformer_blocks(
+        diffusion2, device=torch.device("xpu"), mode="max-autotune"
+    )
+    assert [kwargs for _, kwargs in compiled] == [{"dynamic": False, "mode": "max-autotune"}]
+
 
 def test_stage2_xpu_compile_rejects_non_xpu_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
@@ -258,7 +267,7 @@ def test_stage2_kv_cache_allocator_uses_host_index_scalars() -> None:
     assert type(cache["local_end_index"]) is int
 
 
-def test_stage2_camera_circular_allocator_mirrors_cache_storage() -> None:
+def test_stage2_camera_circular_allocator_shapes() -> None:
     torch = pytest.importorskip("torch")
 
     class _Root:
@@ -275,13 +284,48 @@ def test_stage2_camera_circular_allocator_mirrors_cache_storage() -> None:
         "model": {"local_attn_size": 2, "frame_sequence_length": 3},
     }
 
-    cache = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+    # Default: WS13 unmirrored raw ring + persistent encoded ring
+    cache_ws13 = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+    assert cache_ws13["k"].shape[1] == 6
+    assert cache_ws13["v"].shape[1] == 6
+    assert cache_ws13["k_encoded"].shape[1] == 6
+    assert cache_ws13["v_encoded"].shape[1] == 6
+    assert cache_ws13["_circular_kv_cache"] is True
+    assert cache_ws13["_circular_capacity"] == 6
+    assert cache_ws13["_circular_ring_start"] == 0
+    assert type(cache_ws13["_circular_ring_start"]) is int
 
-    assert cache["k"].shape[1] == 12
-    assert cache["_circular_kv_cache"] is True
-    assert cache["_circular_capacity"] == 6
-    assert cache["_circular_ring_start"] == 0
-    assert type(cache["_circular_ring_start"]) is int
+    # SageAttention: unmirrored raw ring without encoded ring (quantizes on the fly)
+    runtime.config["runtime"] = {"stage2_fused_kernel": "fused_rope_prope_sage"}
+    cache_sage = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+    assert cache_sage["k"].shape[1] == 6
+    assert cache_sage["v"].shape[1] == 6
+    assert "k_encoded" not in cache_sage
+    assert "v_encoded" not in cache_sage
+    assert cache_sage["_circular_kv_cache"] is True
+    assert cache_sage["_circular_capacity"] == 6
+    assert cache_sage["_circular_ring_start"] == 0
+
+    # Explicit SDPA: unmirrored raw ring + encoded ring
+    runtime.config["runtime"] = {"stage2_fused_kernel": "fused_rope_prope_sdpa"}
+    cache_sdpa = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+    assert cache_sdpa["k"].shape[1] == 6
+    assert cache_sdpa["v"].shape[1] == 6
+    assert cache_sdpa["k_encoded"].shape[1] == 6
+    assert cache_sdpa["v_encoded"].shape[1] == 6
+    assert cache_sdpa["_circular_kv_cache"] is True
+    assert cache_sdpa["_circular_capacity"] == 6
+
+    # Opt-out: legacy mirrored ring without encoded ring
+    runtime.config["runtime"] = {"stage2_encoded_kv_ring": False}
+    cache_legacy = runtime.allocate_kv_cache(1, dtype=torch.float32, device=torch.device("cpu"))[0]
+    assert cache_legacy["k"].shape[1] == 12
+    assert cache_legacy["v"].shape[1] == 12
+    assert "k_encoded" not in cache_legacy
+    assert "v_encoded" not in cache_legacy
+    assert cache_legacy["_circular_kv_cache"] is True
+    assert cache_legacy["_circular_capacity"] == 6
+    assert cache_legacy["_circular_ring_start"] == 0
 
 
 def test_mirrored_circular_cache_keeps_wrapped_window_contiguous() -> None:
@@ -378,6 +422,131 @@ def test_circular_attention_uses_contiguous_wrapped_window(
 
     assert cache["_circular_ring_start"] == 1
     assert visible_windows[-1][0, :, 0, 0].tolist() == [2.0, 3.0]
+
+
+def test_encoded_kv_ring_matches_mirrored_circular_cache_multi_chunk() -> None:
+    torch = pytest.importorskip("torch")
+    from solarwm.backends.wan22.runtime.modeling import causal_model
+
+    torch.manual_seed(123)
+    dim = 8
+    num_heads = 2
+    head_dim = dim // num_heads
+    frame_seq_length = 2
+    local_attn_size = 4  # capacity = 8 tokens
+    chunk_tokens = 2    # 1 frame per chunk = 2 tokens
+    capacity_tokens = local_attn_size * frame_seq_length
+    dtype = torch.float32
+
+    attn = causal_model.CausalWanSelfAttention(
+        dim=dim,
+        num_heads=num_heads,
+        local_attn_size=local_attn_size,
+        sink_size=0,
+        qk_norm=False,
+        frame_seq_length=frame_seq_length,
+        use_echorope=True,
+        camera_attention_mode="fused_prope",
+    ).to(dtype=dtype)
+
+    cache_old = {
+        "k": torch.zeros((1, 2 * capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "v": torch.zeros((1, 2 * capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "global_end_index": 0,
+        "local_end_index": 0,
+        "_circular_kv_cache": True,
+        "_circular_capacity": capacity_tokens,
+        "_circular_ring_start": 0,
+        "_fused_prope_camera_metadata": {
+            "viewmats": torch.zeros((1, 2 * capacity_tokens, 4, 4), dtype=torch.float32),
+            "K": torch.zeros((1, 2 * capacity_tokens, 3, 3), dtype=torch.float32),
+        },
+    }
+    cache_new = {
+        "k": torch.zeros((1, capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "v": torch.zeros((1, capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "k_encoded": torch.zeros((1, capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "v_encoded": torch.zeros((1, capacity_tokens, num_heads, head_dim), dtype=dtype),
+        "global_end_index": 0,
+        "local_end_index": 0,
+        "_circular_kv_cache": True,
+        "_circular_capacity": capacity_tokens,
+        "_circular_ring_start": 0,
+        "_fused_prope_camera_metadata": {
+            "viewmats": torch.zeros((1, capacity_tokens, 4, 4), dtype=torch.float32),
+            "K": torch.zeros((1, capacity_tokens, 3, 3), dtype=torch.float32),
+        },
+    }
+
+    freqs = torch.randn((50, head_dim // 2), dtype=torch.complex128)
+    grid = torch.tensor([[1, 1, 2]])
+
+    for chunk_idx in range(5):
+        vm = torch.eye(4).repeat(1, chunk_tokens, 1, 1)
+        vm[..., 0, 3] = float(chunk_idx)
+        K = torch.eye(3).repeat(1, chunk_tokens, 1, 1)
+
+        prope_old = {}
+        prope_new = {}
+
+        for step in range(3):
+            is_commit = (step == 2)
+            policy = "commit_detached" if is_commit else "inference_direct"
+            x = torch.randn(1, chunk_tokens, dim)
+
+            # Apply camera metadata
+            dummy_model = SimpleNamespace(
+                sink_size=0,
+                local_attn_size=local_attn_size,
+                _slice_current_camera_tokens=lambda t, **kwargs: t,
+            )
+            _, _, vm_old, k_cam_old, _ = causal_model.CausalWanModel._stage_fused_camera_cache(
+                dummy_model, [cache_old],
+                cam_viewmats=vm, cam_K=K,
+                current_start=chunk_idx * chunk_tokens,
+                num_new_tokens=chunk_tokens,
+                frame_seqlen=frame_seq_length,
+                cache_update_policy=policy,
+            )
+            _, _, vm_new, k_cam_new, _ = causal_model.CausalWanModel._stage_fused_camera_cache(
+                dummy_model, [cache_new],
+                cam_viewmats=vm, cam_K=K,
+                current_start=chunk_idx * chunk_tokens,
+                num_new_tokens=chunk_tokens,
+                frame_seqlen=frame_seq_length,
+                cache_update_policy=policy,
+            )
+
+            out_old, upd_old = attn(
+                x, torch.tensor([chunk_tokens]), grid, freqs,
+                cache_old,
+                current_start=chunk_idx * chunk_tokens,
+                frame_seqlen=frame_seq_length,
+                cam_viewmats=vm, cam_K=K,
+                kv_cam_viewmats=vm_old, kv_cam_K=k_cam_old,
+                prope_cache=prope_old,
+                cache_update_policy=policy,
+            )
+            out_new, upd_new = attn(
+                x, torch.tensor([chunk_tokens]), grid, freqs,
+                cache_new,
+                current_start=chunk_idx * chunk_tokens,
+                frame_seqlen=frame_seq_length,
+                cam_viewmats=vm, cam_K=K,
+                kv_cam_viewmats=vm_new, kv_cam_K=k_cam_new,
+                prope_cache=prope_new,
+                cache_update_policy=policy,
+            )
+
+            torch.testing.assert_close(out_new, out_old, rtol=0, atol=0)
+
+            if is_commit:
+                causal_model.CausalWanModel._apply_cache_updates(
+                    object(), [cache_old], [(0, upd_old)]
+                )
+                causal_model.CausalWanModel._apply_cache_updates(
+                    object(), [cache_new], [(0, upd_new)]
+                )
 
 
 def test_inference_direct_cache_policy_writes_only_uncommitted_direct_slots(

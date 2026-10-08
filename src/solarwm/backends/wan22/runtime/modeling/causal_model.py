@@ -2514,6 +2514,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.camera_translation_transform = normalize_camera_translation_transform(
             kwargs.get("camera_translation_transform", "linear")
         )
+        self.dit_fused_ops = bool(kwargs.get("dit_fused_ops", False))
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
@@ -2603,11 +2604,25 @@ class CausalWanAttentionBlock(nn.Module):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
         # self-attention
-        attn_input = (
-            self.norm1(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
-            * (1 + e[1])
-            + e[0]
-        ).flatten(1, 2)
+        use_fused = (
+            getattr(self, "dit_fused_ops", False)
+            and x.is_xpu
+            and x.dtype == torch.bfloat16
+        )
+        if use_fused:
+            from solarwm.kernels.dit_fused import (
+                fused_gated_residual_add_,
+                onednn_linear_gelu_tanh,
+                triton_layernorm_adaln,
+            )
+
+            attn_input = triton_layernorm_adaln(x, e[1], e[0], eps=self.norm1.eps)
+        else:
+            attn_input = (
+                self.norm1(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
+                * (1 + e[1])
+                + e[0]
+            ).flatten(1, 2)
         y, cache_update_info = self.self_attn(
             attn_input,
             seq_lens,
@@ -2671,24 +2686,37 @@ class CausalWanAttentionBlock(nn.Module):
                 block_mask=block_mask,
             )
 
-        x = x + (
-            y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[2]
-        ).flatten(1, 2)
+        if use_fused:
+            x = fused_gated_residual_add_(
+                x, y, e[2], num_tokens=num_tokens, mod_seqlen=modulation_seqlen
+            )
+        else:
+            x = x + (
+                y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[2]
+            ).flatten(1, 2)
 
         # cross-attention & FFN
         x = x + self.cross_attn(
             self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache
         )
-        y = self.ffn(
-            (
-                self.norm2(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
-                * (1 + e[4])
-                + e[3]
+        if use_fused:
+            ffn_input = triton_layernorm_adaln(x, e[4], e[3], eps=self.norm2.eps)
+            h = onednn_linear_gelu_tanh(ffn_input, self.ffn[0].weight, self.ffn[0].bias)
+            y = self.ffn[2](h)
+            x = fused_gated_residual_add_(
+                x, y, e[5], num_tokens=num_tokens, mod_seqlen=modulation_seqlen
+            )
+        else:
+            y = self.ffn(
+                (
+                    self.norm2(x).unflatten(dim=1, sizes=(num_tokens, modulation_seqlen))
+                    * (1 + e[4])
+                    + e[3]
+                ).flatten(1, 2)
+            )
+            x = x + (
+                y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[5]
             ).flatten(1, 2)
-        )
-        x = x + (
-            y.unflatten(dim=1, sizes=(num_tokens, modulation_seqlen)) * e[5]
-        ).flatten(1, 2)
 
         return x, cache_update_info
 
@@ -2709,6 +2737,16 @@ class CausalHead(nn.Module):
     def forward(self, x, e):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
+        use_fused = (
+            getattr(self, "dit_fused_ops", False)
+            and x.is_xpu
+            and x.dtype == torch.bfloat16
+        )
+        if use_fused:
+            from solarwm.kernels.dit_fused import triton_layernorm_adaln
+
+            normed = triton_layernorm_adaln(x, e[1], e[0], eps=self.eps)
+            return self.head(normed)
         x = self.head(
             self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]
         )
@@ -2718,7 +2756,7 @@ class CausalHead(nn.Module):
 class CausalWanModel(ModelMixin, ConfigMixin):
     """Wan diffusion backbone for causal camera-controlled training and inference."""
 
-    ignore_for_config = ["patch_size", "cross_attn_norm", "qk_norm", "text_dim"]
+    ignore_for_config = ["patch_size", "cross_attn_norm", "qk_norm", "text_dim", "dit_fused_ops"]
     _no_split_modules = ["CausalWanAttentionBlock"]
 
     @register_to_config
@@ -2763,6 +2801,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         flow_objective="flow_matching",
         anyflow_gate=0.25,
         anyflow_deltatime_type="r",
+        dit_fused_ops=False,
     ):
         super().__init__()
 
@@ -2857,6 +2896,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     radial_sink_frames=self.radial_sink_frames,
                     radial_dense_blocks=self.radial_dense_blocks,
                     radial_dense_steps=self.radial_dense_steps,
+                    dit_fused_ops=bool(dit_fused_ops),
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -2892,6 +2932,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 torch.tensor([float(anyflow_gate)], dtype=torch.float32),
                 persistent=False,
             )
+        self.dit_fused_ops = bool(dit_fused_ops)
+
+    @property
+    def dit_fused_ops(self) -> bool:
+        return getattr(self, "_dit_fused_ops", False)
+
+    @dit_fused_ops.setter
+    def dit_fused_ops(self, value: bool) -> None:
+        val = bool(value)
+        self._dit_fused_ops = val
+        if hasattr(self, "blocks"):
+            for block in self.blocks:
+                block.dit_fused_ops = val
+        if hasattr(self, "head"):
+            self.head.dit_fused_ops = val
+        for m in self.modules():
+            if type(m).__name__ == "WanRMSNorm":
+                m.fused_ops = val
 
     @property
     def uses_anyflow(self):

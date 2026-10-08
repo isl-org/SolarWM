@@ -157,6 +157,7 @@ def _get_strides(tensor: torch.Tensor, C: int) -> tuple[int, int]:
     raise ValueError(f"Tensor with shape {tensor.shape} and strides {tensor.stride()} is not in channels-first layout with contiguous channels.")
 
 
+@torch.compiler.disable
 def triton_rms_norm_silu(
     x: torch.Tensor,
     gamma: torch.Tensor,
@@ -217,6 +218,7 @@ def triton_rms_norm_silu(
     return out
 
 
+@torch.compiler.disable
 def triton_add_rms_norm_silu(
     x: torch.Tensor,
     residual: torch.Tensor,

@@ -182,6 +182,8 @@ class Wan5BVAE:
         xpu_channels_last: bool = True,
         xpu_fused_kernels: bool = True,
         xpu_vae_int8_quarot: bool = False,
+        stage2_vae_compile: bool = False,
+        stage2_vae_compile_mode: str = "max-autotune",
     ) -> None:
         import torch
 
@@ -193,6 +195,8 @@ class Wan5BVAE:
         self._xpu_channels_last = xpu_channels_last
         self._xpu_fused_kernels = xpu_fused_kernels
         self._xpu_vae_int8_quarot = xpu_vae_int8_quarot
+        self._stage2_vae_compile = stage2_vae_compile
+        self._stage2_vae_compile_mode = stage2_vae_compile_mode
         try:
             self.module = (
                 _video_vae(
@@ -230,6 +234,12 @@ class Wan5BVAE:
             from .modeling.vae_quarot import apply_vae_quarot
 
             apply_vae_quarot(self.module.decoder, enabled=True)
+        if device_type == "xpu" and self._stage2_vae_compile:
+            self.module.decoder = torch.compile(
+                self.module.decoder,
+                mode=self._stage2_vae_compile_mode,
+                dynamic=False,
+            )
         return self
 
     def _scale(self, reference: Any) -> list[Any]:
