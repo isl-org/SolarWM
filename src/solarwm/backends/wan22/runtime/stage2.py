@@ -3178,6 +3178,12 @@ class CudaWanStage2GenerationAdapter:
                         xpu_channels_last=bool(
                             runtime_options.get("stage2_vae_channels_last", True)
                         ),
+                        xpu_fused_kernels=bool(
+                            runtime_options.get("stage2_vae_fused_kernels", True)
+                        ),
+                        xpu_vae_int8_quarot=bool(
+                            runtime_options.get("stage2_vae_int8_quarot", False)
+                        ),
                     )
                     self.vae.to(self.device, dtype=inference_dtype)
                 self._stage2_inference_buffers = (

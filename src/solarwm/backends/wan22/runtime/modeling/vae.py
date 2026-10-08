@@ -32,12 +32,38 @@ class CausalConv3d(nn.Conv3d):
             0,
         )
         self.padding = (0, 0, 0)
+        self._fast_cache_buffer = None
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
+            # Fast contiguous buffer reuse when incoming frame count is 1 and cache has 2 frames
+            if cache_x.shape[2] == 2 and x.shape[2] == 1:
+                b, c, _, h, w = x.shape
+                buf = self._fast_cache_buffer
+                if (
+                    buf is None
+                    or buf.shape != (b, c, 3, h, w)
+                    or buf.device != x.device
+                    or buf.dtype != x.dtype
+                ):
+                    buf = torch.empty(
+                        (b, c, 3, h, w),
+                        device=x.device,
+                        dtype=x.dtype,
+                        memory_format=(
+                            torch.channels_last_3d
+                            if x.is_contiguous(memory_format=torch.channels_last_3d)
+                            else torch.contiguous_format
+                        ),
+                    )
+                    self._fast_cache_buffer = buf
+                buf[:, :, :2, :, :].copy_(cache_x)
+                buf[:, :, 2:3, :, :].copy_(x)
+                x = buf
+            else:
+                x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
         x = F.pad(x, padding)
 
@@ -879,6 +905,45 @@ class WanVAE_(nn.Module):
                 module.preserve_input_dtype = enabled
             elif isinstance(module, Upsample):
                 module.native_bfloat16 = enabled
+
+    def configure_xpu_fused_decode(self, enabled: bool) -> None:
+        """Enable fused Triton kernels (RMS_norm + SiLU) in decoder."""
+        if not hasattr(self, "decoder"):
+            return
+
+        def patch_seq(seq):
+            for i in range(len(seq) - 1):
+                if enabled and isinstance(seq[i], RMS_norm) and isinstance(seq[i + 1], nn.SiLU):
+                    seq[i] = FusedNormSiLU(seq[i])
+                    seq[i + 1] = nn.Identity()
+                elif not enabled and isinstance(seq[i], FusedNormSiLU) and isinstance(seq[i + 1], nn.Identity):
+                    seq[i] = seq[i].orig_norm
+                    seq[i + 1] = nn.SiLU()
+
+        for m in self.decoder.middle:
+            if hasattr(m, "residual") and isinstance(m.residual, nn.Sequential):
+                patch_seq(m.residual)
+
+        for up in self.decoder.upsamples:
+            for block in up.upsamples:
+                if hasattr(block, "residual") and isinstance(block.residual, nn.Sequential):
+                    patch_seq(block.residual)
+
+        patch_seq(self.decoder.head)
+
+
+class FusedNormSiLU(nn.Module):
+    def __init__(self, norm_module: RMS_norm):
+        super().__init__()
+        self.orig_norm = norm_module
+        self.gamma = norm_module.gamma
+        self.bias = getattr(norm_module, "bias", None)
+        self.scale = getattr(norm_module, "scale", None)
+
+    def forward(self, x):
+        from solarwm.kernels.vae_fused import triton_rms_norm_silu
+
+        return triton_rms_norm_silu(x, self.gamma, self.bias, self.scale)
 
 
 def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):

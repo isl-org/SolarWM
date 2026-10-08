@@ -180,6 +180,8 @@ class Wan5BVAE:
         weights: str | Path,
         *,
         xpu_channels_last: bool = True,
+        xpu_fused_kernels: bool = True,
+        xpu_vae_int8_quarot: bool = False,
     ) -> None:
         import torch
 
@@ -189,6 +191,8 @@ class Wan5BVAE:
         self._std = torch.tensor(self.std, dtype=torch.float32)
         self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         self._xpu_channels_last = xpu_channels_last
+        self._xpu_fused_kernels = xpu_fused_kernels
+        self._xpu_vae_int8_quarot = xpu_vae_int8_quarot
         try:
             self.module = (
                 _video_vae(
@@ -212,12 +216,20 @@ class Wan5BVAE:
             and dtype == torch.bfloat16
         )
         self.module.configure_xpu_bfloat16_decode(use_xpu_bfloat16)
+        if device_type == "xpu" and self._xpu_fused_kernels and dtype == torch.bfloat16:
+            configure_fused = getattr(self.module, "configure_xpu_fused_decode", None)
+            if callable(configure_fused):
+                configure_fused(True)
         if device_type == "xpu" and self._xpu_channels_last:
             for child in self.module.modules():
                 if isinstance(child, torch.nn.Conv3d):
                     child.to(memory_format=torch.channels_last_3d)
                 elif isinstance(child, torch.nn.Conv2d):
                     child.to(memory_format=torch.channels_last)
+        if device_type == "xpu" and self._xpu_vae_int8_quarot and dtype == torch.bfloat16:
+            from .modeling.vae_quarot import apply_vae_quarot
+
+            apply_vae_quarot(self.module.decoder, enabled=True)
         return self
 
     def _scale(self, reference: Any) -> list[Any]:

@@ -74,6 +74,12 @@ def test_stage2_camera_inference_accepts_clone_kv_cache_fallback() -> None:
     create_backend(family="wan22_ti2v_5b").validate_config(config)
 
 
+def test_stage2_interactive_camera_inference_accepts_one_latent_block() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_interactive.yaml"
+    config = load_config(path)
+    create_backend(family="wan22_ti2v_5b").validate_config(config.values)
+
+
 def test_stage2_camera_circular_kv_cache_rejects_sink() -> None:
     path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
     config = load_config(path).mutable_copy()
@@ -120,6 +126,30 @@ def test_stage2_fused_kernel_rejects_invalid_kernel() -> None:
         create_backend(family="wan22_ti2v_5b").validate_config(config)
 
 
+def test_stage2_radial_attention_accepts_fused_camera_inference() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["runtime"].update(
+        {
+            "stage2_fused_kernel": "fused_rope_prope_sdpa",
+            "stage2_radial_attention": True,
+            "stage2_radial_decay": 0.8,
+            "stage2_radial_sink_frames": 1,
+            "stage2_radial_dense_blocks": 1,
+            "stage2_radial_dense_steps": 1,
+        }
+    )
+    create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
+def test_stage2_radial_attention_rejects_non_fused_kernel() -> None:
+    path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
+    config = load_config(path).mutable_copy()
+    config["runtime"]["stage2_radial_attention"] = True
+    with pytest.raises(BackendContractError, match="requires a fused"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+
 def test_stage2_fused_kernel_build_architecture() -> None:
     from solarwm.backends.wan22.runtime.loader import build_camera_transformer_architecture
     path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
@@ -138,6 +168,21 @@ def test_stage2_fused_kernel_build_architecture() -> None:
     model = build_camera_transformer_architecture(config)
     assert model.fused_kernel == "fused_rope_prope_sage"
     assert model.blocks[0].self_attn.fused_kernel == "fused_rope_prope_sage"
+
+    config["runtime"].update(
+        {
+            "stage2_fused_kernel": "fused_rope_prope_sdpa",
+            "stage2_radial_attention": True,
+            "stage2_radial_decay": 0.7,
+            "stage2_radial_sink_frames": 2,
+            "stage2_radial_dense_blocks": 1,
+            "stage2_radial_dense_steps": 1,
+        }
+    )
+    model = build_camera_transformer_architecture(config)
+    assert model.radial_attention is True
+    assert model.radial_decay == 0.7
+    assert model.blocks[0].self_attn.radial_attention is True
 
 
 def test_backend_factory_is_strict() -> None:
@@ -372,14 +417,36 @@ def test_stage2_camera_vae_optimizations_are_opt_out_and_camera_only() -> None:
     path = EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_camera_length.yaml"
     config = load_config(path).mutable_copy()
     config["runtime"]["stage2_vae_channels_last"] = False
+    config["runtime"]["stage2_vae_fused_kernels"] = False
+    config["runtime"]["stage2_vae_int8_quarot"] = True
     create_backend(family="wan22_ti2v_5b").validate_config(config)
+
+    config["runtime"]["stage2_vae_int8_quarot"] = "true"
+    with pytest.raises(BackendContractError, match="stage2_vae_int8_quarot must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+    config["runtime"]["stage2_vae_int8_quarot"] = False
 
     config["runtime"]["stage2_vae_channels_last"] = "false"
     with pytest.raises(BackendContractError, match="stage2_vae_channels_last must be boolean"):
         create_backend(family="wan22_ti2v_5b").validate_config(config)
 
+    config["runtime"]["stage2_vae_channels_last"] = True
+    config["runtime"]["stage2_vae_fused_kernels"] = "false"
+    with pytest.raises(BackendContractError, match="stage2_vae_fused_kernels must be boolean"):
+        create_backend(family="wan22_ti2v_5b").validate_config(config)
+
     fixed = load_config(EXAMPLES / "wan22_ti2v_5b" / "infer_stage2_sgf_81f.yaml").mutable_copy()
     fixed["runtime"]["stage2_vae_channels_last"] = False
+    with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
+        create_backend(family="wan22_ti2v_5b").validate_config(fixed)
+
+    fixed["runtime"]["stage2_vae_channels_last"] = True
+    fixed["runtime"]["stage2_vae_fused_kernels"] = False
+    with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
+        create_backend(family="wan22_ti2v_5b").validate_config(fixed)
+
+    fixed["runtime"]["stage2_vae_fused_kernels"] = True
+    fixed["runtime"]["stage2_vae_int8_quarot"] = True
     with pytest.raises(BackendContractError, match="only for standalone Stage2 camera-length"):
         create_backend(family="wan22_ti2v_5b").validate_config(fixed)
 
