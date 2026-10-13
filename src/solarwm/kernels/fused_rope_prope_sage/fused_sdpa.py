@@ -411,7 +411,7 @@ _TRANSFORM_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_TRANSFORM_CONFIGS, key=["seq_len"])
+@triton.autotune(configs=_TRANSFORM_CONFIGS, key=["seq_len"], cache_results=True)
 @triton.jit
 def _transform_kernel(
     X, Y, CS, P,
