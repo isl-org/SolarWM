@@ -101,9 +101,7 @@ inference:
   interactive: true
   kv_cache_mode: circular
   max_rollout_latent_frames: 900
-  stage2_xpu_vae_pipeline: false
   stage2_xpu_compile_blocks: false
-  stage2_encoded_kv_ring: true
   output_layout: transaction_v1
   run_id: wan22-ti2v-5b-stage2-sgf-interactive
 runtime:

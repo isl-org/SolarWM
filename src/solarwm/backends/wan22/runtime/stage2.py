@@ -53,6 +53,7 @@ from ..sgf import (
     validate_checkpoint_transaction,
     warp_denoising_steps,
 )
+from ..contracts import stage2_attention_backend, stage2_linear_quant, stage2_vae_quant
 from .assets import WanAssetLayout
 from .checkpoint import normalize_model_state
 from .codec import Wan5BOnlineCodec
@@ -87,19 +88,13 @@ class _Stage2QuantizedVaeOutput:
     compare: Any
 
 
-class _Stage2XpuVaePipeline:
+class _Stage2XpuTileDecoder:
     """Decode each completed diffusion tile with a continuous-cache XPU VAE.
 
-    Tiles are decoded incrementally during the rollout rather than after it, so
-    host pixel accumulation stays bounded by the tile size instead of the
-    rollout horizon, and pixels are quantized on XPU with the existing video and
-    comparison encoder rules before the host transfer.
-
-    Decoding runs on the caller's stream. WS6 submitted tiles to a second XPU
-    stream to overlap them with the next chunk's diffusion; a two-stream
-    microbenchmark measures 1.001x on this device, so the stream, its events,
-    and the double buffering were removed as machinery that never overlapped.
-    See ``docs/backends/wan22-xpu-inference-optimization-plan.md``.
+    Tiles are decoded serially on the caller's stream as the rollout completes
+    them, so host pixel accumulation stays bounded by the tile size instead of
+    the rollout horizon, and pixels are quantized on XPU with the video and
+    comparison encoder rules before a uint8 host transfer.
     """
 
     def __init__(
@@ -119,7 +114,7 @@ class _Stage2XpuVaePipeline:
             or xpu is None
             or not callable(getattr(vae, "streaming_decode_session", None))
         ):
-            raise BackendContractError("Stage2 XPU VAE pipeline is unavailable")
+            raise BackendContractError("Stage2 XPU tile decoder is unavailable")
         self._torch = torch
         self._xpu = xpu
         self._vae = vae
@@ -128,7 +123,7 @@ class _Stage2XpuVaePipeline:
         self._width = int(width)
         self._chunk_latent_frames = int(chunk_latent_frames)
         if self._chunk_latent_frames <= 0:
-            raise BackendContractError("Stage2 XPU VAE pipeline chunk size must be positive")
+            raise BackendContractError("Stage2 XPU tile decoder chunk size must be positive")
         self._session: Any | None = None
         self._decode_tile: Callable[[Any], Any] | None = None
         self._video_buffer: Any | None = None
@@ -140,7 +135,7 @@ class _Stage2XpuVaePipeline:
         self._entered_at: float | None = None
         self._decode_seconds = 0.0
 
-    def __enter__(self) -> _Stage2XpuVaePipeline:
+    def __enter__(self) -> _Stage2XpuTileDecoder:
         self._session = self._vae.streaming_decode_session()
         self._decode_tile = self._session.__enter__()
         self._entered_at = time.perf_counter()
@@ -150,16 +145,16 @@ class _Stage2XpuVaePipeline:
         """Decode one completed latent tile and retain its quantized pixels."""
 
         if self._decode_tile is None:
-            raise BackendContractError("Stage2 XPU VAE pipeline was not entered")
+            raise BackendContractError("Stage2 XPU tile decoder was not entered")
         count = int(end) - int(start)
         if count <= 0:
-            raise BackendContractError("Stage2 XPU VAE pipeline received an empty tile")
+            raise BackendContractError("Stage2 XPU tile decoder received an empty tile")
         if int(start) != self._submitted:
             raise BackendContractError("Stage2 XPU VAE tiles submitted out of order")
         frames = 1 + 4 * (count - 1) if int(start) == 0 else 4 * count
         capacity = 4 * self._chunk_latent_frames
         if frames > capacity:
-            raise BackendContractError("Stage2 XPU VAE tile exceeds pipeline capacity")
+            raise BackendContractError("Stage2 XPU VAE tile exceeds decoder capacity")
         if self._video_buffer is None:
             self._video_buffer = self._torch.empty(
                 (1, capacity, 3, self._height, self._width),
@@ -209,7 +204,7 @@ class _Stage2XpuVaePipeline:
 
     def finish(self, *, expected_latent_frames: int) -> _Stage2QuantizedVaeOutput:
         if self._submitted != int(expected_latent_frames):
-            raise BackendContractError("Stage2 XPU VAE pipeline did not decode every latent tile")
+            raise BackendContractError("Stage2 XPU tile decoder did not decode every latent tile")
         return _Stage2QuantizedVaeOutput(
             video=self._torch.cat(self._video_tiles, dim=1),
             compare=self._torch.cat(self._compare_tiles, dim=1),
@@ -1094,10 +1089,10 @@ def _generation_steps(provider: Any) -> tuple[Any, ...]:
     )
 
 
-def _stage2_xpu_vae_pipeline_enabled(
+def _stage2_xpu_tile_decode_enabled(
     provider: Any, *, output_latent_frames: int, rollout_latent_frames: int
 ) -> bool:
-    """Limit overlap to the validated standalone camera XPU route."""
+    """Decode tiles during the rollout only on the standalone camera XPU route."""
 
     config = provider.config
     inference = config.get("inference", {})
@@ -1105,7 +1100,6 @@ def _stage2_xpu_vae_pipeline_enabled(
         getattr(provider.device, "type", None) == "xpu"
         and str(config.get("action", "")).strip().lower() == "infer"
         and str(inference.get("length", "fixed")).strip().lower() == "camera"
-        and bool(inference.get("stage2_xpu_vae_pipeline", True))
         and int(output_latent_frames) == int(rollout_latent_frames)
         and 1 + 4 * (int(output_latent_frames) - 1) <= _FILE_STREAMING_PIXEL_THRESHOLD
         and callable(getattr(provider.vae, "streaming_decode_session", None))
@@ -1371,13 +1365,13 @@ def _stage2_generated_sample(
     output_latent_frames = int(
         metadata.get("output_rollout_latent_frames", generation_pass.rollout_latent_frames)
     )
-    pipeline: _Stage2XpuVaePipeline | None = None
-    if _stage2_xpu_vae_pipeline_enabled(
+    tile_decoder: _Stage2XpuTileDecoder | None = None
+    if _stage2_xpu_tile_decode_enabled(
         provider,
         output_latent_frames=output_latent_frames,
         rollout_latent_frames=generation_pass.rollout_latent_frames,
     ):
-        pipeline = _Stage2XpuVaePipeline(
+        tile_decoder = _Stage2XpuTileDecoder(
             vae=provider.vae,
             device=provider.device,
             height=int(provider.config["data"]["height"]),
@@ -1393,9 +1387,9 @@ def _stage2_generated_sample(
         raise BackendContractError("Stage2 TI2V generation may not receive I2V y")
     previous_callback = getattr(provider, "_stage2_final_latent_tile_callback", None)
     try:
-        with (pipeline if pipeline is not None else nullcontext()):
-            if pipeline is not None:
-                provider._stage2_final_latent_tile_callback = pipeline.submit
+        with (tile_decoder if tile_decoder is not None else nullcontext()):
+            if tile_decoder is not None:
+                provider._stage2_final_latent_tile_callback = tile_decoder.submit
             with torch.no_grad():
                 latents, schedule = _stage2_self_forcing_latents(
                     provider,
@@ -1405,15 +1399,15 @@ def _stage2_generated_sample(
                     camera,
                     rng,
                 )
-            decoded_from_pipeline = (
-                pipeline.finish(expected_latent_frames=output_latent_frames)
-                if pipeline is not None
+            decoded_tiles = (
+                tile_decoder.finish(expected_latent_frames=output_latent_frames)
+                if tile_decoder is not None
                 else None
             )
-            if pipeline is not None:
+            if tile_decoder is not None:
                 measurements = getattr(provider, "_stage2_measurements", None)
                 if measurements is not None:
-                    measurements.record("vae_pipeline", **pipeline.measurements())
+                    measurements.record("vae_tile_decode", **tile_decoder.measurements())
     finally:
         if previous_callback is None:
             provider.__dict__.pop("_stage2_final_latent_tile_callback", None)
@@ -1510,7 +1504,7 @@ def _stage2_generated_sample(
             # instead of switching to a horizon-dependent single-shot decode below
             # _STREAMING_VAE_LATENT_CHUNK.
             chunk_latent_frames = min(_STREAMING_VAE_LATENT_CHUNK, output_latent_frames)
-            if decoded_from_pipeline is None:
+            if decoded_tiles is None:
                 with _measurement_phase(
                     provider, "vae_decode", case_slot=int(case.slot), mode="streaming"
                 ):
@@ -1521,13 +1515,13 @@ def _stage2_generated_sample(
                 compare_decoded = decoded
                 decoded_is_uint8 = False
             else:
-                decoded = decoded_from_pipeline.video
-                compare_decoded = decoded_from_pipeline.compare
+                decoded = decoded_tiles.video
+                compare_decoded = decoded_tiles.compare
                 decoded_is_uint8 = True
             vae_decode = {
                 "mode": (
-                    "continuous_cached_xpu_pipeline_tiles"
-                    if decoded_from_pipeline is not None
+                    "continuous_cached_xpu_rollout_tiles"
+                    if decoded_tiles is not None
                     else "continuous_cached_tiles"
                 ),
                 "chunk_latent_frames": chunk_latent_frames,
@@ -2433,30 +2427,11 @@ class Wan5BStage2Runtime:
             and str(inference.get("length", "fixed")).strip().lower() == "camera"
             and str(inference.get("kv_cache_mode", "circular")).strip().lower() == "circular"
         )
-        fused_kernel = (
-            self.config.get("runtime", {}).get("stage2_fused_kernel")
-            or self.config.get("model", {}).get("stage2_fused_kernel")
-            or self.config.get("model", {}).get("fused_kernel")
-            or getattr(self._root(self.student.module), "fused_kernel", None)
-        )
-        if fused_kernel is not None:
-            fused_kernel = str(fused_kernel).strip().lower()
-        is_sage = fused_kernel in ("fused_rope_prope_sage", "sage", "fused_sage")
-
-        unmirrored_ring = circular and bool(
-            self.config.get("runtime", {}).get("stage2_encoded_kv_ring", True)
-        )
-        encoded_kv_ring = unmirrored_ring and not is_sage
-        physical_cache_tokens = (
-            cache_tokens
-            if unmirrored_ring
-            else (cache_tokens * 2 if circular else cache_tokens)
-        )
         caches = [
             {
                 "k": torch.zeros(
                     batch_size,
-                    physical_cache_tokens,
+                    cache_tokens,
                     num_heads,
                     head_dim,
                     dtype=dtype,
@@ -2464,7 +2439,7 @@ class Wan5BStage2Runtime:
                 ),
                 "v": torch.zeros(
                     batch_size,
-                    physical_cache_tokens,
+                    cache_tokens,
                     num_heads,
                     head_dim,
                     dtype=dtype,
@@ -2482,27 +2457,12 @@ class Wan5BStage2Runtime:
                 cache["_circular_kv_cache"] = True
                 cache["_circular_capacity"] = cache_tokens
                 cache["_circular_ring_start"] = 0
-                if encoded_kv_ring:
-                    cache["k_encoded"] = torch.zeros(
-                        batch_size,
-                        cache_tokens,
-                        num_heads,
-                        head_dim,
-                        dtype=dtype,
-                        device=device,
-                    )
-                    cache["v_encoded"] = torch.zeros(
-                        batch_size,
-                        cache_tokens,
-                        num_heads,
-                        head_dim,
-                        dtype=dtype,
-                        device=device,
-                    )
+                cache["k_encoded"] = torch.zeros_like(cache["k"])
+                cache["v_encoded"] = torch.zeros_like(cache["v"])
         caches[0]["_fused_prope_camera_metadata"] = {
             "viewmats": torch.zeros(
                 batch_size,
-                physical_cache_tokens,
+                cache_tokens,
                 4,
                 4,
                 dtype=torch.float32,
@@ -2510,7 +2470,7 @@ class Wan5BStage2Runtime:
             ),
             "K": torch.zeros(
                 batch_size,
-                physical_cache_tokens,
+                cache_tokens,
                 3,
                 3,
                 dtype=torch.float32,
@@ -3169,25 +3129,20 @@ class CudaWanStage2GenerationAdapter:
                     )
                     self.text_encoder.to(encoder_device, dtype=encoder_dtype)
                     self.diffusion = build_diffusion_architecture(values)
+                    if stage2_linear_quant(values) != "full_precision":
+                        from .modeling.svdquant_linear import stub_dit_linear_layers
+
+                        stub_dit_linear_layers(self.diffusion.module)
                     self.diffusion.module.eval().requires_grad_(False).to(
                         device=self.device, dtype=inference_dtype
                     )
                     runtime_options = values.get("runtime", {})
-                    if hasattr(self.diffusion.module, "dit_fused_ops"):
-                        self.diffusion.module.dit_fused_ops = bool(
-                            runtime_options.get("stage2_dit_fused_ops", False)
-                        )
                     self.vae = Wan5BVAE(
                         layout.vae,
                         xpu_channels_last=bool(
                             runtime_options.get("stage2_vae_channels_last", True)
                         ),
-                        xpu_fused_kernels=bool(
-                            runtime_options.get("stage2_vae_fused_kernels", True)
-                        ),
-                        xpu_vae_int8_quarot=bool(
-                            runtime_options.get("stage2_vae_int8_quarot", False)
-                        ),
+                        xpu_vae_int8_quarot=stage2_vae_quant(values) == "quarot_w8a8",
                         stage2_vae_compile=bool(
                             runtime_options.get("stage2_vae_compile", False)
                         ),
@@ -3232,12 +3187,13 @@ class CudaWanStage2GenerationAdapter:
             def _load_role(self, role: str) -> None:
                 if self._loaded_role == role:
                     return
-                with self._stage2_measurements.phase("weight_load", weight_role=role):
-                    super()._load_role(role)
-                if hasattr(self.diffusion.module, "dit_fused_ops"):
-                    self.diffusion.module.dit_fused_ops = bool(
-                        self.config.get("runtime", {}).get("stage2_dit_fused_ops", False)
-                    )
+                linear_quant = stage2_linear_quant(self.config)
+                if linear_quant != "full_precision":
+                    with self._stage2_measurements.phase("weight_load", weight_role=role):
+                        self._load_svdquant_role(role, linear_quant)
+                else:
+                    with self._stage2_measurements.phase("weight_load", weight_role=role):
+                        super()._load_role(role)
                 if _stage2_xpu_compile_blocks_enabled(self.config):
                     compile_mode = (
                         self.config.get("inference", {}).get("stage2_xpu_compile_mode")
@@ -3252,6 +3208,82 @@ class CudaWanStage2GenerationAdapter:
                             device=self.device,
                             mode=compile_mode,
                         )
+
+            def _load_svdquant_role(self, role: str, linear_quant: str) -> None:
+                import torch
+                from pathlib import Path
+
+                from .checkpoint import normalize_model_state
+                from .distributed import empty_accelerator_cache
+                from .inference import _validate_checkpoint_config
+                from .modeling.svdquant_linear import (
+                    TimestepTrackingDiffusionWrapper,
+                    load_svdquant_into_model,
+                )
+
+                try:
+                    payload = torch.load(
+                        self.checkpoint_path,
+                        map_location="cpu",
+                        weights_only=True,
+                        mmap=True,
+                    )
+                except Exception as exc:
+                    raise BackendContractError(
+                        f"cannot read Wan inference checkpoint {self.checkpoint_path}: {exc}"
+                    ) from exc
+                if not isinstance(payload, Mapping):
+                    raise BackendContractError("Wan inference checkpoint payload must be a mapping")
+
+                _validate_checkpoint_config(payload.get("config"), self.config)
+                field = self._checkpoint_state_field(role)
+                state = payload.get(field)
+                if not isinstance(state, Mapping) or not state:
+                    raise BackendContractError(f"Wan inference checkpoint lacks {field}")
+                normalized = normalize_model_state(state, field=field)
+
+                target_suffixes = (
+                    ".self_attn.q.weight",
+                    ".self_attn.q.bias",
+                    ".self_attn.k.weight",
+                    ".self_attn.k.bias",
+                    ".self_attn.v.weight",
+                    ".self_attn.v.bias",
+                    ".ffn.0.weight",
+                    ".ffn.0.bias",
+                    ".ffn.2.weight",
+                    ".ffn.2.bias",
+                )
+                filtered = {
+                    k: v
+                    for k, v in normalized.items()
+                    if not any(
+                        k.startswith(f"blocks.{b}") and any(s in k for s in target_suffixes)
+                        for b in range(30)
+                    )
+                }
+                del payload, state, normalized
+
+                result = self.diffusion.module.load_state_dict(filtered, strict=False)
+                del filtered
+
+                k_tag = linear_quant.removeprefix("svdquant_")
+                ckpt_root = self.config.get("model", {}).get("svdquant_weights_root")
+                ckpt_root = (
+                    Path(ckpt_root)
+                    if ckpt_root is not None
+                    else Path(self.checkpoint_path).parent / "svdquant_int4"
+                )
+                svdquant_dir = ckpt_root / f"{stage2_attention_backend(self.config)}_{k_tag}"
+                if not svdquant_dir.exists():
+                    raise BackendContractError(f"SVDQuant checkpoint dir does not exist: {svdquant_dir}")
+
+                svd_manager = load_svdquant_into_model(
+                    self.diffusion.module, svdquant_dir, device=self.device
+                )
+                self.diffusion = TimestepTrackingDiffusionWrapper(self.diffusion, svd_manager)
+                self._loaded_role = role
+                empty_accelerator_cache()
 
             def _conditions(
                 self, case: Any, *, latent_frames: int

@@ -136,7 +136,7 @@ def test_cached_fused_q_and_kv_transforms_are_reused_and_correct() -> None:
     assert set(cache) == {"q_rope", ("kv_rope", (0, kv_tokens))}
 
 
-def test_causal_self_attention_fused_kernels_execution() -> None:
+def test_causal_self_attention_fused_encoded_ring() -> None:
     if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
         return
 
@@ -148,10 +148,8 @@ def test_causal_self_attention_fused_kernels_execution() -> None:
     frame_seqlen = 16
     local_attn_size = 4
     cache_tokens = local_attn_size * frame_seqlen
-    capacity = cache_tokens
-    physical_cache_tokens = cache_tokens * 2
 
-    for kernel in ("reference", "fused_rope_prope_sdpa", "fused_rope_prope_sage"):
+    for kernel in ("fused_rope_prope_sdpa", "fused_rope_prope_sage"):
         attn = CausalWanSelfAttention(
             dim=dim,
             num_heads=num_heads,
@@ -181,18 +179,22 @@ def test_causal_self_attention_fused_kernels_execution() -> None:
         cam_K = torch.eye(3, device=dev, dtype=torch.float64).repeat(1, q_tokens, 1, 1)
 
         kv_cache = {
-            "k": torch.zeros(1, physical_cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
-            "v": torch.zeros(1, physical_cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "k": torch.zeros(1, cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "v": torch.zeros(1, cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "k_encoded": torch.zeros(1, cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
+            "v_encoded": torch.zeros(1, cache_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=dev),
             "global_end_index": 0,
             "local_end_index": 0,
             "_circular_kv_cache": True,
-            "_circular_capacity": capacity,
+            "_circular_capacity": cache_tokens,
             "_circular_ring_start": 0,
         }
-        kv_cam_vm = torch.eye(4, device=dev, dtype=torch.float64).repeat(1, physical_cache_tokens, 1, 1)
-        kv_cam_K = torch.eye(3, device=dev, dtype=torch.float64).repeat(1, physical_cache_tokens, 1, 1)
+        kv_cam_vm = torch.eye(4, device=dev, dtype=torch.float64).repeat(1, cache_tokens, 1, 1)
+        kv_cam_K = torch.eye(3, device=dev, dtype=torch.float64).repeat(1, cache_tokens, 1, 1)
 
-        out, cache_update = attn(
+        # Step 0: populate history
+        prope_cache = {}
+        out0, cache_update0 = attn(
             q,
             seq_lens=None,
             grid_sizes=grid_sizes,
@@ -205,7 +207,66 @@ def test_causal_self_attention_fused_kernels_execution() -> None:
             kv_cam_K=kv_cam_K,
             frame_seqlen=frame_seqlen,
             cache_update_policy="commit_detached",
+            prope_cache=prope_cache,
         )
-        assert out.shape == (1, q_tokens, dim)
-        assert cache_update[0] == q_tokens
+        assert out0.shape == (1, q_tokens, dim)
+        assert torch.isfinite(out0).all()
+        # Step 0 updates cache pointer indices
+        kv_cache["global_end_index"] = cache_update0[0]
+        kv_cache["local_end_index"] = cache_update0[1]
+        if cache_update0[2] and "ring_start" in cache_update0[2]:
+            kv_cache["_circular_ring_start"] = cache_update0[2]["ring_start"]
+
+        # Step 1: history re-encoding should be skipped
+        q1 = torch.randn(1, q_tokens, dim, dtype=torch.bfloat16, device=dev)
+        out1, cache_update1 = attn(
+            q1,
+            seq_lens=None,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            kv_cache=kv_cache,
+            current_start=q_tokens,
+            cam_viewmats=cam_viewmats,
+            cam_K=cam_K,
+            kv_cam_viewmats=kv_cam_vm,
+            kv_cam_K=kv_cam_K,
+            frame_seqlen=frame_seqlen,
+            cache_update_policy="commit_detached",
+            prope_cache=prope_cache,
+        )
+        assert out1.shape == (1, q_tokens, dim)
+        assert torch.isfinite(out1).all()
+        # Step 0 had 0 history tokens so only fused_new_prope was populated.
+        # Step 1 had 32 history tokens and 32 new tokens.
+        assert ("fused_hist_prope", kernel == "fused_rope_prope_sage", (32, 0, 32)) in prope_cache
+        assert ("fused_new_prope", kernel == "fused_rope_prope_sage", 2, 2) in prope_cache
+
+        # Step 2: Radial attention with encoded ring
+        kv_cache["global_end_index"] = cache_update1[0]
+        kv_cache["local_end_index"] = cache_update1[1]
+        if cache_update1[2] and "ring_start" in cache_update1[2]:
+            kv_cache["_circular_ring_start"] = cache_update1[2]["ring_start"]
+
+        attn.radial_attention = True
+        attn.radial_dense_blocks = 0
+        attn.radial_dense_steps = 0
+        q2 = torch.randn(1, q_tokens, dim, dtype=torch.bfloat16, device=dev)
+        out2, cache_update2 = attn(
+            q2,
+            seq_lens=None,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            kv_cache=kv_cache,
+            current_start=2 * q_tokens,
+            cam_viewmats=cam_viewmats,
+            cam_K=cam_K,
+            kv_cam_viewmats=kv_cam_vm,
+            kv_cam_K=kv_cam_K,
+            frame_seqlen=frame_seqlen,
+            cache_update_policy="commit_detached",
+            prope_cache=prope_cache,
+            radial_step=2,
+        )
+        assert out2.shape == (1, q_tokens, dim)
+        assert torch.isfinite(out2).all()
 
