@@ -13,14 +13,28 @@ from .attention import attention
 __all__ = ["WanModel"]
 
 
-def sinusoidal_embedding_1d(dim, position):
+def sinusoidal_embedding_frequencies(dim, device=None):
+    assert dim % 2 == 0
+    half = dim // 2
+    indices = torch.arange(half, device=device, dtype=torch.float64)
+    return torch.pow(10000, -indices.div(half))
+
+
+def sinusoidal_embedding_1d(dim, position, frequencies=None):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
+    if frequencies is None:
+        frequencies = sinusoidal_embedding_frequencies(dim, device=position.device)
+    elif frequencies.device != position.device:
+        raise RuntimeError(
+            "sinusoidal embedding frequencies must be on the position device; "
+            f"got {frequencies.device} and {position.device}"
+        )
 
     # calculation
-    sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+    sinusoid = torch.outer(position, frequencies)
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
@@ -404,6 +418,11 @@ class WanModel(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        # Keep this plain (rather than a registered buffer) so model.to(dtype=...)
+        # does not demote the FP64 frequency table. _apply moves it with the model.
+        self._time_embedding_frequencies = sinusoidal_embedding_frequencies(
+            freq_dim, device=self.patch_embedding.weight.device
+        )
 
         # blocks
         self.blocks = nn.ModuleList(
@@ -433,6 +452,15 @@ class WanModel(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
         self.gradient_checkpointing = False
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        device = self.patch_embedding.weight.device
+        if device.type != "meta":
+            self._time_embedding_frequencies = self._time_embedding_frequencies.to(
+                device=device
+            )
+        return self
 
     def _set_gradient_checkpointing(
         self, module=None, value=False, gradient_checkpointing_func=None
@@ -492,7 +520,11 @@ class WanModel(ModelMixin, ConfigMixin):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len)).type_as(x)
+            sinusoidal_embedding_1d(
+                self.freq_dim, t, self._time_embedding_frequencies
+            )
+            .unflatten(0, (bt, seq_len))
+            .type_as(x)
         )
         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
         # context

@@ -29,6 +29,7 @@ class _Diffusion:
         current_start,
         cache_start,
         cache_update_policy,
+        **kwargs,
     ):
         self.calls.append((int(current_start), cache_update_policy, kv_cache, crossattn_cache))
         return torch.zeros_like(latents)

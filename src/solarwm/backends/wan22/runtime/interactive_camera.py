@@ -20,10 +20,10 @@ _TRANSLATION_KEYS = {
     "KeyE": np.array([0.0, 1.0, 0.0]),
 }
 _LOOK_KEYS = {
-    "ArrowLeft": np.array([0.0, -1.0, 0.0]),
-    "ArrowRight": np.array([0.0, 1.0, 0.0]),
-    "ArrowUp": np.array([-1.0, 0.0, 0.0]),
-    "ArrowDown": np.array([1.0, 0.0, 0.0]),
+    "ArrowLeft": np.array([-1.0, 0.0, 0.0]),
+    "ArrowRight": np.array([1.0, 0.0, 0.0]),
+    "ArrowUp": np.array([0.0, 1.0, 0.0]),
+    "ArrowDown": np.array([0.0, -1.0, 0.0]),
     "KeyZ": np.array([0.0, 0.0, 1.0]),
     "KeyC": np.array([0.0, 0.0, -1.0]),
 }
@@ -63,25 +63,34 @@ def _validate_pose(pose: np.ndarray) -> None:
 class FreeFlyCamera:
     """Integrate keyboard intent in camera-local coordinates.
 
-    The camera uses the conventional optical frame: forward is local ``-Z``,
-    right is ``+X`` and up is ``+Y``.  Positions are model-space units and
-    angles are radians per second.
+    Manual controls use the conventional optical frame: forward is local
+    ``-Z``, right is ``+X`` and up is ``+Y``.  The autonomous review trajectory
+    intentionally follows ``+Z`` to match the model's desired visual direction.
+    Positions are model-space units and angles are radians per second.
     """
 
     pose: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))
-    translation_speed: float = 1.0
-    rotation_speed: float = 0.7
-    acceleration: float = 8.0
-    damping: float = 10.0
+    translation_speed: float = 0.1
+    rotation_speed: float = 0.1
+    acceleration: float = 2.5
+    damping: float = 3.0
     boost_multiplier: float = 3.0
     precision_multiplier: float = 0.25
+    default_motion: str = "forward_turn_right_4s"
+    turn_delay_seconds: float = 4.0
+    turn_duration_seconds: float = 4.0
+    turn_angle_rad: float = np.pi / 2.0
     _velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
     _angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    _elapsed_time: float = field(default=0.0, init=False)
+    _turn_accumulated: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self.pose = np.asarray(self.pose, dtype=np.float64).copy()
         _validate_pose(self.pose)
         self._origin = self.pose.copy()
+        if self.default_motion == "forward_turn_right_4s":
+            self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
 
     def reset(self, pose: np.ndarray | None = None) -> None:
         self.pose = np.asarray(
@@ -90,12 +99,16 @@ class FreeFlyCamera:
         ).copy()
         _validate_pose(self.pose)
         self._origin = self.pose.copy()
-        self._velocity.fill(0.0)
         self._angular_velocity.fill(0.0)
+        self._elapsed_time = 0.0
+        self._turn_accumulated = 0.0
+        self.default_motion = "forward_turn_right_4s"
+        self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
 
     def brake(self) -> None:
         self._velocity.fill(0.0)
         self._angular_velocity.fill(0.0)
+        self.default_motion = "none"
 
     def update(self, pressed: Iterable[str] | Mapping[str, bool], dt: float) -> np.ndarray:
         if dt < 0 or not np.isfinite(dt):
@@ -105,14 +118,47 @@ class FreeFlyCamera:
             if isinstance(pressed, Mapping)
             else set(pressed)
         )
-        translation = sum(
-            (value for key, value in _TRANSLATION_KEYS.items() if key in keys),
-            start=np.zeros(3, dtype=np.float64),
-        )
-        rotation = sum(
-            (value for key, value in _LOOK_KEYS.items() if key in keys),
-            start=np.zeros(3, dtype=np.float64),
-        )
+        has_manual_translation = any(key in keys for key in _TRANSLATION_KEYS)
+        has_manual_rotation = any(key in keys for key in _LOOK_KEYS)
+
+        if has_manual_translation:
+            translation = sum(
+                (value for key, value in _TRANSLATION_KEYS.items() if key in keys),
+                start=np.zeros(3, dtype=np.float64),
+            )
+        elif self.default_motion == "forward_turn_right_4s":
+            # Default motion: move forward in the model's +Z trajectory direction.
+            translation = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            translation = np.zeros(3, dtype=np.float64)
+
+        turn_d_yaw = 0.0
+        if has_manual_rotation:
+            rotation = sum(
+                (value for key, value in _LOOK_KEYS.items() if key in keys),
+                start=np.zeros(3, dtype=np.float64),
+            )
+        elif (
+            self.default_motion == "forward_turn_right_4s"
+            and self._elapsed_time + dt > self.turn_delay_seconds
+            and self._turn_accumulated < self.turn_angle_rad
+        ):
+            # Smooth C2-continuous turn using smootherstep: S(tau) = 6*tau^5 - 15*tau^4 + 10*tau^3
+            dur = max(self.turn_duration_seconds, 1e-6)
+            tau0 = np.clip((self._elapsed_time - self.turn_delay_seconds) / dur, 0.0, 1.0)
+            tau1 = np.clip((self._elapsed_time + dt - self.turn_delay_seconds) / dur, 0.0, 1.0)
+            s0 = 6.0 * (tau0**5) - 15.0 * (tau0**4) + 10.0 * (tau0**3)
+            s1 = 6.0 * (tau1**5) - 15.0 * (tau1**4) + 10.0 * (tau1**3)
+            turn_d_yaw = float(self.turn_angle_rad * (s1 - s0))
+            self._turn_accumulated = min(float(self.turn_angle_rad), self._turn_accumulated + turn_d_yaw)
+            rotation = np.zeros(3, dtype=np.float64)
+            if tau1 >= 1.0 or self._turn_accumulated >= self.turn_angle_rad:
+                self._angular_velocity[0] = 0.0
+            elif dt > 0:
+                self._angular_velocity[0] = -turn_d_yaw / dt
+        else:
+            rotation = np.zeros(3, dtype=np.float64)
+
         if np.linalg.norm(translation) > 1.0:
             translation /= np.linalg.norm(translation)
         if np.linalg.norm(rotation) > 1.0:
@@ -124,20 +170,31 @@ class FreeFlyCamera:
         target_angular = rotation * self.rotation_speed * multiplier
         alpha = 1.0 - np.exp(-self.acceleration * dt)
         self._velocity += (target_velocity - self._velocity) * alpha
-        self._angular_velocity += (target_angular - self._angular_velocity) * alpha
+        if has_manual_rotation:
+            self._angular_velocity += (target_angular - self._angular_velocity) * alpha
+        else:
+            if turn_d_yaw == 0.0:
+                self._angular_velocity *= np.exp(-self.damping * dt)
+
         if not np.any(translation):
             self._velocity *= np.exp(-self.damping * dt)
-        if not np.any(rotation):
-            self._angular_velocity *= np.exp(-self.damping * dt)
-        self.pose[:3, 3] += self.pose[:3, :3] @ (self._velocity * dt)
-        yaw, pitch, roll = self._angular_velocity * dt
-        self.pose[:3, :3] = (
-            self.pose[:3, :3]
-            @ _rotation(np.array([0.0, 1.0, 0.0]), yaw)
-            @ _rotation(np.array([1.0, 0.0, 0.0]), pitch)
-            @ _rotation(np.array([0.0, 0.0, 1.0]), roll)
+
+        if turn_d_yaw > 0.0:
+            yaw = -turn_d_yaw
+            pitch = float(self._angular_velocity[1] * dt)
+            roll = float(self._angular_velocity[2] * dt)
+        else:
+            yaw, pitch, roll = self._angular_velocity * dt
+
+        half_rot = (
+            _rotation(np.array([0.0, 1.0, 0.0]), 0.5 * yaw)
+            @ _rotation(np.array([1.0, 0.0, 0.0]), 0.5 * pitch)
+            @ _rotation(np.array([0.0, 0.0, 1.0]), 0.5 * roll)
         )
-        self.pose[:3, :3] = _orthonormalize(self.pose[:3, :3])
+        mid_rot = self.pose[:3, :3] @ half_rot
+        self.pose[:3, 3] += mid_rot @ (self._velocity * dt)
+        self.pose[:3, :3] = _orthonormalize(mid_rot @ half_rot)
+        self._elapsed_time += dt
         return self.pose.copy()
 
     def level_roll(self, amount: float = 0.2) -> np.ndarray:
@@ -151,9 +208,16 @@ class FreeFlyCamera:
         self.pose[:3, :3] = _orthonormalize(self.pose[:3, :3])
         return self.pose.copy()
 
-    def model_tokens(self, *, frame_sequence_length: int, device: Any, dtype: Any = None) -> dict[str, Any]:
+    def model_tokens(
+        self,
+        *,
+        frame_sequence_length: int,
+        device: Any,
+        dtype: Any = None,
+        chunk: int = 1,
+    ) -> dict[str, Any]:
         return camera_tokens_from_poses(
-            [self.pose],
+            [self.pose] * int(chunk),
             origin=self._origin,
             frame_sequence_length=frame_sequence_length,
             device=device,

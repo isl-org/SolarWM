@@ -15,7 +15,14 @@ from .camera_prope import (
     prope_qkv_separate,
     transform_relative_viewmats,
 )
-from .model import WanRMSNorm, WanLayerNorm, WanCrossAttention, rope_params, sinusoidal_embedding_1d
+from .model import (
+    WanRMSNorm,
+    WanLayerNorm,
+    WanCrossAttention,
+    rope_params,
+    sinusoidal_embedding_1d,
+    sinusoidal_embedding_frequencies,
+)
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from ..camera import normalize_camera_translation_transform
@@ -2384,8 +2391,15 @@ class CausalWanAttentionBlock(nn.Module):
             ).flatten(1, 2)
 
         # cross-attention & FFN
+        if use_fused:
+            # Native bf16 LayerNorm (fp32 statistics) instead of autocast's fp32
+            # upcast of the input, weight and bias plus the downcast of the output.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                cross_input = self.norm3(x)
+        else:
+            cross_input = self.norm3(x)
         x = x + self.cross_attn(
-            self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache
+            cross_input, context, context_lens, crossattn_cache=crossattn_cache
         )
         if use_fused:
             ffn_input = triton_layernorm_adaln(x, e[4], e[3], eps=self.norm2.eps)
@@ -2556,6 +2570,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        # Keep this plain (rather than a registered buffer) so model.to(dtype=...)
+        # does not demote the FP64 frequency table. _apply moves it with the model.
+        self._time_embedding_frequencies = sinusoidal_embedding_frequencies(
+            freq_dim, device=self.patch_embedding.weight.device
+        )
 
         # transformer blocks
         self.blocks = nn.ModuleList(
@@ -2624,6 +2643,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             )
         self.dit_fused_ops = bool(dit_fused_ops)
 
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        device = self.patch_embedding.weight.device
+        if device.type != "meta":
+            self._time_embedding_frequencies = self._time_embedding_frequencies.to(
+                device=device
+            )
+        return self
+
     @property
     def dit_fused_ops(self) -> bool:
         return getattr(self, "_dit_fused_ops", False)
@@ -2663,7 +2691,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     def _time_condition(self, timestep, reference, r_timestep=None):
         """Return the base time embedding or the AnyFlow mixed (t,r) embedding."""
         time_emb = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(reference)
+            sinusoidal_embedding_1d(
+                self.freq_dim,
+                timestep.flatten(),
+                self._time_embedding_frequencies,
+            ).type_as(reference)
         )
         if not self.uses_anyflow:
             return time_emb
@@ -2674,7 +2706,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 f"r_timestep shape {tuple(r_timestep.shape)} != timestep shape {tuple(timestep.shape)}"
             )
         delta_emb = self.delta_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, r_timestep.flatten()).type_as(reference)
+            sinusoidal_embedding_1d(
+                self.freq_dim,
+                r_timestep.flatten(),
+                self._time_embedding_frequencies,
+            ).type_as(reference)
         )
         gate = self.anyflow_gate_buffer.to(device=time_emb.device, dtype=time_emb.dtype)
         return (1.0 - gate) * time_emb + gate * delta_emb

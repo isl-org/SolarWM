@@ -58,7 +58,11 @@ class Stage2InteractiveSession:
         self.condition = dict(condition)
         self.generator = generator
         self.max_latent_frames = int(max_latent_frames)
+        self.chunk = int(provider.config["model"].get("num_frame_per_block", 1))
+        if self.chunk < 1:
+            raise BackendContractError("interactive Stage2 num_frame_per_block must be >= 1")
         self.frame_sequence_length = int(provider.config["model"]["frame_sequence_length"])
+        self.sequence_length = self.chunk * self.frame_sequence_length
         self.dtype = self.first_latent.dtype
         self._decode_tile = decode_tile
         self._first_pose = first_pose
@@ -77,7 +81,7 @@ class Stage2InteractiveSession:
         height = int(provider.config["data"]["latent_shape"][-2])
         width = int(provider.config["data"]["latent_shape"][-1])
         self._noise = torch.empty(
-            (1, 1, channels, height, width),
+            (1, self.chunk, channels, height, width),
             device=self.device,
             dtype=self.dtype,
         )
@@ -149,7 +153,7 @@ class Stage2InteractiveSession:
             latents[:, 0] = self.first_latent[:, 0]
         for step_index, step_value in enumerate(self._steps):
             timestep = torch.full(
-                (1, 1),
+                (1, self.chunk),
                 float(step_value),
                 device=self.device,
                 dtype=self.dtype,
@@ -166,12 +170,13 @@ class Stage2InteractiveSession:
                     self.condition,
                     camera,
                     self._expand_timestep(timestep),
-                    sequence_length=self.frame_sequence_length,
+                    sequence_length=self.sequence_length,
                     kv_cache=self._kv_cache,
                     crossattn_cache=self._crossattn_cache,
                     current_start=frame * self.frame_sequence_length,
                     cache_start=0,
                     cache_update_policy="inference_direct",
+                    radial_step=step_index,
                 )
                 x0 = self.provider.diffusion.flow_to_x0(latents, flow, timestep)
             if frame == 0:
@@ -179,7 +184,7 @@ class Stage2InteractiveSession:
             if step_index + 1 < len(self._steps):
                 self.provider._noise_into(self._denoise_noise, self.generator)
                 next_timestep = torch.full(
-                    (1, 1),
+                    (1, self.chunk),
                     float(self._steps[step_index + 1]),
                     device=self.device,
                     dtype=torch.float32,
@@ -192,14 +197,13 @@ class Stage2InteractiveSession:
                         self._denoise_noise.flatten(0, 1).float(),
                         next_timestep.flatten(0, 1),
                     )
-                    .unflatten(0, (1, 1))
+                    .unflatten(0, (1, self.chunk))
                     .to(self.dtype)
                 )
                 if frame == 0:
                     latents = self._restore_first(latents)
             else:
                 latents = x0
-        diffusion_seconds = time.perf_counter() - started
         with torch.no_grad(), torch.autocast(
             device_type=self.device.type,
             dtype=torch.bfloat16,
@@ -209,20 +213,22 @@ class Stage2InteractiveSession:
                 latents,
                 self.condition,
                 camera,
-                self._expand_timestep(torch.zeros((1, 1), device=self.device, dtype=self.dtype)),
-                sequence_length=self.frame_sequence_length,
+                self._expand_timestep(torch.zeros((1, self.chunk), device=self.device, dtype=self.dtype)),
+                sequence_length=self.sequence_length,
                 kv_cache=self._kv_cache,
                 crossattn_cache=self._crossattn_cache,
                 current_start=frame * self.frame_sequence_length,
                 cache_start=0,
                 cache_update_policy="commit_detached",
+                radial_step=len(self._steps),
             )
+        diffusion_seconds = time.perf_counter() - started
         decode_started = time.perf_counter()
         pixels = self._decode_tile(latents)
         decode_seconds = time.perf_counter() - decode_started
         if not bool(torch.isfinite(latents).all().item()):
             raise BackendContractError("interactive Stage2 rollout produced non-finite latents")
-        self._index += 1
+        self._index += self.chunk
         self._frames += int(pixels.shape[1])
         return InteractiveFrame(
             index=frame,

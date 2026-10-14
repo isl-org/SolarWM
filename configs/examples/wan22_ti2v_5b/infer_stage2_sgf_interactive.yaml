@@ -17,9 +17,7 @@ model:
   camera_translation_transform: linear
   latent_channels: 48
   frame_sequence_length: 405
-  # Block size 1 is intentionally opt-in: it is out of distribution for the
-  # released Stage2 checkpoint and must pass the visual quality gate.
-  num_frame_per_block: 1
+  num_frame_per_block: 3
   num_output_frames: 21
   max_prior_clean_chunks: 5
   local_attn_size: 18
@@ -99,6 +97,13 @@ inference:
   source: validation
   length: camera
   interactive: true
+  default_camera_motion: forward_turn_right_4s
+  default_translation_speed: 0.1
+  default_rotation_speed: 0.1
+  default_turn_delay_seconds: 4.0
+  default_turn_duration_seconds: 4.0
+  default_acceleration: 2.5
+  default_damping: 3.0
   kv_cache_mode: circular
   max_rollout_latent_frames: 900
   stage2_xpu_compile_blocks: false
