@@ -1,78 +1,78 @@
 {
   "baseline (none)": {
     "avg_denoise_per_step_ms": [
-      318.55106990163523,
-      236.90443128968278,
-      236.87588780497512,
-      236.4305656713744
+      319.535693153739,
+      237.67180554568768,
+      237.06316575407982,
+      238.06758504360914
     ],
-    "mean_denoise_fwd_ms": 257.1904886669169,
-    "mean_commit_fwd_ms": 237.24963624651232,
-    "mean_all_fwd_ms": 253.20231818283597,
-    "mean_chunk_total_ms": 1266.870556709667
+    "mean_denoise_fwd_ms": 258.0845623742789,
+    "mean_commit_fwd_ms": 237.52899561077356,
+    "mean_all_fwd_ms": 253.97344902157784,
+    "mean_chunk_total_ms": 1271.1299881339073
   },
   "fused_rope_prope_sdpa (dense)": {
     "avg_denoise_per_step_ms": [
-      216.13535129775605,
-      202.70476024597883,
-      202.68685882911086,
-      202.33955389509597
+      214.5917033776641,
+      200.05235355347395,
+      200.00123418867588,
+      199.20796994119883
     ],
-    "mean_denoise_fwd_ms": 205.96663106698543,
-    "mean_commit_fwd_ms": 201.40939733634391,
-    "mean_all_fwd_ms": 205.05518432085714,
-    "mean_chunk_total_ms": 1026.1535518802702,
-    "fwd_speedup": 1.2486997885753262,
-    "fwd_savings_ms": 51.22385759993148,
-    "chunk_speedup": 1.2345818560860793,
-    "chunk_savings_ms": 240.71700482939673
+    "mean_denoise_fwd_ms": 203.4633152652532,
+    "mean_commit_fwd_ms": 199.80360101908445,
+    "mean_all_fwd_ms": 202.73137241601944,
+    "mean_chunk_total_ms": 1014.6305439993739,
+    "fwd_speedup": 1.2684574712538057,
+    "fwd_savings_ms": 54.62124710902572,
+    "chunk_speedup": 1.2528008304613898,
+    "chunk_savings_ms": 256.4994441345334
   },
   "fused_rope_prope_sdpa (radial)": {
     "avg_denoise_per_step_ms": [
-      216.67752120022973,
-      215.9698490674297,
-      215.10351666559777,
-      215.27783867592612
+      215.3928205370903,
+      201.51695609092712,
+      202.07094680517912,
+      201.3768283650279
     ],
-    "mean_denoise_fwd_ms": 215.75718140229583,
-    "mean_commit_fwd_ms": 214.55491691206893,
-    "mean_all_fwd_ms": 215.51672850425044,
-    "mean_chunk_total_ms": 1078.4305340300004,
-    "fwd_speedup": 1.1920367470288995,
-    "fwd_savings_ms": 41.43330726462108,
-    "chunk_speedup": 1.174735429620564,
-    "chunk_savings_ms": 188.44002267966653
+    "mean_denoise_fwd_ms": 205.0893879495561,
+    "mean_commit_fwd_ms": 199.60992876440287,
+    "mean_all_fwd_ms": 203.99349611252546,
+    "mean_chunk_total_ms": 1020.8833524957299,
+    "fwd_speedup": 1.258400373391126,
+    "fwd_savings_ms": 52.99517442472279,
+    "chunk_speedup": 1.2451275505927344,
+    "chunk_savings_ms": 250.2466356381774
   },
   "fused_rope_prope_sage (dense)": {
     "avg_denoise_per_step_ms": [
-      209.7321959833304,
-      209.59122898057103,
-      209.76180334885916,
-      210.02196179081997
+      219.14920303970575,
+      201.49251259863377,
+      201.49087999016047,
+      201.4724062755704
     ],
-    "mean_denoise_fwd_ms": 209.77679752589515,
-    "mean_commit_fwd_ms": 209.70174872005978,
-    "mean_all_fwd_ms": 209.76178776472807,
-    "mean_chunk_total_ms": 1049.5916507206857,
-    "fwd_speedup": 1.226019710950964,
-    "fwd_savings_ms": 47.41369114102176,
-    "chunk_speedup": 1.2070127995395068,
-    "chunk_savings_ms": 217.27890598898125
+    "mean_denoise_fwd_ms": 205.9012504760176,
+    "mean_commit_fwd_ms": 201.2560935690999,
+    "mean_all_fwd_ms": 204.97221909463406,
+    "mean_chunk_total_ms": 1025.74123442173,
+    "fwd_speedup": 1.253438538025486,
+    "fwd_savings_ms": 52.18331189826131,
+    "chunk_speedup": 1.2392306611818302,
+    "chunk_savings_ms": 245.38875371217728
   },
   "fused_rope_prope_sage (radial)": {
     "avg_denoise_per_step_ms": [
-      209.8326754445831,
-      201.0601293295622,
-      200.96344128251076,
-      200.84400894120336
+      211.0451078042388,
+      194.28240321576595,
+      192.51037947833538,
+      193.78778245300055
     ],
-    "mean_denoise_fwd_ms": 203.17506374946484,
-    "mean_commit_fwd_ms": 200.83146573354801,
-    "mean_all_fwd_ms": 202.70634414628148,
-    "mean_chunk_total_ms": 1014.355186217775,
-    "fwd_speedup": 1.2658565668474873,
-    "fwd_savings_ms": 54.015424917452066,
-    "chunk_speedup": 1.2489417650965495,
-    "chunk_savings_ms": 252.51537049189199
+    "mean_denoise_fwd_ms": 197.90641823783517,
+    "mean_commit_fwd_ms": 193.69901157915592,
+    "mean_all_fwd_ms": 197.06493690609932,
+    "mean_chunk_total_ms": 986.2020434811711,
+    "fwd_speedup": 1.3040737368311335,
+    "fwd_savings_ms": 60.178144136443734,
+    "chunk_speedup": 1.2889143726035852,
+    "chunk_savings_ms": 284.9279446527362
   }
 }

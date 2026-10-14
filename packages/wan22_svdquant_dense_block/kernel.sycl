@@ -1,0 +1,827 @@
+#define SYCL_INTEL_TARGET 20
+#define CUTLASS_ENABLE_SYCL 1
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <cute/tensor.hpp>
+#include <string>
+#include "tuning_params.h"
+
+#ifndef KF_GRF
+#define KF_GRF 128
+#endif
+
+#if KF_GRF != 128 && KF_GRF != 256
+#error "KF_GRF must be 128 or 256"
+#endif
+
+#ifndef KF_N_TILE
+#define KF_N_TILE 64
+#endif
+
+#if KF_N_TILE != 64 && KF_N_TILE != 128
+#error "KF_N_TILE (GEMM columns per sub-group) must be 64 or 128"
+#endif
+
+namespace py = pybind11;
+
+/*
+[USER_INSTRUCTIONS_START]
+Create sycl kernels using the sycl-tla library.
+Workload: SolarWM Wan2.2 TI2V-5B Camera Transformer Block Projections & FFN
+- Active sequence length: M = 1215 tokens (3 frames * 405 tokens/frame)
+- BF16 LoRA rank: r = 32
+- Group size: G = 64
+1. Projection 0 (Q): M = 1215, K = 3072, N = 3072, LoRA rank 32, with optional RMSNorm (WanRMSNorm dim=3072, eps=1e-5)
+2. Projection 1 (K): M = 1215, K = 3072, N = 3072, LoRA rank 32, with optional RMSNorm (WanRMSNorm dim=3072, eps=1e-5)
+3. Projection 2 (V): M = 1215, K = 3072, N = 3072, LoRA rank 32, no normalization
+4. FFN up-projection: M = 1215, K = 3072, N = 14336, LoRA rank 32, activation gelu_tanh, optional fused INT4 output quantization
+5. FFN down-projection: M = 1215, K = 14336, N = 3072, LoRA rank 32, no activation
+
+Optimization directives:
+- Input handling: Quantization should be optional. If input x is already in INT4 (from a preceding layer with fused output quantization), do not quantize. If input x is BF16, dynamic INT4 group-64 quantization must be fused on the fly inside the SYCL kernel (similar to Nunchaku SVDQuant).
+- Fused LoRA: LoRA (x @ lora_a^T @ lora_b^T) must be calculated on the fly inside the SYCL kernel without separate PyTorch passes.
+- Dual GEMM: In the main loop, perform a dual GEMM (INT4 MMA, scale it and accumulate into the BF16 LoRA MMA). Alternately, use XMX / dpas for the INT4 GEMM and vector engines for the LoRA BF16 branch in the epilogue.
+- Epilogue features:
+  - Fused bias addition.
+  - Optional RMSNorm normalization for query and key projections, following the Wan2.2-5B model.
+  - Optional non-linearities (gelu_tanh, silu).
+  - Optional fused output INT4 quantization (qout and oscales) in the epilogue to chain inter-layer execution without HBM round-trips.
+[USER_INSTRUCTIONS_END]
+*/
+
+// [EVOLVE_START]
+namespace syclex = sycl::ext::oneapi::experimental;
+namespace intelex = sycl::ext::intel::experimental;
+
+constexpr int kSG = 16;       // sub-group size required by DPAS
+constexpr int kTileM = 8;     // DPAS repeat count: rows per sub-group
+constexpr int kTilesN = 4;    // 16-column DPAS tiles per sub-group: 64 columns = one quant group
+constexpr int kGroup = 64;
+
+template <typename T, int N>
+using vec_t = T __attribute__((ext_vector_type(N)));
+using f32x8 = vec_t<float, 8>;
+using s32x8 = vec_t<int32_t, 8>;
+using u32x8 = vec_t<uint32_t, 8>;
+using u16x8 = vec_t<uint16_t, 8>;
+using coord2 = vec_t<int, 2>;  // (column, row) of a 2D block message
+
+using MmaInt4 = cute::XE_DPAS_TT<kTileM, int32_t, cute::int4_t, cute::int4_t>;
+static_assert(MmaInt4::K == kGroup, "one INT4 DPAS step must span exactly one quantization group");
+
+// 2D block messages on a row-major surface (byte width/pitch, row count); rows outside the
+// surface read as zero and are not written. Element m of lane l = (row + m, column + l), and
+// for the v2 read element 16 b + m = (row + m, column + 16 b + l).
+using u16x32 = vec_t<uint16_t, 32>;
+SYCL_EXTERNAL extern "C" u16x32 __builtin_IB_subgroup_block_read_flat_u16_m16k16v2(
+    intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord);
+SYCL_EXTERNAL extern "C" u32x8 __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
+    intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord);
+SYCL_EXTERNAL extern "C" void __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
+    intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord, u16x8 data);
+
+inline float bf16_to_f32(uint16_t v) {
+    return sycl::bit_cast<float>(uint32_t(v) << 16);
+}
+
+inline uint16_t f32_to_bf16(float v) {
+    uint32_t bits = sycl::bit_cast<uint32_t>(v);
+    return uint16_t((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+inline float gelu_tanh(float x) {
+    return 0.5f * x * (1.0f + sycl::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+// Round half away from zero, clamped to [-8, 7], as the low nibble.
+inline uint32_t quant_nibble(float v, float inv_scale) {
+    const float s = v * inv_scale;
+    return uint32_t(sycl::clamp(int(s >= 0.0f ? s + 0.5f : s - 0.5f), -8, 7)) & 0xFu;
+}
+
+// Register images (one vector element per row / dword, all 16 lanes):
+//   INT4 A: element m of lane l = K [4l, 4l + 4) of row m.
+//   INT4 B: dword d of lane n = K [8d, 8d + 8) of column n, low nibble first.
+//   BF16 A: element m of lane l = A[m][l].  BF16 B: dword d of lane n = B[2d..2d+1][n],
+//   i.e. 32 contiguous bytes of row n of a row-major [N, K] matrix.
+//   D: element m of lane n = D[m][n].
+inline void dpas_s4(s32x8& d, MmaInt4::AVector const& a, u32x8 const& b) {
+#ifdef __SYCL_DEVICE_ONLY__
+    asm("{\n"
+        ".decl DST     v_type=G type=d  num_elts=128 alias=<%0,0>\n"
+        ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+        ".decl SRC2_UD v_type=G type=UD num_elts=64  alias=<%1,0>\n"
+        "dpas.s4.s4.8.8 (M1, 16) DST.0 %%null.0 SRC1_UD.0 SRC2_UD(0,0)\n"
+        "}\n"
+        : "=rw"(d) : "rw"(a), "rw"(b));
+#endif
+}
+
+inline void dpas_bf16(f32x8& d, u16x8 const& a, u32x8 const& b) {
+#ifdef __SYCL_DEVICE_ONLY__
+    asm("{\n"
+        ".decl DST     v_type=G type=f  num_elts=128 alias=<%0,0>\n"
+        ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+        ".decl SRC2_UD v_type=G type=UD num_elts=64  alias=<%1,0>\n"
+        "dpas.bf.bf.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD(0,0)\n"
+        "}\n"
+        : "+rw"(d) : "rw"(a), "rw"(b));
+#endif
+}
+
+// Lane l receives src[16 i + l] as element i.
+template <typename T, int N>
+inline sycl::vec<T, N> block_load(sycl::sub_group sg, const T* src) {
+    sycl::vec<T, N> v;
+    syclex::group_load(
+        sg, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(src), v,
+        syclex::properties{syclex::data_placement_striped, syclex::contiguous_memory, syclex::full_group});
+    return v;
+}
+
+inline u32x8 load_b_image(sycl::sub_group sg, const uint32_t* src) {
+    const auto v = block_load<uint32_t, 8>(sg, src);
+    u32x8 r;
+    #pragma unroll
+    for (int d = 0; d < 8; ++d) r[d] = v[d];
+    return r;
+}
+
+// Group-64 INT4 quantization of an 8 x 64 tile held as v[t][m] = (row m, column 16 t + lane).
+// Row m (if m < rows) is written as 32 packed bytes (even column in the low nibble) at
+// dst + m * ld. The scale is amax * rho / 7 (rho < 1 clips outliers). Returns the scale of
+// row lane / 2.
+inline float quantize_tile8x64(sycl::sub_group sg, int lane, const float (&v)[kTilesN][kTileM],
+                               int8_t* dst, size_t ld, int rows, float rho) {
+    float amax[kTileM];
+    #pragma unroll
+    for (int m = 0; m < kTileM; ++m)
+        amax[m] = sycl::fmax(sycl::fmax(sycl::fabs(v[0][m]), sycl::fabs(v[1][m])),
+                             sycl::fmax(sycl::fabs(v[2][m]), sycl::fabs(v[3][m])));
+
+    // Sub-group collectives: per-row max across lanes.
+    float scale_row[kTileM];
+    float inv_row[kTileM];
+    #pragma unroll
+    for (int m = 0; m < kTileM; ++m) {
+        const float mx = sycl::reduce_over_group(sg, amax[m], sycl::maximum<float>());
+        const float s = sycl::fmax(mx * rho / 7.0f, 1e-8f);
+        scale_row[m] = s;
+        inv_row[m] = 1.0f / s;
+    }
+
+    // Row pair p: lane L stores dword L % 8 (columns 8 (L % 8) .. + 8) of row 2 p + L / 8.
+    #pragma unroll
+    for (int p = 0; p < kTileM / 2; ++p) {
+        uint32_t d = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int m = 2 * p + half;
+            const float inv = inv_row[m];
+            #pragma unroll
+            for (int t = 0; t < kTilesN; ++t) {
+                const uint32_t q = quant_nibble(v[t][m], inv);
+                uint32_t w = q | (sycl::shift_group_left(sg, q, 1) << 4);  // even lanes: 1 byte
+                w |= sycl::shift_group_left(sg, w, 2) << 8;                 // lanes 4i: 2 bytes
+                w |= sycl::shift_group_left(sg, w, 4) << 16;                // lanes 8h: dword 2t + h
+                const uint32_t pick = sycl::select_from_group(sg, w, 8 * (lane & 1));
+                if ((lane >> 3) == half && ((lane & 7) >> 1) == t) d = pick;
+            }
+        }
+        const int row = 2 * p + (lane >> 3);
+        if (row < rows) *reinterpret_cast<uint32_t*>(dst + row * ld + 4 * (lane & 7)) = d;
+    }
+    return scale_row[lane >> 1];
+}
+
+// Lane-local group-64 INT4 quantization of 64 bf16 values held as 32 dwords (column 2i in the
+// low half of dword i). packed[j] receives columns 8j .. 8j + 7, low nibble first. Values are
+// multiplied by sinv[column] (if non-null, uniform across lanes) before quantization, and the
+// scale is amax * rho / 7.
+inline float quantize_group_lane(const u32x8 (&x)[kTilesN], u32x8& packed, const float* sinv, float rho) {
+    float amax = 0.0f;
+    #pragma unroll
+    for (int kb = 0; kb < kTilesN; ++kb) {
+        #pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            float lo = sycl::bit_cast<float>(x[kb][d] << 16);
+            float hi = sycl::bit_cast<float>(x[kb][d] & 0xFFFF0000u);
+            if (sinv != nullptr) {
+                lo *= sinv[16 * kb + 2 * d];
+                hi *= sinv[16 * kb + 2 * d + 1];
+            }
+            amax = sycl::fmax(amax, sycl::fmax(sycl::fabs(lo), sycl::fabs(hi)));
+        }
+    }
+    const float scale = sycl::fmax(amax * rho / 7.0f, 1e-8f);
+    const float inv = 1.0f / scale;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        uint32_t w = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int kb = j / 2, dd = 4 * (j % 2) + i;
+            const uint32_t d = x[kb][dd];
+            float lo = sycl::bit_cast<float>(d << 16);
+            float hi = sycl::bit_cast<float>(d & 0xFFFF0000u);
+            if (sinv != nullptr) {
+                lo *= sinv[16 * kb + 2 * dd];
+                hi *= sinv[16 * kb + 2 * dd + 1];
+            }
+            w |= (quant_nibble(lo, inv) | (quant_nibble(hi, inv) << 4)) << (8 * i);
+        }
+        packed[j] = w;
+    }
+    return scale;
+}
+
+// ---------------------------------------------------------------------------------------
+// Prologue: optional INT4 quantization of x and lora_act = x @ lora_a^T, in one pass over x.
+// Lane n of a sub-group owns row n of a 16-row block, so the row's 64-column K group loads
+// straight into the BF16 DPAS B operand and quantizes without cross-lane traffic; lora_a
+// (row-major [R, K]) is the A operand via 2D block loads. A work-group of kProSGs sub-groups
+// splits the rank in kRS parts and K in kKS contiguous ranges; partial products are reduced
+// through SLM. Activation scales are stored group-major: x_scales_t[g * xs_ld + row].
+// ---------------------------------------------------------------------------------------
+constexpr int kProRows = kSG;
+constexpr int kProSGs = 8;
+
+template <int RT, bool QUANT> class PrologueKernel;
+
+template <int RT, bool QUANT>
+void launch_prologue(sycl::queue& q, const uint16_t* x, int M, int K, int8_t* x_q, float* x_scales_t, int xs_ld,
+                     const float* smooth_inv, float rho, const uint16_t* lora_a, float* lora_act) {
+    constexpr int R = RT * 16;
+    constexpr int kRankBlocks = R / 8;                            // 8-row DPAS tiles of lora_a
+    constexpr int kRS = kRankBlocks > 8 ? kRankBlocks / 8 : 1;    // keeps <= 8 accumulators
+    constexpr int RB = kRankBlocks / kRS;
+    constexpr int kPart = RB * kTileM * kSG;                     // floats of one sub-group's partial
+    constexpr int kKS = kProSGs / kRS;
+    static_assert(RB % 2 == 0, "rank must be a multiple of 16");
+    const int G = K / kGroup;
+    const int blocks = (M + kProRows - 1) / kProRows;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(RB > 0 ? kProSGs * kPart : 1), h);
+        h.parallel_for<PrologueKernel<RT, QUANT>>(
+            sycl::nd_range<1>(size_t(blocks) * kProSGs * kSG, kProSGs * kSG),
+            syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<(RB > 4 ? 256 : 128)>},
+            [=](sycl::nd_item<1> item) {
+                auto sg = item.get_sub_group();
+                const int lane = sg.get_local_id()[0];
+                const int s = sg.get_group_id()[0];
+                const int rs = s % kRS, ks = s / kRS;
+                const int m0 = int(item.get_group(0)) * kProRows;
+                const int row = m0 + lane;
+                const uint16_t* x_row = x + size_t(sycl::min(row, M - 1)) * K;
+
+                f32x8 acc[RB > 0 ? RB : 1] = {};
+                const int g_begin = ks * G / kKS, g_end = (ks + 1) * G / kKS;
+                for (int g = g_begin; g < g_end; ++g) {
+                    u32x8 xb[kTilesN];
+                    #pragma unroll
+                    for (int kb = 0; kb < kTilesN; ++kb) xb[kb] = *reinterpret_cast<const u32x8*>(x_row + g * kGroup + 16 * kb);
+                    if constexpr (QUANT) {
+                        if ((g - g_begin) % kRS == rs) {
+                            u32x8 packed;
+                            const float scale = quantize_group_lane(
+                                xb, packed, smooth_inv != nullptr ? smooth_inv + g * kGroup : nullptr, rho);
+                            if (row < M) {
+                                *reinterpret_cast<u32x8*>(x_q + size_t(row) * (K / 2) + g * 32) = packed;
+                                x_scales_t[size_t(g) * xs_ld + row] = scale;
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < RB / 2; ++j) {
+                        #pragma unroll
+                        for (int half = 0; half < 2; ++half) {
+                            // 16 lora_a rows x 32 columns: element 16 b + r = (rank r0 + r, column 16 b + lane).
+                            const auto la = __builtin_IB_subgroup_block_read_flat_u16_m16k16v2(
+                                intptr_t(lora_a), K * 2 - 1, R - 1, K * 2 - 1,
+                                coord2{g * kGroup + 32 * half, (rs * RB + 2 * j) * kTileM});
+                            #pragma unroll
+                            for (int b = 0; b < 2; ++b) {
+                                #pragma unroll
+                                for (int rr = 0; rr < 2; ++rr) {
+                                    u16x8 a;
+                                    #pragma unroll
+                                    for (int m = 0; m < kTileM; ++m) a[m] = la[16 * b + kTileM * rr + m];
+                                    dpas_bf16(acc[2 * j + rr], a, xb[2 * half + b]);
+                                }
+                            }
+                        }
+                    }
+                }
+                if constexpr (RB > 0) {
+                    // acc[rb][m] of lane n = lora_act[m0 + n][(rs * RB + rb) * 8 + m].
+                    #pragma unroll
+                    for (int rb = 0; rb < RB; ++rb) {
+                        #pragma unroll
+                        for (int m = 0; m < kTileM; ++m) slm[s * kPart + (rb * kTileM + m) * kSG + lane] = acc[rb][m];
+                    }
+                    sycl::group_barrier(item.get_group());
+                    for (int i = int(item.get_local_id(0)); i < kRS * kPart; i += kProSGs * kSG) {
+                        const int part = i / kPart, j = i % kPart;
+                        float sum = 0.0f;
+                        #pragma unroll
+                        for (int k = 0; k < kKS; ++k) sum += slm[(k * kRS + part) * kPart + j];
+                        const int out_row = m0 + j % kSG;
+                        if (out_row < M) lora_act[size_t(out_row) * R + part * RB * kTileM + j / kSG] = sum;
+                    }
+                }
+            });
+    });
+}
+
+template <bool QUANT>
+void dispatch_prologue(sycl::queue& q, const uint16_t* x, int M, int K, int8_t* x_q, float* x_scales_t, int xs_ld,
+                       const float* si, float rho, const uint16_t* lora_a, int R, float* lora_act) {
+    switch (R) {
+        case 0:   launch_prologue<0, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        case 16:  launch_prologue<1, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        case 32:  launch_prologue<2, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        case 64:  launch_prologue<4, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        case 96:  launch_prologue<6, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        case 128: launch_prologue<8, QUANT>(q, x, M, K, x_q, x_scales_t, xs_ld, si, rho, lora_a, lora_act); break;
+        default:  TORCH_CHECK(false, "LoRA rank (total) must be 16, 32, 64, 96 or 128, got ", R);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Main GEMM: out[M, N] = act(dequant(x_q @ W^T) + lora_act @ lora_b^T + bias), with optional
+// fused INT4 output quantization and per-(row, 64 columns) sums of squares for RMSNorm.
+// Each sub-group owns an 8 x KF_N_TILE output tile.
+// ---------------------------------------------------------------------------------------
+enum Act : int { kActNone, kActGeluTanh, kActSilu };
+
+struct GemmArgs {
+    const int8_t* x_q;
+    const float* x_scales;      // [M, K/64] with strides (xs_row, xs_group)
+    int xs_row, xs_group;
+    const uint32_t* w_dpas_b;   // [N/16, K/64, 8, 16]
+    const float* w_scales_t;    // [K/64, N]
+    const float* lora_act;      // [M, R] with row stride lora_ld, or null
+    int lora_ld;
+    const uint16_t* lora_b;     // [N, R]
+    int R;
+    const uint16_t* bias;       // [N] or null
+    uint16_t* out;              // [M, N]
+    int8_t* qout;               // [M, N/2] or null
+    float* oscales_t;           // [N/64][os_ld], group-major
+    int os_ld;
+    const float* q_smooth_inv;  // [N] multiplier applied before output quantization, or null
+    float q_rho;                // output quantization clipping ratio
+    float* row_sq;              // [M, N/64] or null
+    int M, N, K, act;
+};
+
+class GemmKernel;
+
+// Epilogue of one 8 x 64 block (rows m0.., columns 64 ng..): LoRA up, bias, activation, BF16
+// store, optional INT4 output quantization and RMSNorm partial sums.
+inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8 (&acc)[kTilesN], int m0, int ng) {
+    const int M = p.M, N = p.N, n0 = ng * kGroup;
+    // LoRA up: acc += bf16(lora_act[rows]) @ lora_b[cols]^T on BF16 DPAS. It accumulates into a
+    // separate register block: binding acc to the asm operand forces copies of it in the K loop.
+    if (p.lora_act != nullptr) {
+        #pragma unroll
+        for (int t = 0; t < kTilesN; ++t) {
+            f32x8 up = {};
+            const uint16_t* b_row = p.lora_b + size_t(n0 + 16 * t + lane) * p.R;
+            for (int kb = 0; kb < p.R / 16; ++kb) {
+                const auto la = __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
+                    intptr_t(p.lora_act), p.R * 4 - 1, M - 1, p.lora_ld * 4 - 1, coord2{kb * 16, m0});
+                u16x8 a;
+                #pragma unroll
+                for (int m = 0; m < kTileM; ++m) a[m] = f32_to_bf16(sycl::bit_cast<float>(la[m]));
+                dpas_bf16(up, a, *reinterpret_cast<const u32x8*>(b_row + kb * 16));
+            }
+            acc[t] += up;
+        }
+    }
+
+    // Bias, activation, BF16 output.
+    // Fast-path: if neither output quantization nor RMSNorm is requested, avoid the extra
+    // BF16->F32 roundtrip scratch (v[][]) to reduce register pressure.
+    const bool need_aux = (p.qout != nullptr) || (p.row_sq != nullptr);
+    if (!need_aux) {
+        #pragma unroll
+        for (int t = 0; t < kTilesN; ++t) {
+            const float bias = p.bias != nullptr ? bf16_to_f32(p.bias[n0 + 16 * t + lane]) : 0.0f;
+            u16x8 y16;
+            #pragma unroll
+            for (int m = 0; m < kTileM; ++m) {
+                float y = acc[t][m] + bias;
+                if (p.act == kActGeluTanh) y = gelu_tanh(y);
+                else if (p.act == kActSilu) y = y / (1.0f + sycl::exp(-y));
+                y16[m] = f32_to_bf16(y);
+            }
+            __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
+                intptr_t(p.out), N * 2 - 1, M - 1, N * 2 - 1, coord2{n0 + 16 * t, m0}, y16);
+        }
+        return;
+    }
+
+    // Slow-path: materialize BF16-rounded outputs for correct INT4 quant + RMSNorm.
+    float v[kTilesN][kTileM];
+    #pragma unroll
+    for (int t = 0; t < kTilesN; ++t) {
+        const float bias = p.bias != nullptr ? bf16_to_f32(p.bias[n0 + 16 * t + lane]) : 0.0f;
+        u16x8 y16;
+        #pragma unroll
+        for (int m = 0; m < kTileM; ++m) {
+            float y = acc[t][m] + bias;
+            if (p.act == kActGeluTanh) y = gelu_tanh(y);
+            else if (p.act == kActSilu) y = y / (1.0f + sycl::exp(-y));
+            y16[m] = f32_to_bf16(y);
+            v[t][m] = bf16_to_f32(y16[m]);
+        }
+        __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
+            intptr_t(p.out), N * 2 - 1, M - 1, N * 2 - 1, coord2{n0 + 16 * t, m0}, y16);
+    }
+
+    const int rows = sycl::min(kTileM, M - m0);
+    const bool owner = (lane & 1) == 0 && (lane >> 1) < rows;  // lane 2 r holds row r's reductions
+    if (p.qout != nullptr) {
+        float vq[kTilesN][kTileM];
+        #pragma unroll
+        for (int t = 0; t < kTilesN; ++t) {
+            const float si = p.q_smooth_inv != nullptr ? p.q_smooth_inv[n0 + 16 * t + lane] : 1.0f;
+            #pragma unroll
+            for (int m = 0; m < kTileM; ++m) vq[t][m] = v[t][m] * si;
+        }
+        const float scale =
+            quantize_tile8x64(sg, lane, vq, p.qout + size_t(m0) * (N / 2) + ng * 32, N / 2, rows, p.q_rho);
+        if (owner) p.oscales_t[size_t(ng) * p.os_ld + m0 + (lane >> 1)] = scale;
+    }
+    if (p.row_sq != nullptr) {
+        float sq[kTileM];
+        #pragma unroll
+        for (int m = 0; m < kTileM; ++m)
+            sq[m] = v[0][m] * v[0][m] + v[1][m] * v[1][m] + v[2][m] * v[2][m] + v[3][m] * v[3][m];
+
+        float total_row[kTileM];
+        #pragma unroll
+        for (int m = 0; m < kTileM; ++m) total_row[m] = sycl::reduce_over_group(sg, sq[m], sycl::plus<float>());
+
+        if (owner) p.row_sq[size_t(m0 + (lane >> 1)) * (N / kGroup) + ng] = total_row[lane >> 1];
+    }
+}
+
+void launch_gemm(sycl::queue& q, const GemmArgs& p) {
+    constexpr int kNG = KF_N_TILE / kGroup;   // 64-column groups per sub-group
+    constexpr int kNT = kNG * kTilesN;        // 16-column DPAS tiles per sub-group
+    using namespace cute;
+    using TiledMma = typename TiledMMAHelper<MMA_Atom<MmaInt4>, Layout<Shape<Int<kTileM>, _16, _64>>,
+                                             Layout<Shape<_1, _1, _1>>>::TiledMMA;
+    const int grid_m = (p.M + kTileM - 1) / kTileM;
+    const int grid_n = p.N / KF_N_TILE;
+    // Work-group = sg_m sub-groups along M (sharing B tiles) x sg_n along N (sharing A tiles).
+    // Measured on B70: deep-K / narrow-N layers (FFN down) prefer 16 x 1, the others 4 x 4.
+    const bool tall = p.K > p.N || grid_n % 4 != 0;
+    const int sg_m = tall ? 16 : 4, sg_n = tall ? 1 : 4;
+    const sycl::range<2> local(sg_n * sg_m, kSG);
+    const sycl::range<2> global(grid_n * sg_m, ((grid_m + sg_m - 1) / sg_m) * kSG);
+
+    q.parallel_for<GemmKernel>(
+        sycl::nd_range<2>(global, local),
+        syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<KF_GRF>},
+        [=](sycl::nd_item<2> item) {
+            auto sg = item.get_sub_group();
+            const int lane = item.get_local_id(1);
+            const int sg_id = item.get_local_id(0);
+            const int wg_m = item.get_group(1) * sg_m + sg_id % sg_m;
+            const int wg_n = item.get_group(0) * sg_n + sg_id / sg_m;
+            const int M = p.M, N = p.N, G = p.K / kGroup;
+            const int m0 = wg_m * kTileM;
+            const int n0 = wg_n * KF_N_TILE;
+            if (m0 >= M) return;
+
+            // A: CuTe 2D block load of the packed INT4 activations (its reorder is a no-op).
+            TiledMma mma{};
+            auto tensor_A = make_tensor(make_gmem_ptr(reinterpret_cast<const int4_t*>(p.x_q)),
+                                        make_shape(M, p.K), make_stride(p.K, _1{}));
+            auto copy_a = make_block_2d_copy_A(mma, tensor_A);
+            Tensor gA = local_tile(make_identity_tensor(tensor_A.shape()), select<0, 2>(mma.tile_mnk()), make_coord(wg_m, _));
+            auto thr_copy_a = copy_a.get_slice(lane);
+            auto tCrA = mma.get_slice(lane).partition_sg_fragment_A(gA(_, _, 0));
+            auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+            Tensor tAgA = thr_copy_a.partition_S(gA);
+
+            // B: each (16-column tile, K group) is a 512-byte register image -> one block read.
+            // Keep address arithmetic in 32-bit where possible (BMG has relatively expensive int64 ALU).
+            const uint32_t b_stride = uint32_t(G) * 128u;
+            const uint32_t* b_src = p.w_dpas_b + uint32_t(n0 / 16) * b_stride;
+            // Scales are software-pipelined one K step ahead: lane l gets the weight scales of
+            // columns 16 t + l; lane m < 8 gets the scale of row m0 + m.
+            const float* sw_next = p.w_scales_t + n0;
+            const float* xs_next = p.x_scales + size_t(sycl::min(m0 + (lane & (kTileM - 1)), M - 1)) * p.xs_row;
+            auto s_w_next = block_load<float, kNT>(sg, sw_next);
+            float s_x_next = *xs_next;
+
+            f32x8 acc[kNG][kTilesN] = {};
+            for (int g = 0; g < G; ++g) {
+                copy(copy_a, tAgA(_, _, _, g), tArA);
+                u32x8 b[kNT];
+                const uint32_t* b_ptr = b_src + uint32_t(g) * 128u;
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t) b[t] = load_b_image(sg, b_ptr + uint32_t(t) * b_stride);
+
+                const auto s_w = s_w_next;
+                const auto s_x = s_x_next;
+                if (g + 1 < G) {
+                    sw_next += N;
+                    xs_next += p.xs_group;
+                }
+                s_w_next = block_load<float, kNT>(sg, sw_next);
+                s_x_next = *xs_next;
+
+                reorder(tArA, tCrA);
+                const auto& a = recast<MmaInt4::AVector>(tCrA)(0);
+                float sx[kTileM];
+                #pragma unroll
+                for (int m = 0; m < kTileM; ++m) sx[m] = sycl::select_from_group(sg, s_x, m);
+                #pragma unroll
+                for (int ng = 0; ng < kNG; ++ng) {
+                    s32x8 c[kTilesN];
+                    #pragma unroll
+                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a, b[ng * kTilesN + t]);
+                    #pragma unroll
+                    for (int t = 0; t < kTilesN; ++t) {
+                        const float sw = s_w[ng * kTilesN + t];
+                        #pragma unroll
+                        for (int m = 0; m < kTileM; ++m) acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx[m], acc[ng][t][m]);
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int ng = 0; ng < kNG; ++ng) gemm_epilogue(sg, lane, p, acc[ng], m0, n0 / kGroup + ng);
+        });
+}
+
+// ---------------------------------------------------------------------------------------
+// RMSNorm: out[row] *= rsqrt(mean(out[row]^2) + eps) * w, from the GEMM's partial sums.
+// One sub-group per row; each lane handles 8 contiguous columns per step.
+// ---------------------------------------------------------------------------------------
+class RmsNormKernel;
+
+void launch_rmsnorm(sycl::queue& q, uint16_t* out, const float* row_sq, const uint16_t* w, int M, int N, float eps) {
+    constexpr int kRowsPerWG = 16;
+    const int parts = N / kGroup;
+    q.parallel_for<RmsNormKernel>(
+        sycl::nd_range<1>(size_t((M + kRowsPerWG - 1) / kRowsPerWG) * kRowsPerWG * kSG, kRowsPerWG * kSG),
+        syclex::properties{syclex::sub_group_size<kSG>},
+        [=](sycl::nd_item<1> item) {
+            auto sg = item.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int row = int(item.get_global_id(0) / kSG);
+            if (row >= M) return;
+            float sq = 0.0f;
+            for (int j = lane; j < parts; j += kSG) sq += row_sq[size_t(row) * parts + j];
+            sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
+            const float inv_rms = sycl::rsqrt(sq / float(N) + eps);
+            using u16x8v = sycl::vec<uint16_t, 8>;
+            for (int c = lane * 8; c < N; c += kSG * 8) {
+                auto* o = reinterpret_cast<u16x8v*>(out + size_t(row) * N + c);
+                const u16x8v y = *o;
+                const u16x8v nw = *reinterpret_cast<const u16x8v*>(w + c);
+                u16x8v r;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) r[i] = f32_to_bf16(bf16_to_f32(y[i]) * inv_rms * bf16_to_f32(nw[i]));
+                *o = r;
+            }
+        });
+}
+
+// [EVOLVE_END]
+
+// ---------------------------------------------------------------------------------------
+// Host bindings
+// ---------------------------------------------------------------------------------------
+namespace {
+
+const uint16_t* bf16_ptr(const torch::Tensor& t) {
+    return reinterpret_cast<const uint16_t*>(t.data_ptr<c10::BFloat16>());
+}
+
+void check_bf16(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_xpu() && t.scalar_type() == torch::kBFloat16 && t.is_contiguous(), name,
+                " must be a contiguous XPU bfloat16 tensor");
+}
+
+// Per-(row, group) scales are logically [M, G] but stored group-major (a transposed view), so
+// the 8 row scales a GEMM sub-group needs per K step are contiguous.
+torch::Tensor new_group_major(int M, int G, const torch::TensorOptions& opts) {
+    return torch::empty({G, M}, opts.dtype(torch::kFloat32)).t();
+}
+
+struct Prologue {
+    torch::Tensor x_q, x_scales, lora_act;
+};
+
+const float* smooth_ptr(const c10::optional<torch::Tensor>& s, int64_t n, const char* name) {
+    if (!s.has_value()) return nullptr;
+    TORCH_CHECK(s->is_xpu() && s->scalar_type() == torch::kFloat32 && s->is_contiguous() && s->dim() == 1
+                && s->size(0) == n, name, " must be a contiguous XPU float32 tensor of length ", n);
+    return s->data_ptr<float>();
+}
+
+// Quantizes x * smooth_inv (if `quantize`, group scale amax * rho / 7) and computes
+// lora_act = x @ lora_a^T (if lora_a, on the unsmoothed x) in one pass over x.
+Prologue run_prologue(sycl::queue& q, const torch::Tensor& x, const c10::optional<torch::Tensor>& lora_a, bool quantize,
+                      const c10::optional<torch::Tensor>& smooth_inv = c10::nullopt, float rho = 1.0f) {
+    check_bf16(x, "x");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) % kGroup == 0, "x must be [M, K] with K % 64 == 0");
+    const int M = x.size(0), K = x.size(1);
+    const auto opts = x.options();
+    const float* si = smooth_ptr(smooth_inv, K, "smooth_inv");
+    Prologue r;
+    int R = 0;
+    if (lora_a.has_value()) {
+        check_bf16(*lora_a, "lora_a");
+        TORCH_CHECK(lora_a->dim() == 2 && lora_a->size(1) == K, "lora_a must be [R, K]");
+        R = lora_a->size(0);
+        r.lora_act = torch::empty({M, R}, opts.dtype(torch::kFloat32));
+    }
+    if (quantize) {
+        r.x_q = torch::empty({M, K / 2}, opts.dtype(torch::kInt8));
+        r.x_scales = new_group_major(M, K / kGroup, opts);
+    }
+    if (!quantize && R == 0) return r;
+    const uint16_t* la = R > 0 ? bf16_ptr(*lora_a) : nullptr;
+    float* act = R > 0 ? r.lora_act.data_ptr<float>() : nullptr;
+    if (quantize) {
+        dispatch_prologue<true>(q, bf16_ptr(x), M, K, r.x_q.data_ptr<int8_t>(), r.x_scales.data_ptr<float>(),
+                                r.x_scales.stride(1), si, rho, la, R, act);
+    } else {
+        dispatch_prologue<false>(q, bf16_ptr(x), M, K, nullptr, nullptr, 0, nullptr, 1.0f, la, R, act);
+    }
+    return r;
+}
+
+int parse_act(const std::string& act) {
+    if (act == "gelu_tanh") return kActGeluTanh;
+    if (act == "silu") return kActSilu;
+    TORCH_CHECK(act == "none", "unsupported activation ", act);
+    return kActNone;
+}
+
+}  // namespace
+
+py::object torch_svdquant_w4a4_gemm(
+    torch::Tensor x,
+    torch::Tensor w_dpas_b,
+    torch::Tensor w_scales,
+    c10::optional<torch::Tensor> x_scales_opt,
+    c10::optional<torch::Tensor> lora_a_opt,
+    c10::optional<torch::Tensor> lora_b_opt,
+    c10::optional<torch::Tensor> bias_opt,
+    c10::optional<torch::Tensor> norm_w_opt,
+    float norm_eps,
+    std::string activation,
+    bool fuse_quant_out,
+    c10::optional<torch::Tensor> x_bf16_opt,
+    c10::optional<torch::Tensor> x_lora_opt,
+    c10::optional<torch::Tensor> x_smooth_inv_opt,
+    float x_rho,
+    c10::optional<torch::Tensor> out_smooth_inv_opt,
+    float out_rho
+) {
+    sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+    TORCH_CHECK(w_dpas_b.is_xpu() && w_dpas_b.scalar_type() == torch::kInt32 && w_dpas_b.dim() == 4 && w_dpas_b.is_contiguous(),
+                "w_dpas_b must be the contiguous XPU int32 [N/16, K/64, 8, 16] DPAS B image "
+                "(see convert_int4_weights_to_dpas_b)");
+    const bool x_is_int4 = x.scalar_type() == torch::kInt8;
+    const int M = x.size(0);
+    const int K = x_is_int4 ? x.size(1) * 2 : x.size(1);
+    const int N = w_dpas_b.size(0) * 16;
+    const auto opts = x.options();
+    TORCH_CHECK(w_dpas_b.sizes() == torch::IntArrayRef({N / 16, K / kGroup, 8, 16}), "w_dpas_b must be [N/16, K/64, 8, 16]");
+    TORCH_CHECK(N % KF_N_TILE == 0, "N must be a multiple of N_TILE = ", KF_N_TILE);
+    TORCH_CHECK(w_scales.is_xpu() && w_scales.scalar_type() == torch::kFloat32 && w_scales.is_contiguous()
+                && w_scales.sizes() == torch::IntArrayRef({K / kGroup, N}),
+                "w_scales must be the contiguous XPU float32 [K/64, N] scales (see convert_w_scales_to_dpas)");
+
+    const bool has_lora = lora_b_opt.has_value();
+    Prologue pro;
+    torch::Tensor x_q, x_scales, lora_act;
+    if (x_is_int4) {
+        TORCH_CHECK(x.is_xpu() && x.is_contiguous(), "x must be a contiguous XPU tensor");
+        TORCH_CHECK(x_scales_opt.has_value() && x_scales_opt->is_xpu()
+                    && x_scales_opt->sizes() == torch::IntArrayRef({M, K / kGroup}),
+                    "XPU x_scales [M, K/64] must be provided when x is INT4");
+        x_q = x;
+        x_scales = x_scales_opt->to(torch::kFloat32);  // no-op for float32; any strides are accepted
+        if (has_lora && !x_lora_opt.has_value()) {
+            TORCH_CHECK(x_bf16_opt.has_value() && lora_a_opt.has_value(),
+                        "LoRA on INT4 input needs x_lora, or x_bf16 and lora_a");
+            pro = run_prologue(q, *x_bf16_opt, lora_a_opt, false);
+        }
+    } else {
+        TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be BF16 or INT8 (packed INT4)");
+        pro = run_prologue(q, x, (has_lora && !x_lora_opt.has_value()) ? lora_a_opt : c10::nullopt, true,
+                           x_smooth_inv_opt, x_rho);
+        x_q = pro.x_q;
+        x_scales = pro.x_scales;
+    }
+
+    GemmArgs p{};
+    if (has_lora) {
+        const auto& lb = *lora_b_opt;
+        check_bf16(lb, "lora_b");
+        lora_act = x_lora_opt.has_value() ? *x_lora_opt : pro.lora_act;
+        p.R = lb.size(1);
+        TORCH_CHECK(lb.size(0) == N && p.R % 16 == 0, "lora_b must be [N, R] with R % 16 == 0");
+        TORCH_CHECK(lora_act.is_xpu() && lora_act.scalar_type() == torch::kFloat32 && lora_act.stride(1) == 1
+                    && lora_act.size(0) == M && lora_act.size(1) == p.R && lora_act.stride(0) % 16 == 0
+                    && reinterpret_cast<uintptr_t>(lora_act.data_ptr()) % 64 == 0,
+                    "x_lora must be an XPU float32 [M, R] tensor with unit column stride, a row stride "
+                    "that is a multiple of 16 and a 64-byte aligned base");
+        p.lora_act = lora_act.data_ptr<float>();
+        p.lora_ld = lora_act.stride(0);
+        p.lora_b = bf16_ptr(lb);
+    }
+
+    auto out = torch::empty({M, N}, opts.dtype(torch::kBFloat16));
+    torch::Tensor qout, oscales, row_sq;
+    if (fuse_quant_out) {
+        qout = torch::empty({M, N / 2}, opts.dtype(torch::kInt8));
+        oscales = new_group_major(M, N / kGroup, opts);
+        p.qout = qout.data_ptr<int8_t>();
+        p.oscales_t = oscales.data_ptr<float>();
+        p.os_ld = oscales.stride(1);
+        p.q_smooth_inv = smooth_ptr(out_smooth_inv_opt, N, "out_smooth_inv");
+        p.q_rho = out_rho;
+    }
+    if (norm_w_opt.has_value()) {
+        check_bf16(*norm_w_opt, "norm_weight");
+        row_sq = torch::empty({M, N / kGroup}, opts.dtype(torch::kFloat32));
+        p.row_sq = row_sq.data_ptr<float>();
+    }
+    if (bias_opt.has_value()) {
+        check_bf16(*bias_opt, "bias");
+        p.bias = bf16_ptr(*bias_opt);
+    }
+    p.x_q = x_q.data_ptr<int8_t>();
+    p.x_scales = x_scales.data_ptr<float>();
+    p.xs_row = x_scales.stride(0);
+    p.xs_group = x_scales.stride(1);
+    p.w_dpas_b = reinterpret_cast<const uint32_t*>(w_dpas_b.data_ptr<int32_t>());
+    p.w_scales_t = w_scales.data_ptr<float>();
+    p.out = reinterpret_cast<uint16_t*>(out.data_ptr<c10::BFloat16>());
+    p.M = M;
+    p.N = N;
+    p.K = K;
+    p.act = parse_act(activation);
+    launch_gemm(q, p);
+
+    if (norm_w_opt.has_value()) launch_rmsnorm(q, p.out, p.row_sq, bf16_ptr(*norm_w_opt), M, N, norm_eps);
+
+    if (fuse_quant_out) return py::make_tuple(out, qout, oscales);
+    return py::cast(out);
+}
+
+py::tuple torch_quantize_activation_int4(torch::Tensor x, c10::optional<torch::Tensor> lora_a,
+                                         c10::optional<torch::Tensor> smooth_inv, float rho) {
+    auto r = run_prologue(c10::xpu::getCurrentXPUStream().queue(), x, lora_a, true, smooth_inv, rho);
+    if (lora_a.has_value()) return py::make_tuple(r.x_q, r.x_scales, r.lora_act);
+    return py::make_tuple(r.x_q, r.x_scales);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("svdquant_w4a4_gemm", &torch_svdquant_w4a4_gemm,
+          py::arg("x"),
+          py::arg("w_dpas_b"),
+          py::arg("w_scales"),
+          py::arg("x_scales") = py::none(),
+          py::arg("lora_a") = py::none(),
+          py::arg("lora_b") = py::none(),
+          py::arg("bias") = py::none(),
+          py::arg("norm_weight") = py::none(),
+          py::arg("norm_eps") = 1e-5,
+          py::arg("activation") = "none",
+          py::arg("fuse_quant_out") = false,
+          py::arg("x_bf16") = py::none(),
+          py::arg("x_lora") = py::none(),
+          py::arg("x_smooth_inv") = py::none(),
+          py::arg("x_rho") = 1.0f,
+          py::arg("out_smooth_inv") = py::none(),
+          py::arg("out_rho") = 1.0f,
+          "Fused SVDQuant W4A4 GEMM + BF16 LoRA + bias/activation, optional fused output INT4 "
+          "quantization and RMSNorm. x is BF16 (x * x_smooth_inv quantized with group scale "
+          "amax * x_rho / 7 and LoRA-down projected on the fly) or packed INT4 with x_scales; "
+          "x_lora = x @ lora_a^T (f32) may be supplied precomputed. The fused INT4 output "
+          "quantizes out * out_smooth_inv with group scale amax * out_rho / 7.");
+    m.def("quantize_activation_int4", &torch_quantize_activation_int4,
+          py::arg("x"),
+          py::arg("lora_a") = py::none(),
+          py::arg("smooth_inv") = py::none(),
+          py::arg("rho") = 1.0f,
+          "INT4 group-64 quantization of x * smooth_inv (group scale amax * rho / 7); with lora_a "
+          "([R, K], e.g. several layers' lora_a concatenated) also returns x @ lora_a^T (on the "
+          "unsmoothed x) in float32 from the same pass over x.");
+}

@@ -180,7 +180,6 @@ class Wan5BVAE:
         weights: str | Path,
         *,
         xpu_channels_last: bool = True,
-        xpu_fused_kernels: bool = True,
         xpu_vae_int8_quarot: bool = False,
         stage2_vae_compile: bool = False,
         stage2_vae_compile_mode: str = "max-autotune",
@@ -193,7 +192,6 @@ class Wan5BVAE:
         self._std = torch.tensor(self.std, dtype=torch.float32)
         self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         self._xpu_channels_last = xpu_channels_last
-        self._xpu_fused_kernels = xpu_fused_kernels
         self._xpu_vae_int8_quarot = xpu_vae_int8_quarot
         self._stage2_vae_compile = stage2_vae_compile
         self._stage2_vae_compile_mode = stage2_vae_compile_mode
@@ -220,7 +218,7 @@ class Wan5BVAE:
             and dtype == torch.bfloat16
         )
         self.module.configure_xpu_bfloat16_decode(use_xpu_bfloat16)
-        if device_type == "xpu" and self._xpu_fused_kernels and dtype == torch.bfloat16:
+        if use_xpu_bfloat16:
             configure_fused = getattr(self.module, "configure_xpu_fused_decode", None)
             if callable(configure_fused):
                 configure_fused(True)

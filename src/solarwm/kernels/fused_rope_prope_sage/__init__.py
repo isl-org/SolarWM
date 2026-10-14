@@ -13,8 +13,16 @@ from .fused_sdpa import (
     _prope_tables,
     build_rope_table,
     _freqs_real,
+    _radial_bf16_attention,
+    _radial_flex_attention,
 )
-from .fused_sage import fused_rope_prope_sage
+from .fused_sage import (
+    fused_rope_prope_sage,
+    quantise_k,
+    _attend_int8,
+    hadamard4,
+    k_window_mean,
+)
 from .radial_attention import (
     RadialAttentionConfig,
     build_radial_block_mask,
@@ -40,6 +48,12 @@ __all__ = [
     "_prope_tables",
     "build_rope_table",
     "_freqs_real",
+    "_radial_bf16_attention",
+    "_radial_flex_attention",
+    "quantise_k",
+    "_attend_int8",
+    "hadamard4",
+    "k_window_mean",
     "RadialAttentionConfig",
     "build_radial_block_mask",
     "build_sage_block_indices",

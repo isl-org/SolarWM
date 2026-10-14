@@ -1,0 +1,36 @@
+# TASK DEFINITION
+task_name: wan22_svdquant_dense_block
+job_name: wan22_svdquant_dense_block_bmg
+
+# Target platform: Intel Arc Battlemage (b70)
+gpu_arch: bmg
+language: SYCL
+
+# Execution parameters
+max_iters: 4
+branches_per_iteration: 1
+evolve_mode: false
+stop_once_correct: false
+
+agentic_workflow: true
+use_user_token_budget: true
+inference:
+  servers:
+    - server_type: "openai"
+      model_name: "gpt-6.1-sol"
+
+test_reference: true
+has_reference_build_step: false
+has_build_step: true
+
+build_timeout: 300
+test_timeout: 300
+
+prompt:
+  reference_language: python
+
+hyperparameters:
+  buildtime: null
+  runtime: null
+
+

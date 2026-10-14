@@ -99,6 +99,113 @@ def _require(condition: bool, message: str) -> None:
         raise BackendContractError(message)
 
 
+STAGE2_ATTENTION_KERNELS = {
+    "sdpa": "fused_rope_prope_sdpa",
+    "sageattnv1": "fused_rope_prope_sage",
+}
+STAGE2_LINEAR_QUANTS = ("full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4")
+STAGE2_VAE_QUANTS = ("full_precision", "quarot_w8a8")
+_RETIRED_KEYS = {
+    ("runtime", "stage2_fused_kernel"): "model.attention_backend",
+    ("model", "stage2_fused_kernel"): "model.attention_backend",
+    ("model", "fused_kernel"): "model.attention_backend",
+    ("runtime", "stage2_attention_backend"): "model.attention_backend",
+    ("model", "svdquant_attention_backend"): "model.attention_backend",
+    ("model", "svdquant_checkpoint_dir"): "model.svdquant_weights_root",
+    ("runtime", "stage2_fuse_rope_prope"): None,
+    ("runtime", "stage2_encoded_kv_ring"): None,
+    ("runtime", "stage2_dit_fused_ops"): None,
+    ("runtime", "stage2_vae_fused_kernels"): None,
+    ("runtime", "stage2_vae_int8_quarot"): "runtime.stage2_vae_quant",
+    ("runtime", "stage2_dit_svdquant"): "model.linear_quant",
+    ("runtime", "stage2_dit_svdquant_path"): "model.svdquant_weights_root",
+    ("inference", "stage2_xpu_vae_pipeline"): None,
+}
+
+
+def is_stage2_camera_inference(config: Mapping[str, Any]) -> bool:
+    """Whether ``config`` is standalone Stage2 camera-length inference."""
+
+    return (
+        str(config.get("action", "")).strip().lower() == "infer"
+        and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
+        and str(_mapping(config, "inference").get("length", "fixed")).strip().lower() == "camera"
+    )
+
+
+def stage2_attention_backend(config: Mapping[str, Any]) -> str:
+    return str(_mapping(config, "model").get("attention_backend", "sdpa")).strip().lower()
+
+
+def stage2_fused_attention_kernel(config: Mapping[str, Any]) -> str | None:
+    """Fused RoPE/PRoPE attention kernel for Stage2 camera inference, else ``None``."""
+
+    if not is_stage2_camera_inference(config):
+        return None
+    if str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() != "fused_prope":
+        return None
+    return STAGE2_ATTENTION_KERNELS[stage2_attention_backend(config)]
+
+
+def stage2_linear_quant(config: Mapping[str, Any]) -> str:
+    return str(_mapping(config, "model").get("linear_quant", "full_precision")).strip().lower()
+
+
+def stage2_vae_quant(config: Mapping[str, Any]) -> str:
+    return str(_mapping(config, "runtime").get("stage2_vae_quant", "full_precision")).strip().lower()
+
+
+def _validate_stage2_kernels(config: Mapping[str, Any]) -> None:
+    for (section, key), replacement in _RETIRED_KEYS.items():
+        hint = f"; use {replacement}" if replacement else "; the fused path is always selected"
+        _require(key not in _mapping(config, section), f"{section}.{key} was removed{hint}")
+    camera_inference = is_stage2_camera_inference(config)
+    model = _mapping(config, "model")
+
+    backend = stage2_attention_backend(config)
+    _require(
+        backend in STAGE2_ATTENTION_KERNELS,
+        f"model.attention_backend must be one of {sorted(STAGE2_ATTENTION_KERNELS)}; got {backend}",
+    )
+    if backend != "sdpa":
+        _require(
+            stage2_fused_attention_kernel(config) is not None,
+            f"model.attention_backend={backend} requires standalone Stage2 camera-length "
+            "inference with model.camera_attention_mode=fused_prope",
+        )
+
+    linear_quant = stage2_linear_quant(config)
+    _require(
+        linear_quant in STAGE2_LINEAR_QUANTS,
+        f"model.linear_quant must be one of {list(STAGE2_LINEAR_QUANTS)}; got {linear_quant}",
+    )
+    if linear_quant != "full_precision":
+        _require(
+            camera_inference,
+            "model.linear_quant is supported only for standalone Stage2 camera-length inference",
+        )
+        _require(
+            not _mapping(config, "inference").get("stage2_xpu_compile_blocks", False),
+            "model.linear_quant cannot be combined with inference.stage2_xpu_compile_blocks",
+        )
+    weights_root = model.get("svdquant_weights_root")
+    _require(
+        weights_root is None or (isinstance(weights_root, str) and bool(weights_root.strip())),
+        "model.svdquant_weights_root must be a non-empty string",
+    )
+
+    vae_quant = stage2_vae_quant(config)
+    _require(
+        vae_quant in STAGE2_VAE_QUANTS,
+        f"runtime.stage2_vae_quant must be one of {list(STAGE2_VAE_QUANTS)}; got {vae_quant}",
+    )
+    if vae_quant != "full_precision":
+        _require(
+            camera_inference,
+            "runtime.stage2_vae_quant is supported only for standalone Stage2 camera-length inference",
+        )
+
+
 def _finite_float(value: Any, field: str) -> float:
     try:
         result = float(value)
@@ -275,34 +382,6 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "runtime.stage2_vae_channels_last is supported "
             "only for standalone Stage2 camera-length inference",
         )
-    vae_fused_kernels = runtime.get("stage2_vae_fused_kernels", True)
-    _require(
-        isinstance(vae_fused_kernels, bool),
-        "runtime.stage2_vae_fused_kernels must be boolean",
-    )
-    if "stage2_vae_fused_kernels" in runtime:
-        inference = _mapping(config, "inference")
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "runtime.stage2_vae_fused_kernels is supported "
-            "only for standalone Stage2 camera-length inference",
-        )
-    vae_int8_quarot = runtime.get("stage2_vae_int8_quarot", False)
-    _require(
-        isinstance(vae_int8_quarot, bool),
-        "runtime.stage2_vae_int8_quarot must be boolean",
-    )
-    if "stage2_vae_int8_quarot" in runtime:
-        inference = _mapping(config, "inference")
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "runtime.stage2_vae_int8_quarot is supported "
-            "only for standalone Stage2 camera-length inference",
-        )
     vae_compile = runtime.get("stage2_vae_compile", False)
     _require(
         isinstance(vae_compile, bool),
@@ -331,34 +410,7 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "runtime.stage2_vae_compile_mode is supported "
             "only for standalone Stage2 camera-length inference",
         )
-    dit_fused_ops = runtime.get("stage2_dit_fused_ops", False)
-    _require(
-        isinstance(dit_fused_ops, bool),
-        "runtime.stage2_dit_fused_ops must be boolean",
-    )
-    if "stage2_dit_fused_ops" in runtime:
-        inference = _mapping(config, "inference")
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "runtime.stage2_dit_fused_ops is supported "
-            "only for standalone Stage2 camera-length inference",
-        )
     inference = _mapping(config, "inference")
-    vae_pipeline = inference.get("stage2_xpu_vae_pipeline", True)
-    _require(
-        isinstance(vae_pipeline, bool),
-        "inference.stage2_xpu_vae_pipeline must be boolean",
-    )
-    if "stage2_xpu_vae_pipeline" in inference:
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "inference.stage2_xpu_vae_pipeline is supported only for "
-            "standalone Stage2 camera-length inference",
-        )
     compile_blocks = inference.get("stage2_xpu_compile_blocks", False)
     _require(
         isinstance(compile_blocks, bool),
@@ -385,72 +437,12 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
             "inference.stage2_xpu_compile_mode is supported only for "
             "standalone Stage2 camera-length inference",
         )
-    fuse_rope_prope = runtime.get("stage2_fuse_rope_prope", False)
-    _require(
-        isinstance(fuse_rope_prope, bool),
-        "runtime.stage2_fuse_rope_prope must be boolean",
-    )
-    if fuse_rope_prope:
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "runtime.stage2_fuse_rope_prope is supported only for "
-            "standalone Stage2 camera-length inference",
-        )
-    encoded_kv_ring = runtime.get("stage2_encoded_kv_ring", True)
-    _require(
-        isinstance(encoded_kv_ring, bool),
-        "runtime.stage2_encoded_kv_ring must be boolean",
-    )
-    if "stage2_encoded_kv_ring" in runtime:
-        inference = _mapping(config, "inference")
-        _require(
-            str(config.get("action", "")).strip().lower() == "infer"
-            and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-            and str(inference.get("length", "fixed")).strip().lower() == "camera",
-            "runtime.stage2_encoded_kv_ring is supported only for "
-            "standalone Stage2 camera-length inference",
-        )
     rope_dtype = runtime.get("stage2_rope_dtype")
     if rope_dtype is not None:
         _require(
             str(rope_dtype).strip().lower() in {"float64", "fp64", "float32", "fp32", "float16", "fp16"},
             f"runtime.stage2_rope_dtype must be one of float64, float32, float16; got {rope_dtype}",
         )
-    stage2_fused_kernel = runtime.get("stage2_fused_kernel")
-    if stage2_fused_kernel is None:
-        stage2_fused_kernel = _mapping(config, "model").get("stage2_fused_kernel")
-    if stage2_fused_kernel is None:
-        stage2_fused_kernel = _mapping(config, "model").get("fused_kernel")
-    if stage2_fused_kernel is not None:
-        allowed = {
-            "none",
-            "reference",
-            "fused_rope_prope_sdpa_reference",
-            "fused_rope_prope_sdpa",
-            "sdpa",
-            "fused_sdpa",
-            "fused_rope_prope_sage",
-            "sage",
-            "fused_sage",
-        }
-        val = str(stage2_fused_kernel).strip().lower()
-        _require(
-            val in allowed,
-            f"stage2_fused_kernel must be one of {sorted(allowed)}; got {stage2_fused_kernel}",
-        )
-        if val != "none":
-            _require(
-                str(config.get("action", "")).strip().lower() == "infer"
-                and str(_mapping(config, "train").get("stage", "")).strip().lower() == "stage2"
-                and str(inference.get("length", "fixed")).strip().lower() == "camera",
-                "stage2_fused_kernel is supported only for standalone Stage2 camera-length inference",
-            )
-            _require(
-                str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() == "fused_prope",
-                "stage2_fused_kernel requires model.camera_attention_mode=fused_prope",
-            )
     radial_attention = runtime.get("stage2_radial_attention", False)
     _require(
         isinstance(radial_attention, bool),
@@ -486,19 +478,6 @@ def _validate_runtime_caches(config: Mapping[str, Any]) -> None:
         _require(
             str(_mapping(config, "model").get("camera_attention_mode", "")).strip().lower() == "fused_prope",
             "stage2 radial attention requires model.camera_attention_mode=fused_prope",
-        )
-        _require(
-            stage2_fused_kernel is not None
-            and str(stage2_fused_kernel).strip().lower()
-            in {
-                "fused_rope_prope_sdpa",
-                "sdpa",
-                "fused_sdpa",
-                "fused_rope_prope_sage",
-                "sage",
-                "fused_sage",
-            },
-            "stage2 radial attention requires a fused SDPA or Sage kernel",
         )
     cache_mode = str(inference.get("kv_cache_mode", "circular")).strip().lower()
     if (
@@ -1056,6 +1035,7 @@ def validate_wan_config(config: Mapping[str, Any], *, expected_family: str) -> R
     _validate_stage(config, route, profile)
     _validate_checkpoint(config, route)
     _validate_runtime_caches(config)
+    _validate_stage2_kernels(config)
     return route
 
 

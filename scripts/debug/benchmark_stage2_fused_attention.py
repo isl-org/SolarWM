@@ -58,6 +58,10 @@ def snapshot_cache(cache_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def restore_cache(target_list: list[dict[str, Any]], snapshot: list[dict[str, Any]]) -> None:
     for target, snap in zip(target_list, snapshot):
+        # Clear transient/cached keys that might not be in the snapshot
+        stale_keys = [k for k in list(target.keys()) if k not in snap]
+        for k in stale_keys:
+            del target[k]
         for k, v in snap.items():
             if torch.is_tensor(v):
                 target[k].copy_(v)
@@ -406,7 +410,7 @@ def run_benchmark(
             chunk_total_times.append(chunk_total_ms)
 
             mean_denoise = sum(denoise_step_times[i][-1] for i in range(len(step_values))) / len(step_values)
-            print(f"  [Repeat {repeat+1}/{num_repeats}] Denoise mean: {mean_denoise:6.2f} ms | Commit: {commit_ms:6.2f} ms | Chunk 4 Total: {chunk_total_ms:7.2f} ms")
+            print(f"  [Repeat {repeat+1}/{num_repeats}] Denoise mean: {mean_denoise:6.2f} ms (steps: {', '.join(f'{denoise_step_times[i][-1]:.1f}' for i in range(len(step_values)))}) | Commit: {commit_ms:6.2f} ms | Chunk 4 Total: {chunk_total_ms:7.2f} ms")
 
         # Aggregate metrics
         avg_denoise_per_step = [sum(denoise_step_times[i]) / num_repeats for i in range(len(step_values))]

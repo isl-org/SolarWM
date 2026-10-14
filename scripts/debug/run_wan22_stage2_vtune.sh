@@ -82,8 +82,9 @@ CHECKPOINT_PATH="$SOLAR_MODEL_ROOT/SolarWM-5B-sgf-stage2-81f"
 DATA_INDEX_ROOT="$SOLAR_DATA_ROOT/example"
 START_CHUNK="${START_CHUNK:-4}"
 END_CHUNK="${END_CHUNK:-4}"
-STAGE2_FUSED_KERNEL="${STAGE2_FUSED_KERNEL:-fused_rope_prope_sage}"
-STAGE2_VAE_INT8_QUAROT="${STAGE2_VAE_INT8_QUAROT:-true}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-sageattnv1}"
+LINEAR_QUANT="${LINEAR_QUANT:-full_precision}"
+STAGE2_VAE_QUANT="${STAGE2_VAE_QUANT:-quarot_w8a8}"
 STAGE2_COMPILE_BLOCKS="${STAGE2_COMPILE_BLOCKS:-0}"
 STAGE2_COMPILE_MODE="${STAGE2_COMPILE_MODE:-max-autotune}"
 STAGE2_VAE_COMPILE="${STAGE2_VAE_COMPILE:-0}"
@@ -91,7 +92,6 @@ STAGE2_VAE_COMPILE_MODE="${STAGE2_VAE_COMPILE_MODE:-max-autotune}"
 EXIT_AFTER_ROI="${EXIT_AFTER_ROI:-0}"
 MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-5}"
 ANALYSIS="${ANALYSIS:-gpu-hotspots}"
-FUSE_ROPE_PROPE="${FUSE_ROPE_PROPE:-0}"
 START_PAUSED="${START_PAUSED:-1}"
 
 RESULT_ROOT="${RESULT_ROOT:-$REPO_ROOT/outputs/vtune_results}"
@@ -223,18 +223,11 @@ elif [[ "$ANALYSIS" != "gpu-hotspots" ]]; then
   exit 2
 fi
 
-FUSE_SET=()
-if [[ "$FUSE_ROPE_PROPE" == "1" || "$FUSE_ROPE_PROPE" == "true" ]]; then
-  FUSE_SET=(--set "runtime.stage2_fuse_rope_prope=true")
-fi
-
-EXTRA_SET=()
-if [[ -n "$STAGE2_FUSED_KERNEL" && "$STAGE2_FUSED_KERNEL" != "none" ]]; then
-  EXTRA_SET+=(--set "runtime.stage2_fused_kernel=$STAGE2_FUSED_KERNEL")
-fi
-if [[ "$STAGE2_VAE_INT8_QUAROT" == "1" || "$STAGE2_VAE_INT8_QUAROT" == "true" ]]; then
-  EXTRA_SET+=(--set "runtime.stage2_vae_int8_quarot=true")
-fi
+EXTRA_SET=(
+  --set "model.attention_backend=$ATTENTION_BACKEND"
+  --set "model.linear_quant=$LINEAR_QUANT"
+  --set "runtime.stage2_vae_quant=$STAGE2_VAE_QUANT"
+)
 if [[ "$STAGE2_COMPILE_BLOCKS" == "1" || "$STAGE2_COMPILE_BLOCKS" == "true" ]]; then
   EXTRA_SET+=(--set "inference.stage2_xpu_compile_blocks=true" --set "inference.stage2_xpu_compile_mode=$STAGE2_COMPILE_MODE")
 fi
@@ -272,7 +265,6 @@ env -i HOME="$HOME" USER="${USER:-}" \
             --set "runtime.stage2_xpu_profiler=true" \
             --set "runtime.stage2_xpu_profiler_start_chunk=$START_CHUNK" \
             --set "runtime.stage2_xpu_profiler_end_chunk=$END_CHUNK" \
-            "${FUSE_SET[@]}" \
             "${EXTRA_SET[@]}" \
             --set "runtime.output_dir=$OUTPUT_DIR"
 VTUNE_EXIT=$?
