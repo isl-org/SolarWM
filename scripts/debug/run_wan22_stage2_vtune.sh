@@ -62,15 +62,13 @@ SHIM_EOF
 }
 
 build_metrics_discovery_shim() {
-  local installed installed_md
+  local installed
   installed=$(ldconfig -p 2>/dev/null | awk '/libigdmd\.so\.[0-9]/{print $NF; exit}')
   [[ -n "$installed" && -f "$installed" ]] || return 1
   mkdir -p "$METRICS_SHIM_DIR"
   ln -sfn "$installed" "$METRICS_SHIM"
-  installed_md=$(ldconfig -p 2>/dev/null | awk '/libmd\.so\.[0-9]/{print $NF; exit}')
-  if [[ -n "$installed_md" && -f "$installed_md" ]]; then
-    ln -sfn "$installed_md" "$METRICS_SHIM_DIR/libmd.so"
-  fi
+  # Also remove any legacy/bogus BSD libmd.so symlink that might have been created
+  rm -f "$METRICS_SHIM_DIR/libmd.so"
 }
 
 VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv-wan22-xpu}"

@@ -35,7 +35,18 @@ def table(prof, n=30):
     return prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=n, max_name_column_width=90)
 
 
-def run(linear_quant: str, attn: str, profile_vae: bool) -> None:
+def run(linear_quant: str, attn: str, profile_vae: bool | str) -> None:
+    # Normalize inputs
+    if linear_quant in ("bf16", "fp16", "full_precision"):
+        linear_quant = "full_precision"
+    elif linear_quant in ("svdquant", "svdquant_k4", "k4"):
+        linear_quant = "svdquant_k4"
+
+    if attn in ("sageattn", "sageattnv1"):
+        attn = "sageattnv1"
+    elif attn in ("sdpa",):
+        attn = "sdpa"
+
     tag = f"{linear_quant}_{attn}"
     values = load_config(
         CONFIG,
@@ -91,13 +102,29 @@ def run(linear_quant: str, attn: str, profile_vae: bool) -> None:
         stage2._slice_camera = orig_slice
 
     OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / f"dit_{tag}.txt").write_text(table(state["prof"]))
+    table_str = table(state["prof"])
+    (OUT / f"dit_{tag}.txt").write_text(table_str)
+    state["prof"].export_chrome_trace(str(OUT / f"dit_{tag}.json"))
+    if tag == "full_precision_sdpa":
+        (OUT / "dit_bf16_sdpa.txt").write_text(table_str)
+        (OUT / "dit_bf16_sdpa.json").write_text((OUT / f"dit_{tag}.json").read_text())
     print(f"\n===== DiT chunk4 step1: {tag} =====")
     print(table(state["prof"], 25))
 
     if profile_vae:
         chunk = latents[:, 12:15].contiguous()
-        for name, enabled in (("vae_bf16", False), ("vae_quarot", True)):
+        vae_modes: list[tuple[str, bool]] = []
+        val_str = str(profile_vae).lower()
+        if val_str in ("true", "1", "vae", "all", "both"):
+            vae_modes = [("vae_bf16", False), ("vae_quarot", True)]
+        elif val_str in ("vae_bf16", "bf16"):
+            vae_modes = [("vae_bf16", False)]
+        elif val_str in ("vae_quarot", "quarot", "w8a8"):
+            vae_modes = [("vae_quarot", True)]
+        else:
+            vae_modes = [("vae_bf16", False), ("vae_quarot", True)]
+
+        for name, enabled in vae_modes:
             apply_vae_quarot(provider.vae.module.decoder, enabled=enabled)
             with torch.no_grad():
                 provider.vae.decode_streaming(chunk, chunk_latent_frames=4)
@@ -106,10 +133,12 @@ def run(linear_quant: str, attn: str, profile_vae: bool) -> None:
                     provider.vae.decode_streaming(chunk, chunk_latent_frames=4)
                     torch.xpu.synchronize()
             (OUT / f"{name}.txt").write_text(table(p))
+            p.export_chrome_trace(str(OUT / f"{name}.json"))
             print(f"\n===== {name} =====")
             print(table(p, 20))
         apply_vae_quarot(provider.vae.module.decoder, enabled=False)
 
 
 if __name__ == "__main__":
-    run(sys.argv[1], sys.argv[2], len(sys.argv) > 3 and sys.argv[3] == "vae")
+    vae_flag = sys.argv[3] if len(sys.argv) > 3 else False
+    run(sys.argv[1], sys.argv[2], vae_flag)

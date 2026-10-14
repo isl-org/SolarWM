@@ -249,7 +249,7 @@ inline float quantize_group_lane(const u32x8 (&x)[kTilesN], u32x8& packed, const
 constexpr int kProRows = kSG;
 constexpr int kProSGs = 8;
 
-template <int RT, bool QUANT> class PrologueKernel;
+template <int RT, bool QUANT> class SVDQ_Quant_int4_LoRa_bf16;
 
 template <int RT, bool QUANT>
 void launch_prologue(sycl::queue& q, const uint16_t* x, int M, int K, int8_t* x_q, float* x_scales_t, int xs_ld,
@@ -265,7 +265,7 @@ void launch_prologue(sycl::queue& q, const uint16_t* x, int M, int K, int8_t* x_
     const int blocks = (M + kProRows - 1) / kProRows;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(RB > 0 ? kProSGs * kPart : 1), h);
-        h.parallel_for<PrologueKernel<RT, QUANT>>(
+        h.parallel_for<SVDQ_Quant_int4_LoRa_bf16<RT, QUANT>>(
             sycl::nd_range<1>(size_t(blocks) * kProSGs * kSG, kProSGs * kSG),
             syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<(RB > 4 ? 256 : 128)>},
             [=](sycl::nd_item<1> item) {
@@ -378,7 +378,7 @@ struct GemmArgs {
     int M, N, K, act;
 };
 
-class GemmKernel;
+class SVDQ_GEMM_int4;
 
 // Epilogue of one 8 x 64 block (rows m0.., columns 64 ng..): LoRA up, bias, activation, BF16
 // store, optional INT4 output quantization and RMSNorm partial sums.
@@ -486,7 +486,7 @@ void launch_gemm(sycl::queue& q, const GemmArgs& p) {
     const sycl::range<2> local(sg_n * sg_m, kSG);
     const sycl::range<2> global(grid_n * sg_m, ((grid_m + sg_m - 1) / sg_m) * kSG);
 
-    q.parallel_for<GemmKernel>(
+    q.parallel_for<SVDQ_GEMM_int4>(
         sycl::nd_range<2>(global, local),
         syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<KF_GRF>},
         [=](sycl::nd_item<2> item) {

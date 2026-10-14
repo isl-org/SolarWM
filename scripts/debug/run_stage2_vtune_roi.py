@@ -80,10 +80,12 @@ def _roi_end(self, *, chunk_index: int, force: bool = False) -> None:  # noqa: A
     vtune_itt.itt_pause()
     if os.environ.get("EXIT_AFTER_ROI") in ("1", "true", "True"):
         sys.stderr.write(
-            f"[vtune-roi] chunk_index={chunk_index}: EXIT_AFTER_ROI active, exiting\n"
+            f"[vtune-roi] chunk_index={chunk_index}: EXIT_AFTER_ROI active, exiting cleanly\n"
         )
         sys.stderr.flush()
-        os._exit(0)
+        import time
+        time.sleep(0.5)
+        sys.exit(0)
 
 
 _stage2_mod._Stage2XpuProfiler.begin = _roi_begin  # type: ignore[method-assign]
