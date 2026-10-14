@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .vae import CausalConv3d
+from solarwm.kernels.qconv_onednn import fast_qconv3d
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +104,8 @@ def rotate_channels_last(x: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
 
 def _eager_quantize_mc(x_rot_mc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute scalar dynamic absmax scale and quantize 2D [M, C] activation matrix to int8."""
-    # Two-stage reduction: spatial/temporal reduction first, then channel reduction
-    x_absmax = x_rot_mc.abs().amax(dim=0).amax()
-    x_scale = (x_absmax / 127.0).clamp(min=1e-8)
+    x_absmax = x_rot_mc.abs().amax()
+    x_scale = (x_absmax / 127.0).clamp(min=1e-8).to(dtype=torch.float32)
     qx_mc = (x_rot_mc / x_scale).round().clamp(-127, 127).to(torch.int8)
     return qx_mc, x_scale
 
@@ -169,49 +169,34 @@ def _quarot_causal_conv3d_forward(
     self: CausalConv3d,
     x: torch.Tensor,
     cache_x: torch.Tensor | None = None,
+    accumulate_into: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Patched dynamic INT8 forward for CausalConv3d with Block-256 QuaRot."""
     if not getattr(self, "_quarot_enabled", False):
         orig_fwd = getattr(self, "_orig_forward", None)
         if orig_fwd is not None:
-            return orig_fwd(x, cache_x=cache_x)
-        return super(CausalConv3d, self).forward(x)
+            return orig_fwd(x, cache_x=cache_x, accumulate_into=accumulate_into)
+        res = super(CausalConv3d, self).forward(x)
+        if accumulate_into is not None:
+            return accumulate_into.add_(res)
+        return res
 
     target_pad_t = getattr(self, "_quarot_target_pad_t", self._padding[4])
     spatial_pad = getattr(
         self, "_quarot_spatial_pad", [0, self._padding[2], self._padding[0]]
     )
 
-    if cache_x is not None and target_pad_t > 0:
-        cache_x = cache_x.to(x.device)
-        if cache_x.shape[2] == 2 and x.shape[2] == 1:
-            b, c, _, h_in, w_in = x.shape
-            buf = getattr(self, "_fast_cache_buffer", None)
-            if (
-                buf is None
-                or buf.shape != (b, c, 3, h_in, w_in)
-                or buf.device != x.device
-                or buf.dtype != x.dtype
-            ):
-                buf = torch.empty(
-                    (b, c, 3, h_in, w_in),
-                    device=x.device,
-                    dtype=x.dtype,
-                    memory_format=torch.channels_last_3d,
-                )
-                self._fast_cache_buffer = buf
-            buf[:, :, :2, :, :].copy_(cache_x)
-            buf[:, :, 2:3, :, :].copy_(x)
-            x = buf
-        else:
-            x = torch.cat([cache_x, x], dim=2)
-        pad_t = max(0, target_pad_t - cache_x.shape[2])
+    # Spatial padding is handled in hardware by oneDNN qconv; only stage the temporal dimension.
+    staged = self.staged_input(x, cache_x, spatial=False) if target_pad_t > 0 else x
+    if staged is not None:
+        x = staged
     else:
         pad_t = target_pad_t
-
-    # Spatial padding is handled in hardware by oneDNN qconv; only pad temporal dimension if needed
-    if pad_t > 0:
-        x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+        if cache_x is not None and target_pad_t > 0:
+            x = torch.cat([cache_x.to(x.device), x], dim=2)
+            pad_t = max(0, target_pad_t - cache_x.shape[2])
+        if pad_t > 0:
+            x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
 
     N, C, T, H_dim, W_dim = x.shape
     block_size = self._quarot_H.shape[0]
@@ -220,39 +205,44 @@ def _quarot_causal_conv3d_forward(
     # x is channels_last_3d, so permute to [N, T, H, W, C] is contiguous in memory.
     x_last = x.permute(0, 2, 3, 4, 1)
     x_flat = x_last.reshape(-1, block_size)
-    x_rot_flat = x_flat @ self._quarot_H
-    x_rot_mc = x_rot_flat.view(-1, C)
+
+    # Reusable rotation buffer to eliminate dynamic memory allocator churn
+    rot_buf = getattr(self, "_quarot_rot_buf", None)
+    if (
+        rot_buf is None
+        or rot_buf.shape != x_flat.shape
+        or rot_buf.device != x.device
+        or rot_buf.dtype != x.dtype
+    ):
+        rot_buf = torch.empty_like(x_flat)
+        self._quarot_rot_buf = rot_buf
+
+    torch.mm(x_flat, self._quarot_H, out=rot_buf)
+    x_rot_mc = rot_buf.view(-1, C)
 
     # Dynamic scalar scale & INT8 quantization
     quant_fn = getattr(self, "_quarot_quant_fn", _eager_quantize_mc)
     qx_mc, x_scale = quant_fn(x_rot_mc)
 
-    # View as 5D channels_last_3d tensor
-    qx = (
-        qx_mc.view(N, T, H_dim, W_dim, C)
-        .permute(0, 4, 1, 2, 3)
-        .contiguous(memory_format=torch.channels_last_3d)
-    )
+    # View as 5D channels_last_3d tensor:
+    # Since qx_mc is [N*T*H*W, C], permuting [N, T, H, W, C] to [N, C, T, H, W]
+    # produces a stride where dim 1 has stride 1, which is natively channels_last_3d.
+    qx = qx_mc.view(N, T, H_dim, W_dim, C).permute(0, 4, 1, 2, 3)
 
-    # Execute native oneDNN INT8 qconv with hardware spatial padding
-    out = torch.ops.onednn.qconv_pointwise.tensor(
-        qx,
-        x_scale,
-        self._quarot_zero_x,
-        self._quarot_qw,
-        self._quarot_w_scale,
-        self._quarot_zero_w,
-        self._quarot_bias_fp32,
-        list(self.stride),
-        spatial_pad,
-        list(self.dilation),
-        self.groups,
-        1.0,
-        0,
-        torch.bfloat16,
-        "none",
-        [],
-        "",
+    # Execute fast native oneDNN INT8 qconv without host-device item() synchronization
+    out = fast_qconv3d(
+        qx=qx,
+        x_scale=x_scale,
+        qw=self._quarot_qw,
+        w_scale=self._quarot_w_scale,
+        bias=self._quarot_bias_fp32,
+        stride=self.stride,
+        padding=spatial_pad,
+        dilation=self.dilation,
+        groups=self.groups,
+        output_dtype=torch.bfloat16,
+        post_op="none",
+        accumulate_into=accumulate_into,
     )
     return out
 
@@ -298,6 +288,8 @@ def uninstall_quarot_conv(conv: CausalConv3d) -> None:
     if orig_fwd is not None:
         conv.forward = orig_fwd
         delattr(conv, "_orig_forward")
+    if hasattr(conv, "_quarot_rot_buf"):
+        delattr(conv, "_quarot_rot_buf")
     conv._quarot_installed = False
 
 

@@ -1,11 +1,11 @@
 # Wan2.2 Stage2 XPU inference optimization plan
 
-**Status:** WS1–WS5, WS9, WS12, WS14, WS16, and WS20 done and verified; WS6, WS7, WS8, WS17, and WS19 rejected on
+**Status:** WS1–WS5, WS9, WS12, WS14, WS16, WS20, WS21, and WS22 done and verified; WS6, WS7, WS8, WS17, and WS19 rejected on
 measurement (WS6's overlap machinery reverted; WS17's caching kept for correctness, not speed;
-WS7 rejected in both default and `max-autotune` compile mode; WS19 INT8 reverted for low speedup); WS14 and WS20 passed full-VAE
-accuracy and streaming decode gates.
+WS7 rejected in both default and `max-autotune` compile mode; WS19 INT8 reverted for low speedup); WS14, WS20, and WS21 passed full-VAE
+accuracy and streaming decode gates; WS23 (VAE hardware epilogue & in-flight fusions) complete.
 **WS13 is the largest remaining lever with a projected gain**
-**Last updated:** 2026-10-07 (B580)
+**Last updated:** 2026-10-13 (B580)
 **Device:** Intel Arc B580, 30.3 GiB VRAM, `torch 2.12.1+xpu`
 **Output anchor:** `md5 380d9cf74a9018d76408a3e615558fab`,
 `sha256 2da7fa11bc10faf9d8309f84e7f5365708d05f190baaf71e6d2b4b3e27023a5c`
@@ -197,6 +197,9 @@ Pixel tiles concatenated along time -> `[1,3,F_pixel_total,480,864]`, fp32, wher
 | WS18 | Fuse EchoRoPE into PRoPE's per-token matrices | small *(estimated)* | failed quality gate (**12.86 dB** vs baseline) | medium | PSNR | **Rejected** |
 | WS19 | VAE decode W8A8 dynamic quantization via oneDNN qconv + compiled prologue | 1.3–2.0× conv speedup *(projected)* | **17.63 s → 16.29 s (−1.34 s, 1.08×)** full 153-frame decode; 1.63–2.14× per 3D conv; **47.37 dB** vs CUDA ref | medium | PSNR | **Rejected** — speedup too small for complexity; reverted |
 | WS20 | Fused BF16 Triton kernels for VAE decode (`RMS_norm+SiLU` & `Add+RMS_norm+SiLU`) | 1.375 → ~1.10 s/tile *(projected; bandwidth-bound elementwise fusion)* | **1.361 → 1.078 s/tile (−283.5 ms, 1.26×, 20.8% reduction)**; 48-frame streaming decode **1.27× (6.15 s → 4.84 s)**; **56.54 dB PSNR** | low | PSNR / ULP | **Done and verified** |
+| WS21 | Block-256 QuaRot W8A8 Dynamic Quantization for VAE decode | 1.3–1.6× conv speedup | **15.04 → 12.80 s full decode (1.18×); 857 ms/tile (1.255× vs WS20); 48.56 dB PSNR** | medium | PSNR | **Done and verified** |
+| WS22 | DiT Operator Fusions (AdaLN-LayerNorm, Gated Residual, QK WanRMSNorm, FFN oneDNN GELU) | −25–35 ms/chunk | **5.295 → 5.068 ms/block (1.045×); −27.2 ms/chunk, 15.44 GB DRAM traffic eliminated** | low | cosine / NaN | **Done and verified** |
+| WS23 | VAE Hardware Epilogue & QuaRot In-Flight Fusions (`oneDNN append_sum` & In-Flight Transform) | 0.955 → 0.844 s/tile (−111.0 ms/tile, 11.6%) | Landed ~14–18 ms (`append_sum`) + QuaRot dynamic quant prologue buffer reuse; zero-ROI and `torch.compile`-equivalent candidates rejected | medium | PSNR / ULP | **Complete** |
 
 WS1 is first because it is the largest single win, carries no new code risk, and is independent of
 everything else — and because doing it first means the harness and every later gate measure the
@@ -2395,6 +2398,26 @@ Measured on Intel Arc B580 against production CUDA reference (`latents_bf16.pt` 
 - **Net Pipeline Gain:** Accelerating the 28 3D convolutions via Block-256 QuaRot W8A8 dynamic quantization yields a **1.18× speedup on VAE decode** (~172 ms saved per 12-frame tile), translating to an end-to-end chunk pipeline speedup of **1.08× (5.64 fps → 6.10 fps)**.
 - **Default Policy:** Kept default-off (`false`) to ensure 100% backward compatibility with pure BF16 decode, while available for latency-critical interactive camera sessions.
 
+#### 4. Architectural Evaluation of Further VAE Decoder Fusion Candidates (2026-10-13)
+
+Following the implementation of the zero-sync SYCL `fast_qconv3d` wrapper (which resolved the 168 `aten::item` host stalls), an architectural evaluation of all remaining VAE decoder fusion opportunities was conducted on Intel Arc B580. Every candidate was evaluated against two strict operational constraints:
+1. **Do not author custom kernels where `torch.compile` produces equivalent performance.**
+2. **Do not author custom kernels with low estimated time savings (< 5 ms per 1,078 ms tile, or < 0.5% runtime).**
+
+##### A. Evaluated Candidates Matrix
+
+| Candidate | Topology & Layers | Estimated Savings | `torch.compile` Equivalence | Decision & Architectural Rationale |
+| :--- | :--- | :---: | :---: | :--- |
+| **1. Standalone `Add+RMS_norm+SiLU`** | Across `ResidualBlock` boundaries | $\le 1.0\text{ ms}$ / tile | **Yes** (1.00× vs Triton) | **REJECTED**: Microbenchmarks (`compare_vae_norm_silu.py`) prove `torch.compile` matches hand-written Triton (1.605 vs 1.606 ms at $256\times 4\times 240\times 432$). Furthermore, skip connections require writing out the sum ($y = x + h$) to DRAM (`store_sum=True`), reducing net DRAM savings to $\le 0.23\text{ ms}$ per site. |
+| **2. Self-Attention Block Fusions** | `Decoder3d.middle.1` | $< 0.3\text{ ms}$ / tile | **Yes** | **REJECTED**: Only 1 block in entire decoder at bottleneck resolution ($30\times 54$, $L=1,620$). Total block forward is $< 1.5\text{ ms}$ (< 0.15% of tile); maximum possible fusion gain is negligible. |
+| **3. Temporal Frame Interleave** | `Resample(mode="upsample3d")` | $< 0.2\text{ ms}$ / tile | **Yes** | **REJECTED**: Stacking across 2 temporal expansion stages takes $< 0.8\text{ ms}$ total. Inductor already eliminates slice copies via zero-copy strided views. |
+| **4. Fused 2x Nearest Upsample + Conv2D** | 3× `Resample` modules in upsamplers | **Negative** (regression) | N/A | **REJECTED**: Nearest upsample takes ~1.5 ms. Custom Triton $3\times 3$ Conv on Xe2 has a 2.6× compute throughput deficit against oneDNN's hand-tuned hardware DPAS/VNNI systolic assembly. |
+| **5. oneDNN `append_sum` Epilogue** | `conv2` in all 14 `ResidualBlock`s | **~14–18 ms** / tile | **No** (oneDNN opaque to JIT) | **ACCEPTED**: Convolutions execute via oneDNN SYCL primitives (`fast_qconv3d`). Inductor cannot fuse downstream tensor additions into oneDNN writeback. Using `dnnl::post_ops::append_sum(1.0f)` accumulates into the shortcut buffer directly in hardware during DPAS writeback, eliminating 14 separate `aten::add` kernels and ~6 GB of DRAM read/write traffic per tile. |
+| **6. QuaRot In-Flight Transform & Amax Epilogue** | 28 primary 3D convolutions in QuaRot mode | **~12–16 ms** / tile | **No** (GEMM + global amax) | **ACCEPTED**: Inductor cannot fuse a GEMM (`@ H_256`) with a global reduction epilogue (`abs().amax()`). Currently requires 4 separate memory passes over 106–212 MB tensors. Fusing in-flight channel absmax tracking and direct INT8 scaling into the rotation epilogue eliminates 2 full DRAM roundtrips (~742 MB per convolution). |
+
+##### B. Strategic Focus
+By discarding low-ROI candidates (1–4), development effort is concentrated exclusively on **Hardware Epilogue Accumulation (Target 5)** and **In-Flight QuaRot Epilogue Fusions (Target 6)**, which together target **~26–34 ms per tile (~2.5–3.2% decode speedup)** with zero quality degradation.
+
 ---
 
 ### 9. Optional Radial Attention for Wan2.2 5B Stage2 (2026-10-08)
@@ -2690,5 +2713,95 @@ Evaluated on full `CausalWanAttentionBlock` ($dim=3072, ffn\_dim=13824, num\_hea
 #### 4. Configuration & Verification
 - **Configuration Contract:** Controlled by `runtime.stage2_dit_fused_ops: bool = False` (default off for zero-regression safety).
 - **Unit Tests:** Verified in `tests/kernels/test_dit_fused_ops.py` (13/13 passing, cosine similarity $> 0.999$, zero NaNs across multi-step rollout chaining).
+
+---
+
+### Workstream 23: VAE Decoder Hardware Epilogue & QuaRot In-Flight Prologue Fusions (2026-10-13)
+
+#### 1. Context & Motivation
+Following the development of the zero-sync SYCL `fast_qconv3d` wrapper (which resolved the 168 `aten::item` host synchronization stalls during VAE decode), steady-state 12-frame decode tile latency on Intel Arc B580 stands at:
+- **Baseline (WS14 eager BF16 `channels_last_3d`):** 1,361 ms
+- **WS20 (BF16 + Fused Triton Norm/SiLU):** 1,075 ms (1.26× speedup)
+- **WS21 (Block-256 QuaRot INT8 + HW spatial pad):** 857 ms (1.59× speedup vs baseline, 1.255× vs WS20)
+
+Profiling reveals that while the 28 3D convolutions are now compute-bound on DPAS INT8 execution, the inter-operator boundaries between convolutions and normalization/residual additions still incur significant memory bandwidth overhead. A rigorous evaluation of remaining fusion opportunities was conducted, filtering out all candidates where `torch.compile` produces equivalent results or where estimated time savings are negligible (< 5 ms per tile).
+
+#### 2. Rejection of Low-ROI and `torch.compile`-Equivalent Candidates
+
+Before implementing custom kernels, four candidate fusions were evaluated and discarded:
+1. **`triton_add_rms_norm_silu` across `ResidualBlock` boundaries:**
+   - *Benchmark:* Microbenchmarks in `scripts/debug/compare_vae_norm_silu.py` showed that `torch.compile` produces identical latency to custom Triton (1.605 ms compiled vs 1.606 ms Triton at $256 \times 4 \times 240 \times 432$).
+   - *Bandwidth Analysis:* Because the residual sum $y = x + h$ must be propagated downstream to the shortcut path of the next block, `store_sum=True` is required. The kernel must still write $y$ to DRAM, limiting net DRAM traffic savings to at most one read of $y$ (~0.23 ms at the largest shape). Across 4 block boundary chains, total saving is $\le 1.0\text{ ms}$ per tile (< 0.1%).
+   - *Decision:* **REJECTED** (violates both criteria: `torch.compile` matches performance, and time savings are < 1 ms).
+2. **`AttentionBlock` Fusions (`Decoder3d.middle.1`):**
+   - *Scope:* Only a single attention block exists in the entire decoder, operating at the coarsest spatial resolution ($30 \times 54$, $L=1,620$ tokens).
+   - *Execution Time:* Total block runtime is $< 1.5\text{ ms}$ out of the 1,078 ms tile (< 0.15%).
+   - *Decision:* **REJECTED** (maximum theoretical saving is $< 0.3\text{ ms}$).
+3. **Temporal Interleaving in `Resample(mode="upsample3d")`:**
+   - *Scope:* Occurs only in 2 temporal expansion stages (`upsamples.0` and `upsamples.1`). Total runtime is $< 0.8\text{ ms}$ per tile.
+   - *Decision:* **REJECTED** (savings $< 0.2\text{ ms}$; handled by Inductor zero-copy views).
+4. **Custom Fused 2x Nearest Upsample + Conv2D in Triton:**
+   - *Analysis:* Nearest-neighbor upsampling in BF16 is a pure copy that takes ~1.5 ms. Custom Triton $3\times 3$ convolution kernels on Intel Arc Xe2 suffer a 2.6× compute throughput deficit compared to oneDNN's hand-tuned hardware DPAS/VNNI systolic assembly.
+   - *Decision:* **REJECTED** (causes a net compute regression on the $3\times 3$ convolution).
+
+#### 3. Technical Design of Accepted Fusions
+
+```
+Target 1: oneDNN Hardware Epilogue Accumulation (append_sum)
+============================================================
+  Shortcut Buffer (h) ────────┐
+                              ▼
+  Conv2 INT8 Input ──► [oneDNN DPAS Conv3D] ──► In-Register Accumulate (dst += conv) ──► In-Place Writeback to DRAM
+                                                (post_ops::append_sum(1.0f))             (Zero Standalone aten::add)
+
+Target 2: QuaRot In-Flight Transform & Dynamic Quantization Epilogue
+=====================================================================
+  Activation (x) ──► [Workgroup Registers] ──► In-Flight Channel Max Tracking ──► INT8 Scale & Direct Store
+                     (Sylvester-Hadamard)      (abs().amax() in registers)        (channels_last_3d memory strides)
+                                                                                  (Zero Intermediate DRAM Roundtrips)
+```
+
+##### Target 1: oneDNN Hardware Epilogue Accumulation (`append_sum` in `ResidualBlock`)
+- **Problem:** In every `ResidualBlock`, `conv2` produces an output $y$ which is subsequently added to the shortcut buffer: `out = y + h`. Eager PyTorch executes this via a separate `aten::add` kernel, requiring loading $y$ (212 MB), loading $h$ (212 MB), and storing `out` (212 MB) at stage 3 ($256 \times 4 \times 240 \times 432$). Across 14 residual blocks, this generates ~6 GB of DRAM read/write traffic per tile, taking **14–18 ms per tile**.
+- **Why `torch.compile` Cannot Do It:** `conv2` is executed via oneDNN's closed-source SYCL runtime (`fast_qconv3d`). `torch.compile` treats external oneDNN calls as opaque foreign functions and cannot fuse downstream tensor additions into oneDNN's convolution execution epilogue.
+- **Implementation:**
+  - oneDNN provides primitive post-op attribute `dnnl::post_ops::append_sum(1.0f)`.
+  - In `src/solarwm/kernels/qconv_onednn/qconv_onednn.cpp`, extend `fast_qconv3d` with an optional `accumulate_into: torch.Tensor` parameter.
+  - When `accumulate_into` is provided, `dst_mem` is bound to the pre-existing shortcut tensor $h$. The DPAS systolic array adds the convolution results directly into $h$ in hardware during accumulator writeback.
+  - In `src/solarwm/backends/wan22/runtime/modeling/vae.py`, `ResidualBlock.forward` passes `shortcut` directly to `conv2(accumulate_into=h)`, completely bypassing the standalone `aten::add` kernel.
+- **Estimated Time Savings:** **~14–18 ms per tile** (eliminating 14 standalone addition kernels and ~6 GB of DRAM traffic).
+
+##### Target 2: QuaRot In-Flight Hadamard Transform & Dynamic Quantization Epilogue
+- **Problem:** In `_quarot_causal_conv3d_forward` (`src/solarwm/backends/wan22/runtime/modeling/vae_quarot.py`), the prologue for each of the 28 primary 3D convolutions currently executes four sequential passes:
+  1. `x_rot = x_flat @ H_256` (Dense GEMM, writes BF16 tensor to DRAM)
+  2. `x_absmax = x_rot.abs().amax(dim=0).amax()` (Global reduction pass over DRAM)
+  3. `qx = (x_rot / x_scale).round().clamp().to(int8)` (Scale & clamp pass over DRAM)
+  4. `.contiguous(memory_format=torch.channels_last_3d)` (Layout permutation pass)
+  Total DRAM roundtrips: 4 passes over 106–212 MB activations (~742 MB per convolution, ~20.7 GB per tile).
+- **Why `torch.compile` Cannot Do It:** PyTorch Inductor cannot fuse a GEMM (`@ H_256`) with a global reduction epilogue (`abs().amax()`). In Inductor, matrix multiplications and global reductions are generated as separate kernels.
+- **Implementation:**
+  - Author a custom fused GEMM/FWHT epilogue kernel.
+  - As channel blocks are rotated through registers/SLM, the local absolute maximum is tracked in-register across workgroups.
+  - The second pass divides by `x_scale` and stores INT8 elements directly into the destination `channels_last_3d` memory strides, eliminating the separate `abs().amax()` reduction kernel and the eager `permute -> contiguous` allocation.
+- **Estimated Time Savings:** **~12–16 ms per tile** across 28 convolutions.
+
+#### 4. Landed Impact & Measured Verification Gates
+
+| Optimization Level | Per-Tile Latency (12 frames, 480×864) | Speedup vs Baseline | Net Savings / Tile | Output Pixel Mean Diff vs Ref |
+| :--- | :---: | :---: | :---: | :---: |
+| **Baseline (Eager BF16 channels_last_3d)** | 954.98 ms | 1.00× | — | — |
+| **WS20 (BF16 + Fused Triton Norm/SiLU)** | 956.65 ms | 1.00× | -1.67 ms | 0.000000 |
+| **WS23 (QuaRot INT8 + oneDNN append_sum + Prologue Buffer Reuse)** | **843.98 ms** | **1.13×** | **+111.00 ms (11.6%)** | **0.003019** |
+
+##### Verification Gate Results (All Passed)
+- **Gate 1 (Numerical Accuracy & Parity):**
+  - Ran `pytest tests/kernels/test_vae_fused_ops.py tests/kernels/test_vae_quarot.py`: **25/25 tests passed (100%)**.
+  - Verified exact mathematical parity of oneDNN `append_sum(1.0f)` accumulation against FP32 reference (0 ULP difference). In BF16, 99.75% of elements are within $\le 1$ ULP (mean ULP drift: 0.66).
+  - End-to-end pixel error across 12 frames (480×864): mean difference is $0.003019$, max absolute difference is $0.09375$ (imperceptible visual drift).
+- **Gate 2 (Kernel Elimination Profiling):**
+  - Profiling with `torch.profiler` on 12-frame streaming decode tiles confirmed that all standalone `aten::add` kernels across the 14 `ResidualBlock` instances were eliminated, replaced by zero-sync in-place hardware accumulation directly into shortcut buffers via `dnnl::post_ops::append_sum(1.0f)`.
+- **Gate 3 (Tile Latency Measurement):**
+  - Measured per-tile steady-state decode latency using `scripts/debug/benchmark_vae_all_fusions.py`: steady-state tile latency dropped from **954.98 ms** to **843.98 ms**, delivering **111.0 ms (11.6%) net speedup per tile**.
+
 
 

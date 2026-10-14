@@ -15,6 +15,24 @@ __all__ = [
 
 CACHE_T = 2
 
+# Padded conv inputs shared by every CausalConv3d with the same staged shape. The
+# VAE runs its convs serially on one stream, so a buffer is fully consumed by one
+# conv before the next conv of that shape overwrites it.
+_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+
+
+def _staging_buffer(shape, padding, like: torch.Tensor) -> torch.Tensor:
+    channels_last = like.is_contiguous(memory_format=torch.channels_last_3d)
+    key = (tuple(shape), tuple(padding), like.dtype, like.device, channels_last)
+    buf = _STAGING_BUFFERS.get(key)
+    if buf is None:
+        # The spatial border is zeroed here once and never written afterwards.
+        buf = torch.zeros(shape, dtype=like.dtype, device=like.device)
+        if channels_last:
+            buf = buf.contiguous(memory_format=torch.channels_last_3d)
+        _STAGING_BUFFERS[key] = buf
+    return buf
+
 
 class CausalConv3d(nn.Conv3d):
     """
@@ -32,42 +50,52 @@ class CausalConv3d(nn.Conv3d):
             0,
         )
         self.padding = (0, 0, 0)
-        self._fast_cache_buffer = None
 
-    def forward(self, x, cache_x=None):
+    def staged_input(self, x, cache_x=None, *, spatial=True):
+        """Return ``pad(cat([cache_x, x]))`` laid out in a reused zero-bordered buffer.
+
+        Only the cache frames and the new frames are copied into the interior;
+        leading temporal padding is zeroed only when the cache is shorter than it.
+        Returns ``None`` when the legacy cat/pad path must be used instead.
+        """
+        pad_w, pad_h, pad_t = self._padding[0], self._padding[2], self._padding[4]
+        if not spatial:
+            pad_w = pad_h = 0
+        cache_t = 0 if cache_x is None or pad_t == 0 else cache_x.shape[2]
+        if cache_t > pad_t or torch.compiler.is_compiling():
+            return None
+        b, c, t, h, w = x.shape
+        shape = (b, c, pad_t + t, h + 2 * pad_h, w + 2 * pad_w)
+        buf = _staging_buffer(shape, (pad_t, pad_h, pad_w), x)
+        inner = buf[:, :, :, pad_h : pad_h + h, pad_w : pad_w + w]
+        lead = pad_t - cache_t
+        if lead:
+            inner[:, :, :lead].zero_()
+        if cache_t:
+            inner[:, :, lead:pad_t].copy_(cache_x)
+        inner[:, :, pad_t:].copy_(x)
+        return buf
+
+    def forward(self, x, cache_x=None, accumulate_into=None):
+        if not any(self._padding):
+            res = super().forward(x)
+            if accumulate_into is not None:
+                return accumulate_into.add_(res)
+            return res
+        staged = self.staged_input(x, cache_x)
+        if staged is not None:
+            res = super().forward(staged)
+            if accumulate_into is not None:
+                return accumulate_into.add_(res)
+            return res
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            # Fast contiguous buffer reuse when incoming frame count is 1 and cache has 2 frames
-            if cache_x.shape[2] == 2 and x.shape[2] == 1:
-                b, c, _, h, w = x.shape
-                buf = self._fast_cache_buffer
-                if (
-                    buf is None
-                    or buf.shape != (b, c, 3, h, w)
-                    or buf.device != x.device
-                    or buf.dtype != x.dtype
-                ):
-                    buf = torch.empty(
-                        (b, c, 3, h, w),
-                        device=x.device,
-                        dtype=x.dtype,
-                        memory_format=(
-                            torch.channels_last_3d
-                            if x.is_contiguous(memory_format=torch.channels_last_3d)
-                            else torch.contiguous_format
-                        ),
-                    )
-                    self._fast_cache_buffer = buf
-                buf[:, :, :2, :, :].copy_(cache_x)
-                buf[:, :, 2:3, :, :].copy_(x)
-                x = buf
-            else:
-                x = torch.cat([cache_x, x], dim=2)
+            x = torch.cat([cache_x.to(x.device), x], dim=2)
             padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
-
-        return super().forward(x)
+        res = super().forward(F.pad(x, padding))
+        if accumulate_into is not None:
+            return accumulate_into.add_(res)
+        return res
 
 
 class RMS_norm(nn.Module):
@@ -96,7 +124,10 @@ class Upsample(nn.Upsample):
 
     def forward(self, x):
         if self.native_bfloat16 and x.dtype == torch.bfloat16:
-            return super().forward(x)
+            # Autocast lists nearest-exact upsampling as fp32-only; it is a pure copy,
+            # so running it in bf16 is exact and skips the fp32 round trip.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return super().forward(x)
         # Older XPU backends did not support nearest-exact interpolation in bf16.
         return super().forward(x.float()).type_as(x)
 
@@ -239,7 +270,9 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
+        last_conv = self.residual[-1]
         for layer in self.residual:
+            accum = h if (layer is last_conv and isinstance(layer, CausalConv3d)) else None
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -252,11 +285,19 @@ class ResidualBlock(nn.Module):
                         ],
                         dim=2,
                     )
-                x = layer(x, feat_cache[idx])
+                if accum is not None:
+                    x = layer(x, feat_cache[idx], accumulate_into=accum)
+                else:
+                    x = layer(x, feat_cache[idx])
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
-                x = layer(x)
+                if accum is not None:
+                    x = layer(x, accumulate_into=accum)
+                else:
+                    x = layer(x)
+        if isinstance(last_conv, CausalConv3d):
+            return x
         return x + h
 
 
@@ -411,6 +452,30 @@ class DupUp3D(nn.Module):
         assert out_channels * self.factor % in_channels == 0
         self.repeats = out_channels * self.factor // in_channels
 
+    def add_to_(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor | None:
+        """``out += forward(x)`` through a broadcast view, without materialising the shortcut.
+
+        Returns ``None`` when the channel grouping does not allow a view.
+        """
+        group = self.in_channels // self.out_channels
+        if group == 0 or self.in_channels % self.out_channels:
+            return None
+        b, _, t, h, w = x.shape
+        ft, fs = self.factor_t, self.factor_s
+        if out.shape != (b, self.out_channels, t * ft, h * fs, w * fs):
+            return None
+        try:
+            shortcut = (
+                x.view(b, self.out_channels, group, 1, t, h, w)
+                .expand(b, self.out_channels, group, self.repeats, t, h, w)
+                .view(b, self.out_channels, ft, fs, fs, t, h, w)
+                .permute(0, 1, 5, 2, 6, 3, 7, 4)
+            )
+        except RuntimeError:
+            return None
+        out.view(b, self.out_channels, t, ft, h, fs, w, fs).add_(shortcut)
+        return out
+
     def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
         x = x.repeat_interleave(self.repeats, dim=1)
         x = x.view(
@@ -497,14 +562,19 @@ class Up_ResidualBlock(nn.Module):
         self.upsamples = nn.Sequential(*upsamples)
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        x_main = x.clone()
+        # When avg_shortcut is present, preserve an unmutated input view for it
+        # while allowing in-place accumulation across upsample modules.
+        x_shortcut = x if self.avg_shortcut is None else x.clone()
+        x_main = x
         for module in self.upsamples:
             x_main = module(x_main, feat_cache, feat_idx)
-        if self.avg_shortcut is not None:
-            x_shortcut = self.avg_shortcut(x, first_chunk)
-            return x_main + x_shortcut
-        else:
+        if self.avg_shortcut is None:
             return x_main
+        if not first_chunk and x_main is not x_shortcut:
+            fused = self.avg_shortcut.add_to_(x_main, x_shortcut)
+            if fused is not None:
+                return fused
+        return x_main + self.avg_shortcut(x_shortcut, first_chunk)
 
 
 class Encoder3d(nn.Module):

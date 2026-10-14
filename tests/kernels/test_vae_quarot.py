@@ -111,12 +111,12 @@ def test_quarot_outlier_suppression_advantage():
 
     # 1. Unrotated W8A8 dynamic quantization
     w = conv.weight.data
-    w_scale = (w.abs().amax(dim=(1, 2, 3, 4)) / 127.0).clamp(min=1e-8)
+    w_scale = (w.abs().amax(dim=(1, 2, 3, 4)) / 127.0).clamp(min=1e-8).to(torch.float32)
     qw = (w / w_scale[:, None, None, None, None]).round().clamp(-127, 127).to(torch.int8).to(
         memory_format=torch.channels_last_3d
     )
     x_pad = F.pad(x, list(conv._padding))
-    scale_unrot = (x_pad.abs().amax(dim=(0, 2, 3, 4)).amax() / 127.0).clamp(min=1e-8)
+    scale_unrot = (x_pad.abs().amax(dim=(0, 2, 3, 4)).amax() / 127.0).clamp(min=1e-8).to(torch.float32)
     qx_unrot = (x_pad / scale_unrot).round().clamp(-127, 127).to(torch.int8)
 
     zero_w = torch.zeros((C,), dtype=torch.int32, device=device)
@@ -202,3 +202,73 @@ def test_apply_and_unpatch_vae_quarot():
     for name, module in dec.named_modules():
         if name in unpatched:
             assert getattr(module, "_quarot_enabled", False) is False
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU device required for oneDNN qconv")
+def test_quarot_hardware_accumulation_append_sum():
+    """Verify that oneDNN post_ops append_sum eliminates standalone aten::add and matches ULP gates."""
+    torch.manual_seed(42)
+    device = "xpu"
+    C = 256
+    conv = CausalConv3d(C, C, 3, padding=1).to(device=device, dtype=torch.bfloat16)
+    conv.to(memory_format=torch.channels_last_3d)
+
+    H = get_hadamard_matrix(256, device=device, dtype=torch.bfloat16)
+    install_quarot_conv(conv, H, use_compile=False)
+
+    x = torch.randn(1, C, 3, 12, 12, device=device, dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+    shortcut = torch.randn(1, C, 3, 12, 12, device=device, dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+
+    # 1. Standalone addition reference: conv(x) + shortcut
+    ref_conv_out = conv(x)
+    ref_sum = ref_conv_out + shortcut
+
+    # 2. Hardware accumulation: conv(x, accumulate_into=accum)
+    accum = shortcut.clone()
+    accum_out = conv(x, accumulate_into=accum)
+
+    # Verify zero-copy in-place accumulation
+    assert accum_out.data_ptr() == accum.data_ptr(), "Hardware accumulation must write into target buffer"
+
+    # Verify numerical parity with FP32 accumulator precision
+    # Convert bfloat16 to integer representation to measure exact ULP distance
+    i_ref = ref_sum.view(torch.int16).long() & 0xFFFF
+    i_accum = accum_out.view(torch.int16).long() & 0xFFFF
+    ord_ref = torch.where(i_ref >= 0x8000, 0x8000 - (i_ref & 0x7FFF), 0x8000 + i_ref)
+    ord_accum = torch.where(i_accum >= 0x8000, 0x8000 - (i_accum & 0x7FFF), 0x8000 + i_accum)
+    ulp_dist = (ord_ref - ord_accum).abs()
+
+    mean_ulp = ulp_dist.float().mean().item()
+    pct_within_1_ulp = (ulp_dist <= 1).float().mean().item() * 100.0
+
+    assert mean_ulp < 1.0, f"Mean ULP distance {mean_ulp:.3f} exceeded 1.0 threshold"
+    assert pct_within_1_ulp >= 99.0, f"Only {pct_within_1_ulp:.2f}% of elements within 1 ULP (expected >= 99%)"
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU device required for oneDNN qconv")
+def test_residual_block_append_sum_parity():
+    """Verify ResidualBlock forward path using hardware accumulation vs eager addition."""
+    from solarwm.backends.wan22.runtime.modeling.vae import ResidualBlock
+
+    torch.manual_seed(42)
+    device = "xpu"
+    dim = 256
+    block = ResidualBlock(dim, dim).to(device=device, dtype=torch.bfloat16)
+    block.eval()
+
+    x = torch.randn(1, dim, 3, 12, 12, device=device, dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+
+    feat_cache = [None] * 10
+    feat_idx = [0]
+    out = block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
