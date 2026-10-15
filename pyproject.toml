@@ -33,6 +33,19 @@ wan = [
   "transformers==5.12.1",
   "peft==0.20.0",
 ]
+wan-xpu = [
+  # Keep this extra free of CUDA-only FlashAttention. Install torch from the
+  # PyTorch XPU index before installing this extra.
+  "diffusers==0.38.0",
+  "decord>=0.6",
+  "einops>=0.8",
+  "ftfy>=6.2",
+  "omegaconf>=2.3",
+  "regex>=2024.0",
+  "safetensors>=0.4",
+  "transformers==5.12.1",
+  "peft==0.20.0",
+]
 h3 = [
   "flash-attn==2.8.3",
   "imageio==2.37.4",

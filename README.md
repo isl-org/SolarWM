@@ -98,6 +98,19 @@ python -m pip install -e .
 solarwm environment probe
 ```
 
+For a new Wan2.2-5B machine, activate an environment with PyTorch already
+installed, then let the cross-platform installer detect the device, download
+the Stage2 inference assets, and optionally configure ComfyUI:
+
+```bash
+python scripts/install_solarwm.py
+python scripts/install_solarwm.py --comfyui /path/to/ComfyUI
+```
+
+See the [installation guide](docs/install.md) for custom paths, private
+SVDQuant weights, and the commands to upload them to a private Hugging Face
+repository.
+
 Model weights are available from the
 [`SolarWM model collection`](https://huggingface.co/collections/junchaoh-cs/solarwm). See the
 [Wan2.2 TI2V-5B guide](docs/backends/wan22-ti2v-5b.md) for Stage0.5, Stage1,
