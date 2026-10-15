@@ -9,23 +9,42 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from solarwm.backends.wan22.runtime.interactive import Stage2InteractiveSession
-from solarwm.backends.wan22.runtime.interactive_camera import FreeFlyCamera
+from solarwm.backends.wan22.runtime.interactive_camera import (
+    FreeFlyCamera,
+    camera_tokens_from_poses,
+)
 
 
 ProviderFactory = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
 
+def _rgb_frame(pixels: Any, frame_index: int = 0) -> Any:
+    import numpy as np
+
+    frame = pixels[0, int(frame_index)].detach().float().cpu().numpy()
+    if frame.ndim != 3:
+        raise ValueError(f"decoded frame must have three dimensions, got {frame.shape}")
+    if frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
+        frame = np.transpose(frame, (1, 2, 0))
+    if frame.shape[-1] == 1:
+        frame = np.repeat(frame, 3, axis=-1)
+    elif frame.shape[-1] == 4:
+        frame = frame[..., :3]
+    if frame.shape[-1] != 3:
+        raise ValueError(f"decoded frame must have 1, 3, or 4 channels, got {frame.shape}")
+    return np.clip((frame + 1.0) * 127.5, 0, 255).round().astype(np.uint8)
+
+
 def _jpeg_bytes(pixels: Any, frame_index: int = 0) -> bytes:
     """Encode one decoded frame in a viewer-friendly format."""
 
-    import numpy as np
     from PIL import Image
 
-    frame = pixels[0, int(frame_index)].detach().float().cpu().numpy()
-    frame = np.clip((frame + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    frame = _rgb_frame(pixels, frame_index)
     return _encode_image(Image.fromarray(frame), "JPEG")
 
 
@@ -35,12 +54,50 @@ def _encode_image(image: Any, format_name: str) -> bytes:
     return output.getvalue()
 
 
+class _VideoRecorder:
+    """Incrementally write decoded interactive frames to an H.264 MP4."""
+
+    def __init__(self, path: Path, fps: float) -> None:
+        self.path = path
+        self.fps = max(1, int(round(fps)))
+        self.container: Any | None = None
+        self.stream: Any | None = None
+
+    def write(self, pixels: Any, frame_index: int) -> None:
+        import av
+
+        frame = _rgb_frame(pixels, frame_index)
+        if self.container is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.container = av.open(str(self.path), mode="w")
+            self.stream = self.container.add_stream("libx264", rate=self.fps)
+            self.stream.width = int(frame.shape[1])
+            self.stream.height = int(frame.shape[0])
+            self.stream.pix_fmt = "yuv420p"
+            self.stream.options = {"crf": "18", "preset": "medium"}
+        video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+        for packet in self.stream.encode(video_frame):
+            self.container.mux(packet)
+
+    def close(self) -> None:
+        if self.container is None:
+            return
+        try:
+            for packet in self.stream.encode():
+                self.container.mux(packet)
+        finally:
+            self.container.close()
+            self.container = None
+
+
 @dataclass
 class SessionState:
     session_id: str
     runtime: Stage2InteractiveSession
     camera: FreeFlyCamera
     decode_context: Any
+    recording_path: Path | None = None
+    recording_fps: float = 16.0
     device_lock: threading.Lock = field(default_factory=threading.Lock)
     worker: threading.Thread | None = None
     controls: set[str] = field(default_factory=set)
@@ -54,6 +111,7 @@ class SessionState:
         default_factory=lambda: queue.Queue(maxsize=8)
     )
     lock: threading.Lock = field(default_factory=threading.Lock)
+    _recorder: _VideoRecorder | None = field(default=None, init=False, repr=False)
 
     def start(self) -> None:
         self.worker = threading.Thread(
@@ -76,18 +134,39 @@ class SessionState:
                     time.sleep(0.02)
                     continue
                 now = time.perf_counter()
-                dt = min(max(now - last_step, 0.0), 0.25)
-                last_step = now
-                pose = self.camera.update(keys, dt)
-                camera_tokens = self.camera.model_tokens(
+                fps = 16.0
+                if hasattr(self.runtime, "provider") and hasattr(self.runtime.provider, "config"):
+                    fps = float(self.runtime.provider.config.get("data", {}).get("fps", 16.0))
+                dt_sub = 4.0 / max(fps, 1.0)
+                chunk = int(getattr(self.runtime, "chunk", 1))
+                poses = []
+                if self.runtime.latent_index == 0:
+                    poses.append(self.camera.pose.copy())
+                    for _ in range(chunk - 1):
+                        pose = self.camera.update(keys, dt_sub)
+                        poses.append(pose)
+                else:
+                    for _ in range(chunk):
+                        pose = self.camera.update(keys, dt_sub)
+                        poses.append(pose)
+                camera_tokens = camera_tokens_from_poses(
+                    poses,
+                    origin=self.camera._origin,
                     frame_sequence_length=self.runtime.frame_sequence_length,
                     device=self.runtime.device,
                     dtype=self.runtime.dtype,
                 )
                 with self.device_lock:
-                    frame = self.runtime.step(camera_tokens, pose=pose)
+                    frame = self.runtime.step(camera_tokens, pose=poses[-1])
                 first_pixel = self.runtime.emitted_pixel_frames - int(frame.pixels.shape[1])
                 for offset in range(int(frame.pixels.shape[1])):
+                    if self.recording_path is not None:
+                        if self._recorder is None:
+                            self._recorder = _VideoRecorder(
+                                self.recording_path,
+                                self.recording_fps,
+                            )
+                        self._recorder.write(frame.pixels, offset)
                     self._publish(
                         {
                             "type": "frame",
@@ -113,6 +192,11 @@ class SessionState:
                     "type": "stopped",
                     "reason": "horizon" if self.runtime.done else "cancelled",
                     "latent_index": self.runtime.latent_index,
+                    "video_path": (
+                        str(self.recording_path)
+                        if self.recording_path is not None
+                        else None
+                    ),
                 }
             )
         except Exception as exc:
@@ -120,11 +204,19 @@ class SessionState:
                 {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
             )
         finally:
+            if self._recorder is not None:
+                self._recorder.close()
             self.runtime.close()
             self.decode_context.__exit__(None, None, None)
-            close = getattr(self.runtime.provider, "close", None)
-            if callable(close):
-                close()
+            try:
+                import torch
+
+                if hasattr(torch, "xpu") and torch.xpu.is_available():
+                    torch.xpu.empty_cache()
+                elif torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _publish(self, event: dict[str, Any] | tuple[str, bytes]) -> None:
         try:
@@ -179,8 +271,15 @@ class SessionState:
             elif action == "look_up":
                 self.camera.rotation_speed = min(6.28, self.camera.rotation_speed * 1.2)
             elif action == "defaults":
-                self.camera.translation_speed = 1.0
-                self.camera.rotation_speed = 0.7
+                self.camera.translation_speed = 0.1
+                self.camera.rotation_speed = 0.1
+                self.camera.default_motion = "straight_about_turn_10s"
+                self.camera.turn_delay_seconds = 4.0
+                self.camera.turn_duration_seconds = 2.0
+                self.camera.turn_angle_rad = 3.141592653589793
+                self.camera.acceleration = 2.5
+                self.camera.damping = 3.0
+                self.camera.reset()
 
     def stop(self) -> None:
         with self.lock:
@@ -205,14 +304,44 @@ class SolarWMSessionManager:
                 "SolarWM provider factory is not configured; call "
                 "configure_provider_factory() from the ComfyUI deployment"
             )
+        # Ensure any existing active sessions are terminated before starting a new one
+        with self._lock:
+            stale_ids = list(self._sessions.keys())
+        for sid in stale_ids:
+            self.delete(sid)
+
         values = dict(self._provider_factory(payload))
         provider = values["provider"]
         decode_context = provider.vae.streaming_decode_session()
         decode_tile = decode_context.__enter__()
         try:
+            inf_cfg = getattr(provider, "config", {}).get("inference", {})
+            camera_motion = str(
+                payload.get(
+                    "camera_motion",
+                    inf_cfg.get("default_camera_motion", "straight_about_turn_10s"),
+                )
+            )
+            is_circle = camera_motion == "circle_twice_10s"
             camera = FreeFlyCamera(
-                translation_speed=float(payload.get("translation_speed", 1.0)),
-                rotation_speed=float(payload.get("rotation_speed", 0.7)),
+                translation_speed=float(
+                    payload.get(
+                        "translation_speed",
+                        inf_cfg.get("default_translation_speed", 0.1),
+                    )
+                ),
+                rotation_speed=float(
+                    payload.get(
+                        "rotation_speed",
+                        inf_cfg.get("default_rotation_speed", 0.1),
+                    )
+                ),
+                default_motion=camera_motion,
+                turn_delay_seconds=0.0 if is_circle else 4.0,
+                turn_duration_seconds=10.0 if is_circle else 2.0,
+                turn_angle_rad=4.0 * 3.141592653589793 if is_circle else 3.141592653589793,
+                acceleration=float(inf_cfg.get("default_acceleration", 2.5)),
+                damping=float(inf_cfg.get("default_damping", 3.0)),
             )
             runtime = Stage2InteractiveSession.from_provider(
                 provider,
@@ -223,10 +352,34 @@ class SolarWMSessionManager:
                 decode_tile=decode_tile,
                 first_pose=camera.pose,
             )
-            session = SessionState(str(uuid.uuid4()), runtime, camera, decode_context)
+            session_id = str(uuid.uuid4())
+            configured_output = str(
+                getattr(provider, "config", {})
+                .get("runtime", {})
+                .get("output_dir", "")
+            )
+            if not configured_output or configured_output.startswith("/path/to/"):
+                output_root = (
+                    Path(__file__).resolve().parents[2]
+                    / "outputs"
+                    / "solarwm_interactive"
+                )
+            else:
+                output_root = Path(configured_output).expanduser()
+            recording_path = output_root / f"{session_id}.mp4"
+            recording_fps = float(
+                getattr(provider, "config", {}).get("data", {}).get("fps", 16.0)
+            )
+            session = SessionState(
+                session_id,
+                runtime,
+                camera,
+                decode_context,
+                recording_path=recording_path,
+                recording_fps=recording_fps,
+            )
         except Exception:
             decode_context.__exit__(None, None, None)
-            provider.close()
             raise
         with self._lock:
             session.device_lock = self._device_lock

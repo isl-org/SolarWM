@@ -55,12 +55,13 @@ def test_camera_tokens_rebase_to_initial_absolute_pose():
     assert torch.allclose(tokens["K"][0, 0], tokens["K"][0, 5])
 
 
-def test_default_motion_forward_turn_right_4s_then_forward():
+def test_straight_about_turn_trajectory_walks_back():
     camera = FreeFlyCamera(
         translation_speed=0.5,
-        default_motion="forward_turn_right_4s",
+        default_motion="straight_about_turn_10s",
         turn_delay_seconds=4.0,
         turn_duration_seconds=2.0,
+        turn_angle_rad=np.pi,
     )
     dt = 0.25  # 1 latent frame duration at 16 fps
 
@@ -75,35 +76,33 @@ def test_default_motion_forward_turn_right_4s_then_forward():
     assert np.isclose(fwd_4s[0], 0.0, atol=1e-3)
     assert np.isclose(fwd_4s[2], -1.0, atol=1e-3)
 
-    # Next 10 steps (2.5 seconds): turn right to 90 degrees
-    for _ in range(10):
-        camera.update(set(), dt)
-
-    # Turn should be completed (90 deg / pi/2 right turn)
-    assert np.isclose(camera._turn_accumulated, np.pi / 2.0, atol=1e-3)
-    fwd_turn = camera.pose[:3, :3] @ np.array([0.0, 0.0, -1.0])
-    assert np.isclose(fwd_turn[0], 1.0, atol=1e-2)  # now pointing right (+X)
-    assert np.isclose(fwd_turn[2], 0.0, atol=1e-2)
-
-    z_after_turn = camera.pose[2, 3]
-    x_after_turn = camera.pose[0, 3]
-
-    # Next 8 steps (2.0 seconds): continuing moving slowly forward in new heading (-X)
+    # Next 8 steps (2 seconds): turn in place through 180 degrees.
+    z_before_turn = camera.pose[2, 3]
     for _ in range(8):
         camera.update(set(), dt)
 
-    assert camera.pose[0, 3] < x_after_turn - 0.5  # moving forward along -X
-    assert np.isclose(camera.pose[2, 3], z_after_turn, atol=0.05)  # Z stayed steady
+    assert np.isclose(camera._turn_accumulated, np.pi, atol=1e-3)
+    assert np.isclose(camera.pose[2, 3], z_before_turn, atol=0.02)
+    fwd_turn = camera.pose[:3, :3] @ np.array([0.0, 0.0, -1.0])
+    assert np.isclose(fwd_turn[0], 0.0, atol=1e-2)
+    assert np.isclose(fwd_turn[2], 1.0, atol=1e-2)
+
+    # Next 16 steps (4 seconds): walk back along -Z.
+    for _ in range(16):
+        camera.update(set(), dt)
+
+    assert camera.pose[2, 3] < z_before_turn - 1.5
+    assert np.isclose(camera.pose[0, 3], 0.0, atol=0.02)
 
 
-def test_default_camera_uses_smooth_4s_turn_defaults():
+def test_default_camera_uses_smooth_about_turn_defaults():
     camera = FreeFlyCamera()
     assert camera.turn_delay_seconds == 4.0
-    assert camera.turn_duration_seconds == 4.0
+    assert camera.turn_duration_seconds == 2.0
     assert np.isclose(camera.rotation_speed, 0.1, atol=1e-4)
     assert camera.acceleration == 2.5
     assert camera.damping == 3.0
-    assert camera.default_motion == "forward_turn_right_4s"
+    assert camera.default_motion == "straight_about_turn_10s"
 
     dt = 0.25  # 1 latent frame duration at 16 fps
 
@@ -113,25 +112,44 @@ def test_default_camera_uses_smooth_4s_turn_defaults():
     assert camera._turn_accumulated == 0.0
     assert camera.pose[2, 3] > 0.3
 
-    # 4 to 8s: 16 steps smooth turn
+    # 4 to 6s: 8 steps smooth about-turn
     prev_turn = 0.0
     turn_deltas = []
-    for _ in range(16):
+    for _ in range(8):
         camera.update(set(), dt)
         delta = camera._turn_accumulated - prev_turn
         turn_deltas.append(delta)
         prev_turn = camera._turn_accumulated
 
-    # Turn should be completed to exactly 90 degrees (pi/2)
-    assert np.isclose(camera._turn_accumulated, np.pi / 2.0, atol=1e-3)
+    assert np.isclose(camera._turn_accumulated, np.pi, atol=1e-3)
     # Smooth start: first step delta is gentle (< 1 deg)
-    assert np.degrees(turn_deltas[0]) < 1.0
+    assert np.degrees(turn_deltas[0]) < 4.0
     # Smooth end: last step delta is gentle (< 1 deg)
-    assert np.degrees(turn_deltas[-1]) < 1.0
-    # Heading points right along +X
+    assert np.degrees(turn_deltas[-1]) < 4.0
+    # Heading has reversed along Z.
     fwd = camera.pose[:3, :3] @ np.array([0.0, 0.0, -1.0])
-    assert np.isclose(fwd[0], 1.0, atol=1e-2)
-    assert np.isclose(fwd[2], 0.0, atol=1e-2)
+    assert np.isclose(fwd[0], 0.0, atol=1e-2)
+    assert np.isclose(fwd[2], 1.0, atol=1e-2)
+
+
+def test_circle_twice_trajectory_closes_after_ten_seconds():
+    camera = FreeFlyCamera(
+        translation_speed=0.1,
+        default_motion="circle_twice_10s",
+        turn_delay_seconds=0.0,
+        turn_duration_seconds=10.0,
+        turn_angle_rad=4.0 * np.pi,
+    )
+    for _ in range(40):
+        camera.update(set(), 0.25)
+
+    assert np.isclose(camera._turn_accumulated, 4.0 * np.pi, atol=1e-3)
+    assert np.linalg.norm(camera.pose[:3, 3]) < 0.02
+    assert np.allclose(camera.pose[:3, :3], np.eye(3), atol=1e-3)
+    end_pose = camera.pose.copy()
+    for _ in range(4):
+        camera.update(set(), 0.25)
+    assert np.allclose(camera.pose, end_pose, atol=1e-6)
 
 
 def test_default_camera_initial_velocity_is_constant_speed():
@@ -152,8 +170,10 @@ def test_default_camera_initial_velocity_is_constant_speed():
 def test_midpoint_integration_keeps_trajectory_tangent_to_heading():
     camera = FreeFlyCamera(
         translation_speed=0.5,
+        default_motion="circle_twice_10s",
         turn_delay_seconds=0.0,
         turn_duration_seconds=4.0,
+        turn_angle_rad=2.0 * np.pi,
     )
     dt = 0.25
     prev_pos = camera.pose[:3, 3].copy()

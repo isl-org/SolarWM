@@ -97,11 +97,11 @@ inference:
   source: validation
   length: camera
   interactive: true
-  default_camera_motion: forward_turn_right_4s
+  default_camera_motion: straight_about_turn_10s
   default_translation_speed: 0.1
   default_rotation_speed: 0.1
   default_turn_delay_seconds: 4.0
-  default_turn_duration_seconds: 4.0
+  default_turn_duration_seconds: 2.0
   default_acceleration: 2.5
   default_damping: 3.0
   kv_cache_mode: circular

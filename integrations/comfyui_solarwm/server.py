@@ -29,7 +29,8 @@ def register_routes() -> None:
     @routes.post("/solarwm/sessions")
     async def create_session(request: web.Request) -> web.Response:
         try:
-            session = manager.create(await request.json())
+            payload = await request.json()
+            session = await asyncio.to_thread(manager.create, payload)
         except Exception as exc:
             return web.json_response(
                 {"error": f"{type(exc).__name__}: {exc}"},
@@ -50,6 +51,11 @@ def register_routes() -> None:
                 "latent_index": session.runtime.latent_index,
                 "pixel_frames": session.runtime.emitted_pixel_frames,
                 "done": session.runtime.done,
+                "video_path": (
+                    str(session.recording_path)
+                    if session.recording_path is not None
+                    else None
+                ),
             }
         )
 
@@ -57,6 +63,23 @@ def register_routes() -> None:
     async def delete_session(request: web.Request) -> web.Response:
         manager.delete(request.match_info["session_id"])
         return web.json_response({"ok": True})
+
+    @routes.get("/solarwm/model/status")
+    async def model_status(request: web.Request) -> web.Response:
+        from .factory import is_provider_cached
+
+        return web.json_response({"cached": is_provider_cached()})
+
+    @routes.post("/solarwm/model/unload")
+    async def unload_model(request: web.Request) -> web.Response:
+        from .factory import clear_cached_provider
+
+        with manager._lock:
+            active_ids = list(manager._sessions.keys())
+        for sid in active_ids:
+            manager.delete(sid)
+        await asyncio.to_thread(clear_cached_provider)
+        return web.json_response({"ok": True, "message": "Model unloaded from VRAM"})
 
     @routes.get("/solarwm/sessions/{session_id}/stream")
     async def stream_session(request: web.Request) -> web.WebSocketResponse:

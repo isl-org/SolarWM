@@ -27,6 +27,9 @@ _LOOK_KEYS = {
     "KeyZ": np.array([0.0, 0.0, 1.0]),
     "KeyC": np.array([0.0, 0.0, -1.0]),
 }
+_STRAIGHT_ABOUT_TURN = "straight_about_turn_10s"
+_CIRCLE_TWICE = "circle_twice_10s"
+_AUTONOMOUS_MOTIONS = {_STRAIGHT_ABOUT_TURN, _CIRCLE_TWICE}
 
 
 def _rotation(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -76,10 +79,10 @@ class FreeFlyCamera:
     damping: float = 3.0
     boost_multiplier: float = 3.0
     precision_multiplier: float = 0.25
-    default_motion: str = "forward_turn_right_4s"
+    default_motion: str = _STRAIGHT_ABOUT_TURN
     turn_delay_seconds: float = 4.0
-    turn_duration_seconds: float = 4.0
-    turn_angle_rad: float = np.pi / 2.0
+    turn_duration_seconds: float = 2.0
+    turn_angle_rad: float = np.pi
     _velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
     _angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
     _elapsed_time: float = field(default=0.0, init=False)
@@ -88,8 +91,12 @@ class FreeFlyCamera:
     def __post_init__(self) -> None:
         self.pose = np.asarray(self.pose, dtype=np.float64).copy()
         _validate_pose(self.pose)
+        if self.default_motion == _CIRCLE_TWICE:
+            self.turn_delay_seconds = 0.0
+            self.turn_duration_seconds = 10.0
+            self.turn_angle_rad = 4.0 * np.pi
         self._origin = self.pose.copy()
-        if self.default_motion == "forward_turn_right_4s":
+        if self.default_motion in _AUTONOMOUS_MOTIONS:
             self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
 
     def reset(self, pose: np.ndarray | None = None) -> None:
@@ -102,8 +109,13 @@ class FreeFlyCamera:
         self._angular_velocity.fill(0.0)
         self._elapsed_time = 0.0
         self._turn_accumulated = 0.0
-        self.default_motion = "forward_turn_right_4s"
-        self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
+        if self.default_motion == "none":
+            self.default_motion = _STRAIGHT_ABOUT_TURN
+            self.turn_delay_seconds = 4.0
+            self.turn_duration_seconds = 2.0
+            self.turn_angle_rad = np.pi
+        if self.default_motion in _AUTONOMOUS_MOTIONS:
+            self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
 
     def brake(self) -> None:
         self._velocity.fill(0.0)
@@ -126,8 +138,11 @@ class FreeFlyCamera:
                 (value for key, value in _TRANSLATION_KEYS.items() if key in keys),
                 start=np.zeros(3, dtype=np.float64),
             )
-        elif self.default_motion == "forward_turn_right_4s":
-            # Default motion: move forward in the model's +Z trajectory direction.
+        elif (
+            self.default_motion in _AUTONOMOUS_MOTIONS
+            and self._elapsed_time < 10.0
+        ):
+            # Autonomous motion follows the model's +Z trajectory direction.
             translation = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         else:
             translation = np.zeros(3, dtype=np.float64)
@@ -139,20 +154,39 @@ class FreeFlyCamera:
                 start=np.zeros(3, dtype=np.float64),
             )
         elif (
-            self.default_motion == "forward_turn_right_4s"
+            self.default_motion in _AUTONOMOUS_MOTIONS
+            and self._elapsed_time < 10.0
             and self._elapsed_time + dt > self.turn_delay_seconds
             and self._turn_accumulated < self.turn_angle_rad
         ):
-            # Smooth C2-continuous turn using smootherstep: S(tau) = 6*tau^5 - 15*tau^4 + 10*tau^3
             dur = max(self.turn_duration_seconds, 1e-6)
-            tau0 = np.clip((self._elapsed_time - self.turn_delay_seconds) / dur, 0.0, 1.0)
-            tau1 = np.clip((self._elapsed_time + dt - self.turn_delay_seconds) / dur, 0.0, 1.0)
-            s0 = 6.0 * (tau0**5) - 15.0 * (tau0**4) + 10.0 * (tau0**3)
-            s1 = 6.0 * (tau1**5) - 15.0 * (tau1**4) + 10.0 * (tau1**3)
-            turn_d_yaw = float(self.turn_angle_rad * (s1 - s0))
+            if self.default_motion == _CIRCLE_TWICE:
+                turn_d_yaw = min(
+                    float(self.turn_angle_rad - self._turn_accumulated),
+                    float(self.turn_angle_rad * dt / dur),
+                )
+            else:
+                # Smooth C2-continuous about-turn using smootherstep.
+                tau0 = np.clip(
+                    (self._elapsed_time - self.turn_delay_seconds) / dur, 0.0, 1.0
+                )
+                tau1 = np.clip(
+                    (self._elapsed_time + dt - self.turn_delay_seconds) / dur,
+                    0.0,
+                    1.0,
+                )
+                s0 = 6.0 * (tau0**5) - 15.0 * (tau0**4) + 10.0 * (tau0**3)
+                s1 = 6.0 * (tau1**5) - 15.0 * (tau1**4) + 10.0 * (tau1**3)
+                turn_d_yaw = float(self.turn_angle_rad * (s1 - s0))
             self._turn_accumulated = min(float(self.turn_angle_rad), self._turn_accumulated + turn_d_yaw)
             rotation = np.zeros(3, dtype=np.float64)
-            if tau1 >= 1.0 or self._turn_accumulated >= self.turn_angle_rad:
+            if (
+                self._turn_accumulated >= self.turn_angle_rad
+                or (
+                    self.default_motion != _CIRCLE_TWICE
+                    and tau1 >= 1.0
+                )
+            ):
                 self._angular_velocity[0] = 0.0
             elif dt > 0:
                 self._angular_velocity[0] = -turn_d_yaw / dt
@@ -169,7 +203,21 @@ class FreeFlyCamera:
         target_velocity = translation * self.translation_speed * multiplier
         target_angular = rotation * self.rotation_speed * multiplier
         alpha = 1.0 - np.exp(-self.acceleration * dt)
-        self._velocity += (target_velocity - self._velocity) * alpha
+        turning_in_place = (
+            self.default_motion == _STRAIGHT_ABOUT_TURN
+            and self.turn_delay_seconds < self._elapsed_time + dt
+            and self._elapsed_time < self.turn_delay_seconds + self.turn_duration_seconds
+        )
+        if turning_in_place and not has_manual_translation:
+            self._velocity.fill(0.0)
+        else:
+            self._velocity += (target_velocity - self._velocity) * alpha
+        if (
+            self.default_motion in _AUTONOMOUS_MOTIONS
+            and self._elapsed_time >= 10.0
+            and not has_manual_translation
+        ):
+            self._velocity.fill(0.0)
         if has_manual_rotation:
             self._angular_velocity += (target_angular - self._angular_velocity) * alpha
         else:

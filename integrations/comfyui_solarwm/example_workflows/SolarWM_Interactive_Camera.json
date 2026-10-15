@@ -11,7 +11,7 @@
       ],
       "size": [
         420,
-        300
+        340
       ],
       "flags": {},
       "order": 0,
@@ -58,6 +58,46 @@
           "link": null
         },
         {
+          "name": "attention_backend",
+          "type": "COMBO",
+          "widget": {
+            "name": "attention_backend"
+          },
+          "link": null
+        },
+        {
+          "name": "linear_quant",
+          "type": "COMBO",
+          "widget": {
+            "name": "linear_quant"
+          },
+          "link": null
+        },
+        {
+          "name": "svdquant_weights_root",
+          "type": "STRING",
+          "widget": {
+            "name": "svdquant_weights_root"
+          },
+          "link": null
+        },
+        {
+          "name": "stage2_vae_quant",
+          "type": "COMBO",
+          "widget": {
+            "name": "stage2_vae_quant"
+          },
+          "link": null
+        },
+        {
+          "name": "camera_motion",
+          "type": "COMBO",
+          "widget": {
+            "name": "camera_motion"
+          },
+          "link": null
+        },
+        {
           "name": "translation_speed",
           "type": "FLOAT",
           "widget": {
@@ -88,11 +128,19 @@
       "widgets_values": [
         "/home/ssheorey/code/SolarWM/configs/examples/wan22_ti2v_5b/infer_stage2_sgf_interactive_xpu.local.yaml",
         "/home/ssheorey/code/SolarWM/assets/eastshade.webp",
-        "A moving camera through the scene",
+        "Walk slowly straight ahead for 4 seconds, take an about turn, and walk back.",
         42,
+        "fixed",
         120,
-        1.0,
-        0.7
+        "sdpa",
+        "full_precision",
+        "/home/ssheorey/models/SolarWM/SolarWM-5B-sgf-stage2-81f/svdquant_int4",
+        "full_precision",
+        "straight_about_turn_10s",
+        0.1,
+        0.1,
+        "2x",
+        8
       ]
     }
   ],
