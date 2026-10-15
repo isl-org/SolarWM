@@ -200,6 +200,7 @@ Pixel tiles concatenated along time -> `[1,3,F_pixel_total,480,864]`, fp32, wher
 | WS21 | Block-256 QuaRot W8A8 Dynamic Quantization for VAE decode | 1.3–1.6× conv speedup | **15.04 → 12.80 s full decode (1.18×); 857 ms/tile (1.255× vs WS20); 48.56 dB PSNR** | medium | PSNR | **Done and verified** |
 | WS22 | DiT Operator Fusions (AdaLN-LayerNorm, Gated Residual, QK WanRMSNorm, FFN oneDNN GELU) | −25–35 ms/chunk | **5.295 → 5.068 ms/block (1.045×); −27.2 ms/chunk, 15.44 GB DRAM traffic eliminated** | low | cosine / NaN | **Done and verified** |
 | WS23 | VAE Hardware Epilogue & QuaRot In-Flight Fusions (`oneDNN append_sum` & In-Flight Transform) | 0.955 → 0.844 s/tile (−111.0 ms/tile, 11.6%) | Landed ~14–18 ms (`append_sum`) + QuaRot dynamic quant prologue buffer reuse; zero-ROI and `torch.compile`-equivalent candidates rejected | medium | PSNR / ULP | **Complete** |
+| WS24 | VAE Decoder Graph Compilation (`torch.compile` Inductor XPU & OpenVINO GPU/CPU) | 1.15–1.30× decode speedup *(projected; whole-graph fusion)* | **torch.compile: 720.7 ms/chunk (1.02× vs Eager 736.6 ms)** with ~10–25s JIT warmup and Level-Zero pad buffer spikes; **OpenVINO GPU: 1,037.6 ms/chunk (0.71× vs Eager)**; OpenVINO CPU: 87.4 s/chunk | medium | exact | **Rejected** — PyTorch Eager retained as default production path |
 
 WS1 is first because it is the largest single win, carries no new code risk, and is independent of
 everything else — and because doing it first means the harness and every later gate measure the
@@ -2802,6 +2803,55 @@ Target 2: QuaRot In-Flight Transform & Dynamic Quantization Epilogue
   - Profiling with `torch.profiler` on 12-frame streaming decode tiles confirmed that all standalone `aten::add` kernels across the 14 `ResidualBlock` instances were eliminated, replaced by zero-sync in-place hardware accumulation directly into shortcut buffers via `dnnl::post_ops::append_sum(1.0f)`.
 - **Gate 3 (Tile Latency Measurement):**
   - Measured per-tile steady-state decode latency using `scripts/debug/benchmark_vae_all_fusions.py`: steady-state tile latency dropped from **954.98 ms** to **843.98 ms**, delivering **111.0 ms (11.6%) net speedup per tile**.
+
+---
+
+### Workstream 24: VAE Decoder Whole-Graph Compilation (`torch.compile` Inductor XPU) & OpenVINO IR Export Evaluation (2026-10-15)
+
+#### 1. Context & Motivation
+Following the operator-level and prologue/epilogue fusions delivered in WS20 and WS23, VAE decoding accounts for ~740–750 ms per generation chunk ($T=3$ latent frames, yielding 12 video frames at $480\times 864$). To determine whether whole-graph compiler optimizations could yield substantial end-to-end latency reductions beyond hand-tuned eager kernels, an evaluation of two graph compilation paradigms was conducted:
+1. **PyTorch Inductor (`torch.compile`) on Intel XPU:** Full-graph capture and kernel fusion of `Decoder3d`, eliminating graph breaks across causal cache mutations and custom Triton normalization kernels.
+2. **OpenVINO Intermediate Representation (IR) Export:** Full model export to OpenVINO FP16 IR and evaluation across both Intel Arc Xe GPU and host CPU runtimes.
+
+#### 2. Technical Implementation & Graph Break Elimination
+Prior to this evaluation, compiling `Decoder3d` under PyTorch Inductor failed or fell back to graph breaks due to:
+- Triton `SCALE: float` causing a driver assertion (`assert val.type.is_fp()` failed during float truncation in Triton on Intel XPU). Resolved by converting `SCALE` to `tl.constexpr` and removing `@torch.compiler.disable`.
+- Dynamic slice allocation and list resizing in `feat_cache` causing Inductor tracing guards and recompilations. Resolved by introducing `preallocate_cache()` to pre-allocate all 35 causal cache slices in `channels_last_3d` layout with in-place rolling (`copy_`).
+
+#### 3. Latency & Throughput Benchmark Comparison
+
+Benchmarking was executed on Intel Arc dGPU (`[0xe223]`) and Intel Core Ultra 5 245K CPU on identical latent inputs ($480\times 864$ resolution).
+
+##### Breakdown of Decode Granularity: Slice ($T=1$) vs Chunk ($T=3$)
+- **Temporal Slice ($T=1$ latent frame):** One iterative pass through `Decoder3d`, producing 4 video frames.
+- **Pipeline Chunk ($T=3$ latent frames):** One generation block (`model.num_frame_per_block: 3`), executing 3 temporal slices followed by `conv2` and spatial unpatchify to emit 12 video frames:
+  $$\text{1 Chunk Latency} = 3 \times \text{Slice Latency} + t_{\text{conv2/unpatchify}} \approx 3 \times 244.1\text{ ms} + 4.4\text{ ms} = \mathbf{736.6\text{ ms}}$$
+
+##### Comparative Execution Engines
+
+| Execution Engine | Backend / Precision | Per-Slice Latency ($T=1$) | Per-Chunk Latency ($T=3$, 12 frames) | Relative Throughput | Decision |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **PyTorch Eager (Current)** | XPU BF16 + Fused Triton Norm/SiLU | **244.1 ms** | **736.6 ms** (~0.74 s) | **1.00× (Baseline)** | **Production Default** |
+| **PyTorch Compiled** | `torch.compile` (Inductor XPU) | **240.2 ms** | **720.7 ms** (~0.72 s) | **1.02×** | **Rejected** |
+| **OpenVINO GPU** | OpenVINO Runtime FP16 IR | **345.9 ms** | **1,037.6 ms** (~1.04 s) | **0.71×** | **Rejected** |
+| **OpenVINO CPU** | Core Ultra 5 245K FP32 IR | 29,120 ms | ~87,360 ms (~87.4 s) | 0.008× | N/A |
+
+#### 4. Rejection Justification
+
+##### A. PyTorch Compiled (`torch.compile` Inductor XPU)
+1. **Negligible Latency Gain (1.02×):** `torch.compile` achieves only a 3.9 ms improvement per slice (244.1 ms $\to$ 240.2 ms), corresponding to ~16 ms per chunk (736.6 ms $\to$ 720.7 ms).
+2. **Severe JIT Warmup Penalty:** The first chunk incurs a 10–25s compilation delay, unacceptable for interactive streaming.
+3. **Memory Allocation & Level-Zero Pressure:** Inductor lowers padding and temporal concatenation into explicit pointwise Triton kernels rather than oneDNN's native zero-copy spatial offsets. For the largest stages ($240\times 432$), this allocates intermediate 322 MB temporary padding buffers per layer, inflating peak VRAM usage and creating driver allocation overhead.
+
+##### B. OpenVINO GPU Runtime
+1. **Throughput Regression (0.71× vs Eager):** OpenVINO GPU takes 1,037.6 ms per chunk compared to 736.6 ms in PyTorch Eager (a 41% latency penalty).
+2. **Kernel Selection Disadvantage:** PyTorch on Intel XPU executes 3D convolutions via oneDNN's highly optimized DPAS systolic kernels in blocked `channels_last_3d` layout. OpenVINO's current OpenCL kernel selection for 3D causal convolutions is memory-bandwidth bound and lacks the fused layouts established in the PyTorch pipeline.
+
+#### 5. Conclusion & Action
+- **Decision:** **REJECTED.** Whole-graph compilation via `torch.compile` and OpenVINO IR does not meet the latency-improvement criteria on Intel XPU.
+- **Production Path:** Retained **PyTorch Eager** as the default and only production execution path (`stage2_vae_compile: bool = False`).
+- **Retained Architectural Improvements:** Retained the clean, static cache buffer pre-allocation (`preallocate_cache`) and in-place tensor rolling, which eliminates dynamic cache allocations during eager streaming decode without any compiler dependency. All temporary OpenVINO export artifacts have been removed.
+
 
 
 

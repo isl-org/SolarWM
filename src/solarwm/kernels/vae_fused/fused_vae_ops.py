@@ -32,11 +32,11 @@ def _fused_rms_norm_silu_kernel(
     OUT_ptr,
     M: int,
     C: int,
-    SCALE: float,
     stride_xm: int,
     stride_xc: int,
     stride_outm: int,
     stride_outc: int,
+    SCALE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -86,7 +86,6 @@ def _fused_add_rms_norm_silu_kernel(
     OUT_SUM_ptr,
     M: int,
     C: int,
-    SCALE: float,
     stride_xm: int,
     stride_xc: int,
     stride_rm: int,
@@ -95,6 +94,7 @@ def _fused_add_rms_norm_silu_kernel(
     stride_outc: int,
     stride_sm: int,
     stride_sc: int,
+    SCALE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     STORE_SUM: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -157,7 +157,6 @@ def _get_strides(tensor: torch.Tensor, C: int) -> tuple[int, int]:
     raise ValueError(f"Tensor with shape {tensor.shape} and strides {tensor.stride()} is not in channels-first layout with contiguous channels.")
 
 
-@torch.compiler.disable
 def triton_rms_norm_silu(
     x: torch.Tensor,
     gamma: torch.Tensor,
@@ -205,11 +204,11 @@ def triton_rms_norm_silu(
         out,
         M,
         C,
-        scale_val,
         stride_xm,
         stride_xc,
         stride_outm,
         stride_outc,
+        SCALE=scale_val,
         HAS_BIAS=has_bias,
         BLOCK_M=BLOCK_M,
         BLOCK_C=BLOCK_C,
@@ -218,7 +217,6 @@ def triton_rms_norm_silu(
     return out
 
 
-@torch.compiler.disable
 def triton_add_rms_norm_silu(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -279,7 +277,6 @@ def triton_add_rms_norm_silu(
         out_sum,
         M,
         C,
-        scale_val,
         stride_xm,
         stride_xc,
         stride_rm,
@@ -288,6 +285,7 @@ def triton_add_rms_norm_silu(
         stride_outc,
         stride_sm,
         stride_sc,
+        SCALE=scale_val,
         HAS_BIAS=has_bias,
         STORE_SUM=store_sum,
         BLOCK_M=BLOCK_M,

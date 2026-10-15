@@ -233,6 +233,8 @@ class Wan5BVAE:
 
             apply_vae_quarot(self.module.decoder, enabled=True)
         if device_type == "xpu" and self._stage2_vae_compile:
+            if hasattr(self.module, "preallocate_cache"):
+                self.module.preallocate_cache(dtype=dtype, device=device_type)
             self.module.decoder = torch.compile(
                 self.module.decoder,
                 mode=self._stage2_vae_compile_mode,
