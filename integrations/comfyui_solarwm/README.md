@@ -22,7 +22,7 @@ configuration before model construction:
 | --- | --- | --- |
 | `attention_backend` | `sdpa`, `sageattnv1` | `sdpa` |
 | `linear_quant` | `full_precision`, `svdquant_k1`, `svdquant_k2`, `svdquant_k4` | `full_precision` |
-| `svdquant_weights_root` | SVDQuant weight directory | `${SOLAR_MODEL_ROOT}/SolarWM-5B-sgf-stage2-81f/svdquant_int4` |
+| `svdquant_weights_root` | SVDQuant weight directory | `models/SolarWM-5B-sgf-stage2-81f/svdquant_int4` |
 | `stage2_vae_quant` | `full_precision`, `quarot_w8a8` | `full_precision` |
 | `camera_motion` | `straight_about_turn_10s`, `circle_twice_10s`, `manual_only` | `straight_about_turn_10s` |
 | `translation_speed` | float | `0.1` |

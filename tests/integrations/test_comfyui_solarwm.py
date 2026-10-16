@@ -121,6 +121,29 @@ def test_interactive_config_applies_and_validates_stage2_options():
         _interactive_config({"linear_quant": "int8"}, base)
 
 
+def test_interactive_config_resolves_relative_model_paths():
+    base = {
+        "model": {"base_path": "models/SolarWM-5B-base"},
+        "runtime": {},
+        "checkpoint": {"path": "models/SolarWM-5B-sgf-stage2-81f"},
+    }
+    config = _interactive_config(
+        {
+            "linear_quant": "svdquant_k1",
+            "svdquant_weights_root": "models/SolarWM-5B-sgf-stage2-81f/svdquant_int4",
+        },
+        base,
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    assert config["model"]["base_path"] == str(repo_root / "models/SolarWM-5B-base")
+    assert config["checkpoint"]["path"] == str(
+        repo_root / "models/SolarWM-5B-sgf-stage2-81f"
+    )
+    assert config["model"]["svdquant_weights_root"] == str(
+        repo_root / "models/SolarWM-5B-sgf-stage2-81f/svdquant_int4"
+    )
+
+
 def test_jpeg_encoder_accepts_decoded_channel_first_frames():
     import torch
     from PIL import Image
@@ -194,6 +217,14 @@ def test_workflow_template_widgets_values_aligned():
         assert isinstance(wv[12], (int, float)) and abs(wv[12] - 0.1) < 1e-3
         assert wv[13] in ("1x", "2x", "fit") and wv[13] == "2x"
         assert wv[14] in (4, 8, 12, 16, 24, 30) and wv[14] == 8
+
+    for path in template_paths[:2]:
+        workflow = json.loads(path.read_text(encoding="utf-8"))
+        node = next(n for n in workflow["nodes"] if n.get("type") == "SolarWMInteractive")
+        for value in (node["widgets_values"][0], node["widgets_values"][1], node["widgets_values"][8]):
+            assert not value.startswith(("/", "\\")) and not (
+                len(value) > 1 and value[1] == ":"
+            ), f"template path is not portable: {value}"
 
 
 def test_session_run_does_not_close_provider_on_finish():

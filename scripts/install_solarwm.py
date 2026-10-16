@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from importlib.metadata import PackageNotFoundError, version
 import importlib.util
+import os
 from pathlib import Path
 import re
 import shutil
@@ -49,6 +50,8 @@ WAN_RUNTIME_PACKAGES = (
 )
 BASE_PACKAGES = ("numpy>=1.24", "PyYAML>=6.0")
 PACKAGE_NAME = re.compile(r"^[A-Za-z0-9_.-]+")
+WINDOWS_DRIVE_PATH = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+CYGDRIVE_PATH = re.compile(r"^/cygdrive/([A-Za-z])(?:/(.*))?$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,13 +63,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--comfyui",
-        type=Path,
+        type=str,
         help="ComfyUI installation whose extra_model_paths.yaml should be updated",
     )
     parser.add_argument(
         "--local-dir",
-        type=Path,
-        default=DEFAULT_MODEL_DIR,
+        type=str,
+        default=str(DEFAULT_MODEL_DIR),
         help=f"Local model directory (default: {DEFAULT_MODEL_DIR})",
     )
     parser.add_argument(
@@ -83,6 +86,20 @@ def parse_args() -> argparse.Namespace:
 
 def fail(message: str) -> NoReturn:
     raise SystemExit(f"error: {message}")
+
+
+def normalize_path(value: str | Path) -> Path:
+    raw = os.fspath(value)
+    cygdrive_match = CYGDRIVE_PATH.match(raw)
+    if cygdrive_match and os.name == "nt":
+        drive, suffix = cygdrive_match.groups()
+        raw = f"{drive.upper()}:/{suffix or ''}"
+    elif os.name != "nt":
+        windows_match = WINDOWS_DRIVE_PATH.match(raw)
+        if windows_match and Path("/cygdrive").is_dir():
+            drive, suffix = windows_match.groups()
+            raw = "/cygdrive/" + drive.lower() + "/" + suffix.replace(chr(92), "/")
+    return Path(raw).expanduser().resolve()
 
 
 def ensure_virtual_environment() -> None:
@@ -186,7 +203,7 @@ def download_weights(
     local_dir: Path,
     svdquant_repo: str | None,
 ) -> Path:
-    local_dir = local_dir.expanduser().resolve()
+    local_dir = normalize_path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
     if model_weights_are_present(local_dir):
@@ -295,12 +312,12 @@ def main() -> None:
     print(f"Detected device: {device} (torch {torch.__version__})")
 
     install_runtime(device)
-    model_root = args.local_dir.expanduser().resolve()
+    model_root = normalize_path(args.local_dir)
     if not args.skip_weights:
         model_root = download_weights(args.local_dir, args.svdquant_repo)
     configure_interactive_config(model_root)
     if args.comfyui:
-        configure_comfyui(args.comfyui.expanduser().resolve(), model_root)
+        configure_comfyui(normalize_path(args.comfyui), model_root)
 
     print("SolarWM installation complete.")
     if args.comfyui:

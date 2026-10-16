@@ -95,7 +95,7 @@ class SolarWMInteractive:
                     "STRING",
                     {
                         "default": (
-                            "${SOLAR_MODEL_ROOT}/SolarWM-5B-sgf-stage2-81f/"
+                            "models/SolarWM-5B-sgf-stage2-81f/"
                             "svdquant_int4"
                         ),
                         "tooltip": "Root containing <attention_backend>_<k> SVDQuant weights",
