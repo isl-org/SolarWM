@@ -3,6 +3,16 @@ from __future__ import annotations
 import pytest
 
 from solarwm.backends.wan22.runtime.components import Wan5BVAE
+from solarwm.backends.wan22.runtime.modeling.vae import WanVAE_
+
+
+def test_wanvae_clear_cache_before_preallocate() -> None:
+    vae = WanVAE_()
+
+    vae.clear_cache()
+
+    assert vae._feat_map is not None
+    assert all(value is None for value in vae._feat_map)
 
 
 def test_wan5b_streaming_decode_keeps_one_cache_across_temporal_tiles() -> None:

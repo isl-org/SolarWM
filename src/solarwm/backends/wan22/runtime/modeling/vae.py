@@ -850,6 +850,10 @@ class WanVAE_(nn.Module):
             self.temperal_upsample,
             dropout,
         )
+        self._feat_map: list[torch.Tensor | None] | None = None
+        self._conv_num = 0
+        self._conv_idx = [0]
+        self._is_first_chunk = True
 
     def forward(self, x, scale=[0, 1]):
         mu = self.encode(x, scale)
