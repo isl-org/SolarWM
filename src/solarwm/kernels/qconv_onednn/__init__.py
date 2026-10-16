@@ -6,6 +6,7 @@ in PyTorch XPU's native `onednn::qconv_pointwise.tensor` binding.
 
 from __future__ import annotations
 
+from importlib.machinery import EXTENSION_SUFFIXES
 import importlib.util
 import os
 import shutil
@@ -16,14 +17,59 @@ from typing import Sequence
 
 import torch
 
-_SO_NAME = "qconv_onednn_ops.so"
 _MOD_NAME = "qconv_onednn_ops"
 _MODULE = None
 
 
-def _build_extension(so_path: Path) -> bool:
+def _module_suffix() -> str:
+    suffix = next(
+        (
+            value
+            for value in EXTENSION_SUFFIXES
+            if value.endswith(".pyd" if os.name == "nt" else ".so")
+        ),
+        None,
+    )
+    return suffix or (".pyd" if os.name == "nt" else ".so")
+
+
+def _module_path() -> Path:
+    package_dir = Path(__file__).parent
+    suffixes = [
+        value
+        for value in EXTENSION_SUFFIXES
+        if value.endswith(".pyd" if os.name == "nt" else ".so")
+    ]
+    suffixes.append(_module_suffix())
+    for suffix in dict.fromkeys(suffixes):
+        candidate = package_dir / f"{_MOD_NAME}{suffix}"
+        if candidate.exists():
+            return candidate
+    return package_dir / f"{_MOD_NAME}{_module_suffix()}"
+
+
+def _dnnl_root() -> Path:
+    configured = os.environ.get("DNNLROOT")
+    if configured:
+        return Path(configured)
+    if os.name == "nt":
+        roots = (
+            os.environ.get("ProgramW6432"),
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+        )
+        candidates = [
+            Path(root) / "Intel" / "oneAPI" / "dnnl" / "latest"
+            for root in roots
+            if root
+        ]
+        return next((path for path in candidates if path.exists()), candidates[0])
+    return Path("/opt/intel/oneapi/dnnl/latest")
+
+
+def _build_extension(module_path: Path) -> bool:
     """Compile the SYCL oneDNN extension using icpx if available."""
-    icpx = shutil.which("icpx")
+    icpx = shutil.which("icpx") or shutil.which("icx")
     if not icpx:
         return False
 
@@ -36,7 +82,7 @@ def _build_extension(so_path: Path) -> bool:
     torch_lib = torch_dir / "lib"
     py_inc = sysconfig.get_path("include")
 
-    dnnl_root = Path(os.environ.get("DNNLROOT", "/opt/intel/oneapi/dnnl/latest"))
+    dnnl_root = _dnnl_root()
     dnnl_inc = dnnl_root / "include"
     dnnl_lib = dnnl_root / "lib"
 
@@ -47,7 +93,6 @@ def _build_extension(so_path: Path) -> bool:
     cmd = [
         icpx,
         "-shared",
-        "-fPIC",
         "-O3",
         "-std=c++17",
         "-fsycl",
@@ -65,12 +110,13 @@ def _build_extension(so_path: Path) -> bool:
         "-lc10_xpu",
         "-ltorch_xpu",
         "-ldnnl",
-        f"-Wl,-rpath,{torch_lib}",
-        f"-Wl,-rpath,{dnnl_lib}",
         str(src_file),
         "-o",
-        str(so_path),
+        str(module_path),
     ]
+    if os.name != "nt":
+        cmd[2:2] = ["-fPIC"]
+        cmd[-4:-4] = [f"-Wl,-rpath,{torch_lib}", f"-Wl,-rpath,{dnnl_lib}"]
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -84,14 +130,14 @@ def _get_module():
     if _MODULE is not None:
         return _MODULE
 
-    so_path = Path(__file__).parent / _SO_NAME
-    if not so_path.exists():
-        built = _build_extension(so_path)
-        if not built or not so_path.exists():
+    module_path = _module_path()
+    if not module_path.exists():
+        built = _build_extension(module_path)
+        if not built or not module_path.exists():
             return None
 
     try:
-        spec = importlib.util.spec_from_file_location(_MOD_NAME, str(so_path))
+        spec = importlib.util.spec_from_file_location(_MOD_NAME, str(module_path))
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)

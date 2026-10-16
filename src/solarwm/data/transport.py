@@ -7,7 +7,6 @@ files and GCS objects therefore cannot perturb the logical RNG stream.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import http.client
 import json
@@ -21,10 +20,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Protocol
 from urllib.parse import urlparse
+import warnings
 
 from solarwm.errors import DataContractError
 
 from .index import IndexRow, ShardIdentity, shard_identity, validate_relative_key
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+    warnings.warn(
+        "SolarWM file locking is unavailable; continuing without GCS cache locks. "
+        "This is not required for interactive inference.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def join_root(root: str, relative_key: str) -> str:
@@ -397,6 +408,8 @@ def _failure_happened_during_call(path: Path, *, uri: str, started_ns: int) -> b
 def _acquire_flock(lock: BinaryIO, *, deadline: float, total_seconds: float, uri: str) -> None:
     """Acquire one shard lock within the same bounded transfer window."""
 
+    if fcntl is None:
+        return
     while True:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -542,7 +555,7 @@ class GCSResolver:
                     finally:
                         part.unlink(missing_ok=True)
             finally:
-                if acquired:
+                if acquired and fcntl is not None:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
         if downloaded:
@@ -552,7 +565,8 @@ class GCSResolver:
     def _evict(self, *, protect: Path) -> None:
         eviction_lock = self.cache_dir / ".evict.lock"
         with eviction_lock.open("a+b") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 self._reap_orphan_parts()
                 total = 0
@@ -572,7 +586,8 @@ class GCSResolver:
                     item_lock_path = candidate.with_suffix(candidate.suffix + ".lock")
                     with item_lock_path.open("a+b") as item_lock:
                         try:
-                            fcntl.flock(item_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            if fcntl is not None:
+                                fcntl.flock(item_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                         except BlockingIOError:
                             continue
                         candidate.unlink(missing_ok=True)
@@ -582,7 +597,8 @@ class GCSResolver:
                         self._verified.pop(candidate, None)
                         total -= size
             finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _reap_orphan_parts(self) -> None:
         """Delete abandoned large partials only when their item lock is free."""
@@ -599,7 +615,8 @@ class GCSResolver:
             )
             with lock_path.open("a+b") as item_lock:
                 try:
-                    fcntl.flock(item_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fcntl is not None:
+                        fcntl.flock(item_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     continue
                 part.unlink(missing_ok=True)

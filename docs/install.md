@@ -38,6 +38,15 @@ auth login` before downloading a gated or private repository. The installer
 also writes a local interactive YAML config with `model.base_path` and
 `checkpoint.path` pointing at the selected model directory.
 
+On an Intel XPU machine, pass `--build-kernels` to build the optional
+SVDQuant SYCL extension and load/build the oneDNN qconv extension. The
+SVDQuant build uses `--gpu-arch bmg-g31` by default; override it when needed.
+The step is idempotent for an existing SVDQuant native extension:
+
+```text
+python scripts/install_solarwm.py --build-kernels --gpu-arch bmg-g31
+```
+
 The installer keeps any package already present in the active environment,
 regardless of its version. It has no upgrade, sync, or uninstall step; install
 or resolve incompatible existing versions separately if needed.

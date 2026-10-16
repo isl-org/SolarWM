@@ -32,4 +32,8 @@ The target runtime metric is the **sum of execution times across 5 layers**:
 ## Portability & Build Requirements
 - Self-contained `sycl-tla` headers and applications are bundled in the package (`sycl-tla/`).
 - No machine-specific hardcoded paths are used; include directories are resolved relative to the task root.
-- The build harness assumes `icpx` (Intel oneAPI DPC++/C++ Compiler) is present in `PATH`.
+- The build harness assumes Intel oneAPI's `icpx` (or Windows `icx`) compiler is
+  present in `PATH`.
+- Run `python build.py --gpu-arch bmg-g31`; the extension is emitted with
+  Python's native-module suffix (`.pyd` on Windows, `.so` on Linux) in this
+  package directory.

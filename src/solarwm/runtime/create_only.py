@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import os
 import stat
 import uuid
+import warnings
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+    warnings.warn(
+        "SolarWM create-only publication locks are unavailable; continuing without "
+        "them. This is not required for interactive inference.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def _raise(error_type: type[Exception], message: str) -> None:
@@ -78,7 +89,8 @@ def publish_directory_no_replace(
         _raise(error_type, f"{label} staging and target must be siblings")
     lock_path = target.parent / ".solarwm-directory-publication.lock"
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             _rename_no_replace(
                 staging,
@@ -92,7 +104,8 @@ def publish_directory_no_replace(
             finally:
                 os.close(directory_fd)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def write_file_create_only(

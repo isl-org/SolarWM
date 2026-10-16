@@ -25,6 +25,7 @@ train = [
 ]
 wan = [
   # Matches the release-tested Wan runtime and its UniPC scheduler behavior.
+  "av",
   "diffusers==0.38.0",
   "flash-attn==2.8.3",
   "ftfy>=6.2",
@@ -36,6 +37,7 @@ wan = [
 wan-xpu = [
   # Keep this extra free of CUDA-only FlashAttention. Install torch from the
   # PyTorch XPU index before installing this extra.
+  "av",
   "diffusers==0.38.0",
   "decord>=0.6",
   "einops>=0.8",

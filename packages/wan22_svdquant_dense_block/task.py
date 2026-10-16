@@ -22,7 +22,14 @@ from qdq_utils import (
     unpack_int4_signed,
 )
 from reference_kernels import bf16_linear, bf16_linear_activation
-from triton_w4a4_gemm import triton_svdquant_w4a4_gemm
+try:
+    from triton_w4a4_gemm import triton_svdquant_w4a4_gemm
+except ModuleNotFoundError:
+    # Triton is not available in the Windows build environment. It is only
+    # needed by the correctness oracle, not by the SYCL extension build.
+    triton_svdquant_w4a4_gemm = None
+
+_REFERENCE_EXTENSION_NAME = "svdquant_dense_reference_kernel"
 
 """
 [USER_INSTRUCTIONS_START]
@@ -165,18 +172,42 @@ def device():
 @pytest.fixture(scope="session")
 def candidate_kernel():
     """Import the compiled SYCL kernel."""
-    return importlib.import_module(extension_name(load_hparams()))
+    name = extension_name(load_hparams())
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+    TestWan22SvdquantDenseBlock().build(TestBase.get_machine_gpu_arch())
+    importlib.invalidate_caches()
+    return importlib.import_module(name)
+
+
+@pytest.fixture(scope="session")
+def reference_kernel():
+    return load_reference_kernel()
+
+
+def load_reference_kernel():
+    try:
+        return importlib.import_module(_REFERENCE_EXTENSION_NAME)
+    except ModuleNotFoundError as exc:
+        if exc.name != _REFERENCE_EXTENSION_NAME:
+            raise
+    TestWan22SvdquantDenseBlock().build_reference(TestBase.get_machine_gpu_arch())
+    importlib.invalidate_caches()
+    return importlib.import_module(_REFERENCE_EXTENSION_NAME)
 
 
 @pytest.fixture(scope="session")
 def kernel(use_reference):
     """Kernel fixture conforming to kernelfoundry interface:
 
-    When --ref is passed, returns the PyTorch BF16 baseline.
+    When --ref is passed, returns the frozen current SYCL kernel baseline.
     Otherwise, returns the SYCL candidate dense block callable.
     """
     if use_reference:
-        return reference_dense_block
+        return make_sycl_dense_block_fn(load_reference_kernel())
     else:
         return make_sycl_dense_block_fn(importlib.import_module(extension_name(load_hparams())))
 
@@ -308,11 +339,11 @@ class TestWan22SvdquantDenseBlock(TestBase):
     - 2 FFN layers (FFN Up: 1215 x 3072 x 14336 + gelu_tanh, FFN Down: 1215 x 14336 x 3072, rank 32)
     """
 
-    def build(self, gpu_arch) -> list[str]:
+    def build(self, gpu_arch, **buildtime_params) -> list[str]:
         if gpu_arch in ("b70", "bmg", "0xe223", "0xE223") or "bmg" in str(gpu_arch).lower():
             gpu_arch = "bmg-g31"
         pkg_dir = Path(__file__).parent.resolve()
-        hp = rebuild_hparams()
+        hp = {**rebuild_hparams(), **buildtime_params}
         write_tuning_header(pkg_dir, hp)
         # Portable local paths within package
         sycl_tla_include = (pkg_dir / "sycl-tla" / "include").resolve()
@@ -324,7 +355,9 @@ class TestWan22SvdquantDenseBlock(TestBase):
             curr = os.environ.get(env_k, "")
             to_add = [p for p in inc_paths if p not in curr]
             if to_add:
-                os.environ[env_k] = ":".join(to_add) + (f":{curr}" if curr else "")
+                os.environ[env_k] = os.pathsep.join(to_add) + (
+                    f"{os.pathsep}{curr}" if curr else ""
+                )
 
         artifacts = self.compile_torch_extension(
             extension_name=extension_name(hp),
@@ -336,7 +369,28 @@ class TestWan22SvdquantDenseBlock(TestBase):
         return artifacts
 
     def build_reference(self, gpu_arch) -> list[str]:
-        return []
+        if gpu_arch in ("b70", "bmg", "0xe223", "0xE223") or "bmg" in str(gpu_arch).lower():
+            gpu_arch = "bmg-g31"
+        pkg_dir = Path(__file__).parent.resolve()
+        write_tuning_header(pkg_dir, load_hparams())
+        sycl_tla_include = (pkg_dir / "sycl-tla" / "include").resolve()
+        sycl_tla_apps = (pkg_dir / "sycl-tla" / "applications").resolve()
+        sycl_tla_tools = (pkg_dir / "sycl-tla" / "tools" / "util" / "include").resolve()
+        inc_paths = [str(sycl_tla_include), str(sycl_tla_apps), str(sycl_tla_tools)]
+        for env_k in ["CPATH", "CPLUS_INCLUDE_PATH"]:
+            curr = os.environ.get(env_k, "")
+            to_add = [p for p in inc_paths if p not in curr]
+            if to_add:
+                os.environ[env_k] = os.pathsep.join(to_add) + (
+                    f"{os.pathsep}{curr}" if curr else ""
+                )
+        return self.compile_torch_extension(
+            extension_name=_REFERENCE_EXTENSION_NAME,
+            src=str(pkg_dir / "reference_kernel.sycl"),
+            output_dir=pkg_dir,
+            gpu_arch=gpu_arch,
+            backend="icpx",
+        )
 
     # =========================================================================
     # Correctness Tests (Direct bfloat16 comparison against Triton kernel oracle)
@@ -350,7 +404,7 @@ class TestWan22SvdquantDenseBlock(TestBase):
     def test_correctness_reference_self_consistency(self, kernel, device, block_data, use_reference):
         """Verify that the reference execution is self-consistent and produces finite outputs."""
         if use_reference:
-            q, k, v, ffn = kernel(*block_data["ref_args"])
+            q, k, v, ffn = kernel(*block_data["sycl_args"])
             assert torch.isfinite(q).all(), "Reference Q projection contains NaN/inf"
             assert torch.isfinite(k).all(), "Reference K projection contains NaN/inf"
             assert torch.isfinite(v).all(), "Reference V projection contains NaN/inf"
@@ -509,19 +563,18 @@ class TestWan22SvdquantDenseBlock(TestBase):
         Reference: PyTorch native BF16 execution.
         Kernel: Fused SVDQuant INT4 + BF16 LoRA execution with FFN chaining.
         """
-        args = block_data["ref_args"] if use_reference else block_data["sycl_args"]
-        measure_runtime_torch(kernel, device, args=args)
+        measure_runtime_torch(kernel, device, args=block_data["sycl_args"])
 
     @pytest.mark.performance
-    def test_benchmark_projection_q(self, kernel, device, block_data, use_reference, candidate_kernel, measure_runtime_torch):
+    def test_benchmark_projection_q(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
         """Benchmark Q projection with RMSNorm: M = 1215, K = 3072, N = 3072, rank 32."""
         x = block_data["x"]
         p = block_data["q_p"]
         if use_reference:
             measure_runtime_torch(
-                bf16_linear, device,
-                args=(x, p["w_bf16"], p["bias"], p["lora_a"], p["lora_b"]),
-                kwargs={"norm_weight": p["norm_w"]}
+                reference_kernel.svdquant_w4a4_gemm, device,
+                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
+                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"], "norm_weight": p["norm_w"]}
             )
         else:
             q_fn = candidate_kernel.svdquant_w4a4_gemm
@@ -532,14 +585,15 @@ class TestWan22SvdquantDenseBlock(TestBase):
             )
 
     @pytest.mark.performance
-    def test_benchmark_projection_v(self, kernel, device, block_data, use_reference, candidate_kernel, measure_runtime_torch):
+    def test_benchmark_projection_v(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
         """Benchmark V projection: M = 1215, K = 3072, N = 3072, rank 32."""
         x = block_data["x"]
         p = block_data["v_p"]
         if use_reference:
             measure_runtime_torch(
-                bf16_linear, device,
-                args=(x, p["w_bf16"], p["bias"], p["lora_a"], p["lora_b"]),
+                reference_kernel.svdquant_w4a4_gemm, device,
+                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
+                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"]}
             )
         else:
             measure_runtime_torch(
@@ -549,15 +603,15 @@ class TestWan22SvdquantDenseBlock(TestBase):
             )
 
     @pytest.mark.performance
-    def test_benchmark_ffn_up(self, kernel, device, block_data, use_reference, candidate_kernel, measure_runtime_torch):
+    def test_benchmark_ffn_up(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
         """Benchmark FFN up-projection with gelu_tanh: M = 1215, K = 3072, N = 14336, rank 32."""
         x = block_data["x"]
         p = block_data["ffn_up_p"]
         if use_reference:
             measure_runtime_torch(
-                bf16_linear_activation, device,
-                args=(x, p["w_bf16"], p["bias"], p["lora_a"], p["lora_b"]),
-                kwargs={"activation": "gelu_tanh"}
+                reference_kernel.svdquant_w4a4_gemm, device,
+                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
+                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"], "activation": "gelu_tanh"}
             )
         else:
             up_fn = candidate_kernel.svdquant_w4a4_gemm
@@ -568,15 +622,17 @@ class TestWan22SvdquantDenseBlock(TestBase):
             )
 
     @pytest.mark.performance
-    def test_benchmark_ffn_down(self, kernel, device, block_data, use_reference, candidate_kernel, measure_runtime_torch):
+    def test_benchmark_ffn_down(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
         """Benchmark FFN down-projection: M = 1215, K = 14336, N = 3072, rank 32."""
         h_bf16 = (torch.zeros((1215, 14336), dtype=torch.bfloat16, device=device)).contiguous()
         h_q, h_scales = quantize_activation_int4(h_bf16, group_size=64)
         p = block_data["ffn_down_p"]
         if use_reference:
             measure_runtime_torch(
-                bf16_linear, device,
-                args=(h_bf16, p["w_bf16"], p["bias"], p["lora_a"], p["lora_b"])
+                reference_kernel.svdquant_w4a4_gemm, device,
+                args=(h_q, p["w_dpas_b"], p["w_scale_dpas"]),
+                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"],
+                        "x_scales": h_scales, "x_bf16": h_bf16}
             )
         else:
             down_fn = candidate_kernel.svdquant_w4a4_gemm

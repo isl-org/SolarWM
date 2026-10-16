@@ -38,6 +38,7 @@ BASE_PATTERNS = (
 )
 STAGE2_PATTERN = "SolarWM-5B-sgf-stage2-81f/**"
 WAN_RUNTIME_PACKAGES = (
+    "av",
     "diffusers==0.38.0",
     "decord>=0.6",
     "einops>=0.8",
@@ -80,6 +81,16 @@ def parse_args() -> argparse.Namespace:
         "--skip-weights",
         action="store_true",
         help="Install runtime dependencies without downloading model weights",
+    )
+    parser.add_argument(
+        "--build-kernels",
+        action="store_true",
+        help="Build the optional Intel XPU SVDQuant and oneDNN kernels",
+    )
+    parser.add_argument(
+        "--gpu-arch",
+        default="bmg-g31",
+        help="Intel GPU architecture passed to the SVDQuant kernel build",
     )
     return parser.parse_args()
 
@@ -171,6 +182,57 @@ def install_runtime(device: str) -> None:
             "--no-deps",
             "--no-build-isolation",
         )
+
+
+def svdquant_kernel_is_present() -> bool:
+    package_dir = REPO_ROOT / "packages" / "wan22_svdquant_dense_block"
+    return any(
+        path.is_file()
+        for suffix in (".pyd", ".so", ".dll")
+        for path in package_dir.glob(f"svdquant_dense_kernel_*{suffix}")
+    )
+
+
+def build_svdquant_kernel(gpu_arch: str) -> None:
+    package_dir = REPO_ROOT / "packages" / "wan22_svdquant_dense_block"
+    build_script = package_dir / "build.py"
+    if svdquant_kernel_is_present():
+        print("SVDQuant SYCL kernel already built; skipping")
+        return
+    if not build_script.is_file():
+        fail(f"SVDQuant kernel build script is missing: {build_script}")
+    print(f"Building SVDQuant SYCL kernel for {gpu_arch}")
+    subprocess.run(
+        [sys.executable, str(build_script), "--gpu-arch", gpu_arch],
+        cwd=package_dir,
+        check=True,
+    )
+    if not svdquant_kernel_is_present():
+        fail("SVDQuant kernel build completed without producing a native extension")
+
+
+def build_qconv_kernel() -> None:
+    print("Building or loading the oneDNN qconv XPU kernel")
+    try:
+        from solarwm.kernels.qconv_onednn import is_available
+
+        if is_available():
+            print("oneDNN qconv XPU kernel is available")
+        else:
+            print(
+                "Warning: oneDNN qconv XPU kernel is unavailable; "
+                "the native PyTorch oneDNN fallback will be used"
+            )
+    except Exception as exc:
+        print(f"Warning: oneDNN qconv kernel check failed; using fallback: {exc}")
+
+
+def build_xpu_kernels(device: str, gpu_arch: str) -> None:
+    if device != "xpu":
+        print(f"Skipping Intel XPU kernel builds for detected device: {device}")
+        return
+    build_svdquant_kernel(gpu_arch)
+    build_qconv_kernel()
 
 
 def ensure_huggingface_hub() -> Any:
@@ -312,6 +374,8 @@ def main() -> None:
     print(f"Detected device: {device} (torch {torch.__version__})")
 
     install_runtime(device)
+    if args.build_kernels:
+        build_xpu_kernels(device, args.gpu_arch)
     model_root = normalize_path(args.local_dir)
     if not args.skip_weights:
         model_root = download_weights(args.local_dir, args.svdquant_repo)
