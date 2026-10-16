@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from solarwm.config.routes import Route, validate_route
@@ -681,7 +681,10 @@ def _validate_common_model(config: Mapping[str, Any], route: Route, profile: Fam
 
 def _validate_model_assets(model: Mapping[str, Any]) -> None:
     base = str(model.get("base_path", "")).strip()
-    _require(base.startswith("/"), "model.base_path must be absolute")
+    _require(
+        Path(base).is_absolute() or PureWindowsPath(base).is_absolute(),
+        "model.base_path must be absolute",
+    )
     assets = _mapping(model, "assets")
     required = {
         "transformer_config",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from solarwm.errors import BackendContractError
@@ -28,7 +28,9 @@ class WanAssetLayout:
         if not isinstance(model, Mapping):
             raise BackendContractError("model must be a mapping")
         raw_base = str(model.get("base_path", "")).strip()
-        if not raw_base or not raw_base.startswith("/"):
+        if not raw_base or not (
+            Path(raw_base).is_absolute() or PureWindowsPath(raw_base).is_absolute()
+        ):
             raise BackendContractError("model.base_path must be an absolute path")
         base = Path(raw_base)
         family = str(model.get("family", ""))
