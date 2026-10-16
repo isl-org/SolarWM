@@ -126,15 +126,15 @@
         "Node name for S&R": "SolarWMInteractive"
       },
       "widgets_values": [
-        "/home/ssheorey/code/SolarWM/configs/examples/wan22_ti2v_5b/infer_stage2_sgf_interactive_xpu.local.yaml",
-        "/home/ssheorey/code/SolarWM/assets/eastshade.webp",
+        "configs/examples/wan22_ti2v_5b/infer_stage2_sgf_interactive.yaml",
+        "assets/eastshade.webp",
         "Walk slowly straight ahead for 4 seconds, take an about turn, and walk back.",
         42,
         "fixed",
         120,
         "sdpa",
         "full_precision",
-        "/home/ssheorey/models/SolarWM/SolarWM-5B-sgf-stage2-81f/svdquant_int4",
+        "models/SolarWM-5B-sgf-stage2-81f/svdquant_int4",
         "full_precision",
         "straight_about_turn_10s",
         0.1,

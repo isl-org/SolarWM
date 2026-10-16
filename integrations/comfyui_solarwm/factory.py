@@ -18,6 +18,13 @@ _CACHED_PROVIDER: Any | None = None
 _CACHED_PROVIDER_KEY: tuple[Any, ...] | None = None
 
 
+def _resolve_repo_path(value: str) -> str:
+    path = Path(expandvars(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    return str(path)
+
+
 def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Apply ComfyUI-only runtime choices without rewriting the YAML file."""
 
@@ -25,6 +32,15 @@ def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> d
     runtime = config.setdefault("runtime", {})
     if not isinstance(model, dict) or not isinstance(runtime, dict):
         raise ValueError("interactive config model/runtime sections must be mappings")
+
+    base_path = str(model.get("base_path", "")).strip()
+    if base_path and not base_path.startswith("/path/to/"):
+        model["base_path"] = _resolve_repo_path(base_path)
+    checkpoint = config.get("checkpoint", {})
+    if isinstance(checkpoint, dict):
+        checkpoint_path = str(checkpoint.get("path", "")).strip()
+        if checkpoint_path:
+            checkpoint["path"] = _resolve_repo_path(checkpoint_path)
 
     attention_backend = str(payload.get("attention_backend", "sdpa")).strip().lower()
     if attention_backend not in _ATTENTION_BACKENDS:
@@ -42,9 +58,7 @@ def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> d
 
     weights_root = str(payload.get("svdquant_weights_root", "")).strip()
     if weights_root:
-        weights_root = expandvars(weights_root)
-        weights_root = str(Path(weights_root).expanduser())
-        model["svdquant_weights_root"] = weights_root
+        model["svdquant_weights_root"] = _resolve_repo_path(weights_root)
     elif linear_quant != "full_precision":
         checkpoint_path = Path(str(config.get("checkpoint", {}).get("path", ""))).expanduser()
         model["svdquant_weights_root"] = str(checkpoint_path / "svdquant_int4")
