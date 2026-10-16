@@ -15,11 +15,11 @@ python scripts/install_solarwm.py
 ```
 
 The script uses the upstream model repository `junchaoh-cs/SolarWM` and stores
-weights in Hugging Face's normal cache. It never installs or changes PyTorch.
+weights in `SolarWM/models` by default. It never installs or changes PyTorch.
 Run `python -m pip install torch` or the appropriate vendor command separately
 first.
 
-Use `--local-dir` only when a stable, explicit model directory is required:
+Use `--local-dir` to override the model directory:
 
 ```text
 python scripts/install_solarwm.py --local-dir /path/to/SolarWM-models
@@ -34,10 +34,13 @@ The detected device selects the dependency set:
 Use `--skip-weights` when the model directory is already populated. Weight
 downloads are resumable and skipped entirely when the required files are
 already present. Set `HF_TOKEN` in the environment or authenticate with `hf
-auth login` before downloading a gated or private repository.
+auth login` before downloading a gated or private repository. The installer
+also writes a local interactive YAML config with `model.base_path` and
+`checkpoint.path` pointing at the selected model directory.
 
-On Unix, `scripts/install_solarwm.sh` remains a compatibility wrapper around
-the Python entry point.
+The installer keeps any package already present in the active environment,
+regardless of its version. It has no upgrade, sync, or uninstall step; install
+or resolve incompatible existing versions separately if needed.
 
 ## Configure ComfyUI
 
@@ -46,12 +49,13 @@ model search paths to its `extra_model_paths.yaml`:
 
 ```text
 python scripts/install_solarwm.py \
-  --local-dir /path/to/SolarWM-models \
   --comfyui /path/to/ComfyUI
 ```
 
-The update is idempotent and keeps other top-level ComfyUI path entries. Restart
-ComfyUI after the installer finishes. ComfyUI must run with the environment
+The default `SolarWM/models` directory is used for both the ComfyUI search paths
+and the generated SolarWM config. The update is idempotent and keeps other
+top-level ComfyUI path entries. Restart ComfyUI after the installer finishes.
+ComfyUI must run with the environment
 created by this installer, or with SolarWM installed into its own Python
 environment, because the custom node imports the `solarwm` package.
 
@@ -75,7 +79,7 @@ provided for the owner of the weights and are not run by SolarWM:
 
 ```bash
 export HF_REPO=your-org/SolarWM-5B-svdquant-int4
-export MODEL_ROOT=/path/to/SolarWM-models
+export MODEL_ROOT=/path/to/SolarWM/models
 export SVDQUANT_ROOT="$MODEL_ROOT/SolarWM-5B-sgf-stage2-81f/svdquant_int4"
 
 python -m pip install --upgrade huggingface_hub

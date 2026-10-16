@@ -16,6 +16,8 @@ uv.lock
 outputs/
 runs/
 checkpoints/
+models/
+configs/**/*.local.yaml
 *.pt
 *.pth
 *.safetensors
