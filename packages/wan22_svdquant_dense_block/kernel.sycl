@@ -92,8 +92,31 @@ inline uint16_t f32_to_bf16(float v) {
     return uint16_t((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
 }
 
+inline float fast_tanh(float x) {
+#ifdef __SYCL_DEVICE_ONLY__
+    const float z = sycl::clamp(x, -10.0f, 10.0f);
+    const float e2 = sycl::native::exp(2.0f * z);
+    return (e2 - 1.0f) / (e2 + 1.0f);
+#else
+    return sycl::tanh(x);
+#endif
+}
+
+inline float fast_exp(float x) {
+#ifdef __SYCL_DEVICE_ONLY__
+    return sycl::native::exp(x);
+#else
+    return sycl::exp(x);
+#endif
+}
+
 inline float gelu_tanh(float x) {
-    return 0.5f * x * (1.0f + sycl::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    const float z = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + fast_tanh(z));
+}
+
+inline float silu(float x) {
+    return x / (1.0f + fast_exp(-x));
 }
 
 // Round half away from zero, clamped to [-8, 7], as the low nibble.
@@ -143,11 +166,7 @@ inline sycl::vec<T, N> block_load(sycl::sub_group sg, const T* src) {
 }
 
 inline u32x8 load_b_image(sycl::sub_group sg, const uint32_t* src) {
-    const auto v = block_load<uint32_t, 8>(sg, src);
-    u32x8 r;
-    #pragma unroll
-    for (int d = 0; d < 8; ++d) r[d] = v[d];
-    return r;
+    return sycl::bit_cast<u32x8>(block_load<uint32_t, 8>(sg, src));
 }
 
 // Group-64 INT4 quantization of an 8 x 64 tile held as v[t][m] = (row m, column 16 t + lane).
@@ -378,14 +397,62 @@ struct GemmArgs {
     int M, N, K, act;
 };
 
+template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
 class SVDQ_GEMM_int4;
 
-// Epilogue of one 8 x 64 block (rows m0.., columns 64 ng..): LoRA up, bias, activation, BF16
-// store, optional INT4 output quantization and RMSNorm partial sums.
+inline float quantize_tile8x64_bf16(sycl::sub_group sg, int lane, const u16x8 (&y16)[kTilesN],
+                                    const float* sinv_col, int8_t* dst, size_t ld, int rows, float rho) {
+    float amax[kTileM];
+    #pragma unroll
+    for (int m = 0; m < kTileM; ++m) {
+        float mx = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < kTilesN; ++t) {
+            const float si = sinv_col ? sinv_col[16 * t + lane] : 1.0f;
+            mx = sycl::fmax(mx, sycl::fabs(bf16_to_f32(y16[t][m]) * si));
+        }
+        amax[m] = mx;
+    }
+
+    float scale_row[kTileM];
+    float inv_row[kTileM];
+    #pragma unroll
+    for (int m = 0; m < kTileM; ++m) {
+        const float mx = sycl::reduce_over_group(sg, amax[m], sycl::maximum<float>());
+        const float s = sycl::fmax(mx * rho / 7.0f, 1e-8f);
+        scale_row[m] = s;
+        inv_row[m] = 1.0f / s;
+    }
+
+    #pragma unroll
+    for (int p = 0; p < kTileM / 2; ++p) {
+        uint32_t d = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int m = 2 * p + half;
+            const float inv = inv_row[m];
+            #pragma unroll
+            for (int t = 0; t < kTilesN; ++t) {
+                const float si = sinv_col ? sinv_col[16 * t + lane] : 1.0f;
+                const uint32_t q = quant_nibble(bf16_to_f32(y16[t][m]) * si, inv);
+                uint32_t w = q | (sycl::shift_group_left(sg, q, 1) << 4);
+                w |= sycl::shift_group_left(sg, w, 2) << 8;
+                w |= sycl::shift_group_left(sg, w, 4) << 16;
+                const uint32_t pick = sycl::select_from_group(sg, w, 8 * (lane & 1));
+                if ((lane >> 3) == half && ((lane & 7) >> 1) == t) d = pick;
+            }
+        }
+        const int row = 2 * p + (lane >> 3);
+        if (row < rows) *reinterpret_cast<uint32_t*>(dst + row * ld + 4 * (lane & 7)) = d;
+    }
+    return scale_row[lane >> 1];
+}
+
+template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
 inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8 (&acc)[kTilesN], int m0, int ng) {
-    const int M = p.M, N = p.N, n0 = ng * kGroup;
-    // LoRA up: acc += bf16(lora_act[rows]) @ lora_b[cols]^T on BF16 DPAS. It accumulates into a
-    // separate register block: binding acc to the asm operand forces copies of it in the K loop.
+    const int M = p.M, N = p.N;
+    const int n0 = ng * kGroup;
+
     if (p.lora_act != nullptr) {
         #pragma unroll
         for (int t = 0; t < kTilesN; ++t) {
@@ -403,75 +470,52 @@ inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8
         }
     }
 
-    // Bias, activation, BF16 output.
-    // Fast-path: if neither output quantization nor RMSNorm is requested, avoid the extra
-    // BF16->F32 roundtrip scratch (v[][]) to reduce register pressure.
-    const bool need_aux = (p.qout != nullptr) || (p.row_sq != nullptr);
-    if (!need_aux) {
-        #pragma unroll
-        for (int t = 0; t < kTilesN; ++t) {
-            const float bias = p.bias != nullptr ? bf16_to_f32(p.bias[n0 + 16 * t + lane]) : 0.0f;
-            u16x8 y16;
-            #pragma unroll
-            for (int m = 0; m < kTileM; ++m) {
-                float y = acc[t][m] + bias;
-                if (p.act == kActGeluTanh) y = gelu_tanh(y);
-                else if (p.act == kActSilu) y = y / (1.0f + sycl::exp(-y));
-                y16[m] = f32_to_bf16(y);
-            }
-            __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
-                intptr_t(p.out), N * 2 - 1, M - 1, N * 2 - 1, coord2{n0 + 16 * t, m0}, y16);
-        }
-        return;
-    }
-
-    // Slow-path: materialize BF16-rounded outputs for correct INT4 quant + RMSNorm.
-    float v[kTilesN][kTileM];
+    u16x8 y16[kTilesN];
     #pragma unroll
     for (int t = 0; t < kTilesN; ++t) {
         const float bias = p.bias != nullptr ? bf16_to_f32(p.bias[n0 + 16 * t + lane]) : 0.0f;
-        u16x8 y16;
         #pragma unroll
         for (int m = 0; m < kTileM; ++m) {
             float y = acc[t][m] + bias;
-            if (p.act == kActGeluTanh) y = gelu_tanh(y);
-            else if (p.act == kActSilu) y = y / (1.0f + sycl::exp(-y));
-            y16[m] = f32_to_bf16(y);
-            v[t][m] = bf16_to_f32(y16[m]);
+            if constexpr (ACT == kActGeluTanh) y = gelu_tanh(y);
+            else if constexpr (ACT == kActSilu) y = silu(y);
+            y16[t][m] = f32_to_bf16(y);
         }
         __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
-            intptr_t(p.out), N * 2 - 1, M - 1, N * 2 - 1, coord2{n0 + 16 * t, m0}, y16);
+            intptr_t(p.out), N * 2 - 1, M - 1, N * 2 - 1, coord2{n0 + 16 * t, m0}, y16[t]);
     }
 
     const int rows = sycl::min(kTileM, M - m0);
-    const bool owner = (lane & 1) == 0 && (lane >> 1) < rows;  // lane 2 r holds row r's reductions
-    if (p.qout != nullptr) {
-        float vq[kTilesN][kTileM];
-        #pragma unroll
-        for (int t = 0; t < kTilesN; ++t) {
-            const float si = p.q_smooth_inv != nullptr ? p.q_smooth_inv[n0 + 16 * t + lane] : 1.0f;
-            #pragma unroll
-            for (int m = 0; m < kTileM; ++m) vq[t][m] = v[t][m] * si;
-        }
-        const float scale =
-            quantize_tile8x64(sg, lane, vq, p.qout + size_t(m0) * (N / 2) + ng * 32, N / 2, rows, p.q_rho);
+    const bool owner = (lane & 1) == 0 && (lane >> 1) < rows;
+
+    if constexpr (HAS_QOUT) {
+        const float* sinv = p.q_smooth_inv != nullptr ? p.q_smooth_inv + n0 : nullptr;
+        const float scale = quantize_tile8x64_bf16(
+            sg, lane, y16, sinv, p.qout + size_t(m0) * (N / 2) + ng * 32, N / 2, rows, p.q_rho);
         if (owner) p.oscales_t[size_t(ng) * p.os_ld + m0 + (lane >> 1)] = scale;
     }
-    if (p.row_sq != nullptr) {
+
+    if constexpr (HAS_ROWSQ) {
         float sq[kTileM];
         #pragma unroll
-        for (int m = 0; m < kTileM; ++m)
-            sq[m] = v[0][m] * v[0][m] + v[1][m] * v[1][m] + v[2][m] * v[2][m] + v[3][m] * v[3][m];
-
+        for (int m = 0; m < kTileM; ++m) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < kTilesN; ++t) {
+                const float y = bf16_to_f32(y16[t][m]);
+                s = sycl::fma(y, y, s);
+            }
+            sq[m] = s;
+        }
         float total_row[kTileM];
         #pragma unroll
         for (int m = 0; m < kTileM; ++m) total_row[m] = sycl::reduce_over_group(sg, sq[m], sycl::plus<float>());
-
         if (owner) p.row_sq[size_t(m0 + (lane >> 1)) * (N / kGroup) + ng] = total_row[lane >> 1];
     }
 }
 
-void launch_gemm(sycl::queue& q, const GemmArgs& p) {
+template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
+void launch_gemm_impl(sycl::queue& q, const GemmArgs& p) {
     constexpr int kNG = KF_N_TILE / kGroup;   // 64-column groups per sub-group
     constexpr int kNT = kNG * kTilesN;        // 16-column DPAS tiles per sub-group
     using namespace cute;
@@ -486,7 +530,7 @@ void launch_gemm(sycl::queue& q, const GemmArgs& p) {
     const sycl::range<2> local(sg_n * sg_m, kSG);
     const sycl::range<2> global(grid_n * sg_m, ((grid_m + sg_m - 1) / sg_m) * kSG);
 
-    q.parallel_for<SVDQ_GEMM_int4>(
+    q.parallel_for<SVDQ_GEMM_int4<HAS_QOUT, HAS_ROWSQ, ACT>>(
         sycl::nd_range<2>(global, local),
         syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<KF_GRF>},
         [=](sycl::nd_item<2> item) {
@@ -511,36 +555,33 @@ void launch_gemm(sycl::queue& q, const GemmArgs& p) {
             auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
             Tensor tAgA = thr_copy_a.partition_S(gA);
 
-            // B: each (16-column tile, K group) is a 512-byte register image -> one block read.
-            // Keep address arithmetic in 32-bit where possible (BMG has relatively expensive int64 ALU).
             const uint32_t b_stride = uint32_t(G) * 128u;
             const uint32_t* b_src = p.w_dpas_b + uint32_t(n0 / 16) * b_stride;
-            // Scales are software-pipelined one K step ahead: lane l gets the weight scales of
-            // columns 16 t + l; lane m < 8 gets the scale of row m0 + m.
-            const float* sw_next = p.w_scales_t + n0;
-            const float* xs_next = p.x_scales + size_t(sycl::min(m0 + (lane & (kTileM - 1)), M - 1)) * p.xs_row;
-            auto s_w_next = block_load<float, kNT>(sg, sw_next);
-            float s_x_next = *xs_next;
+            const float* sw_ptr = p.w_scales_t + n0;
+            const float* xs_ptr = p.x_scales + size_t(sycl::min(m0 + (lane & (kTileM - 1)), M - 1)) * p.xs_row;
+            auto s_w0 = block_load<float, kNT>(sg, sw_ptr);
+            float s_x0 = *xs_ptr;
 
             f32x8 acc[kNG][kTilesN] = {};
-            for (int g = 0; g < G; ++g) {
+            for (int g = 0; g < G; g += 2) {
                 copy(copy_a, tAgA(_, _, _, g), tArA);
                 u32x8 b[kNT];
                 const uint32_t* b_ptr = b_src + uint32_t(g) * 128u;
                 #pragma unroll
                 for (int t = 0; t < kNT; ++t) b[t] = load_b_image(sg, b_ptr + uint32_t(t) * b_stride);
 
-                const auto s_w = s_w_next;
-                const auto s_x = s_x_next;
+                const auto s_w = s_w0;
+                const float s_x = s_x0;
+
                 if (g + 1 < G) {
-                    sw_next += N;
-                    xs_next += p.xs_group;
+                    sw_ptr += N;
+                    xs_ptr += p.xs_group;
                 }
-                s_w_next = block_load<float, kNT>(sg, sw_next);
-                s_x_next = *xs_next;
+                auto s_w_next = block_load<float, kNT>(sg, sw_ptr);
+                float s_x_next = *xs_ptr;
 
                 reorder(tArA, tCrA);
-                const auto& a = recast<MmaInt4::AVector>(tCrA)(0);
+                const auto& a0 = recast<MmaInt4::AVector>(tCrA)(0);
                 float sx[kTileM];
                 #pragma unroll
                 for (int m = 0; m < kTileM; ++m) sx[m] = sycl::select_from_group(sg, s_x, m);
@@ -548,19 +589,89 @@ void launch_gemm(sycl::queue& q, const GemmArgs& p) {
                 for (int ng = 0; ng < kNG; ++ng) {
                     s32x8 c[kTilesN];
                     #pragma unroll
-                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a, b[ng * kTilesN + t]);
+                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a0, b[ng * kTilesN + t]);
                     #pragma unroll
                     for (int t = 0; t < kTilesN; ++t) {
                         const float sw = s_w[ng * kTilesN + t];
                         #pragma unroll
-                        for (int m = 0; m < kTileM; ++m) acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx[m], acc[ng][t][m]);
+                        for (int m = 0; m < kTileM; ++m)
+                            acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx[m], acc[ng][t][m]);
+                    }
+                }
+
+                if (g + 1 >= G) {
+                    s_w0 = s_w_next;
+                    s_x0 = s_x_next;
+                    break;
+                }
+
+                copy(copy_a, tAgA(_, _, _, g + 1), tArA);
+                const uint32_t* b_ptr1 = b_ptr + 128u;
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t) b[t] = load_b_image(sg, b_ptr1 + uint32_t(t) * b_stride);
+
+                const auto s_w1 = s_w_next;
+                const float s_x1 = s_x_next;
+
+                if (g + 2 < G) {
+                    sw_ptr += N;
+                    xs_ptr += p.xs_group;
+                }
+                s_w0 = block_load<float, kNT>(sg, sw_ptr);
+                s_x0 = *xs_ptr;
+
+                reorder(tArA, tCrA);
+                const auto& a1 = recast<MmaInt4::AVector>(tCrA)(0);
+                float sx1[kTileM];
+                #pragma unroll
+                for (int m = 0; m < kTileM; ++m) sx1[m] = sycl::select_from_group(sg, s_x1, m);
+
+                #pragma unroll
+                for (int ng = 0; ng < kNG; ++ng) {
+                    s32x8 c[kTilesN];
+                    #pragma unroll
+                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a1, b[ng * kTilesN + t]);
+                    #pragma unroll
+                    for (int t = 0; t < kTilesN; ++t) {
+                        const float sw = s_w1[ng * kTilesN + t];
+                        #pragma unroll
+                        for (int m = 0; m < kTileM; ++m)
+                            acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx1[m], acc[ng][t][m]);
                     }
                 }
             }
 
             #pragma unroll
-            for (int ng = 0; ng < kNG; ++ng) gemm_epilogue(sg, lane, p, acc[ng], m0, n0 / kGroup + ng);
+            for (int ng = 0; ng < kNG; ++ng)
+                gemm_epilogue<HAS_QOUT, HAS_ROWSQ, ACT>(sg, lane, p, acc[ng], m0, n0 / kGroup + ng);
         });
+}
+
+void launch_gemm(sycl::queue& q, const GemmArgs& p) {
+    const bool has_qout = p.qout != nullptr;
+    const bool has_rowsq = p.row_sq != nullptr;
+    const Act act = Act(p.act);
+
+    if (has_qout) {
+        if (has_rowsq) {
+            if (act == kActGeluTanh) return launch_gemm_impl<true, true, kActGeluTanh>(q, p);
+            if (act == kActSilu)     return launch_gemm_impl<true, true, kActSilu>(q, p);
+            return launch_gemm_impl<true, true, kActNone>(q, p);
+        }
+        if (act == kActGeluTanh) return launch_gemm_impl<true, false, kActGeluTanh>(q, p);
+        if (act == kActSilu)     return launch_gemm_impl<true, false, kActSilu>(q, p);
+        return launch_gemm_impl<true, false, kActNone>(q, p);
+    }
+
+    if (has_rowsq) {
+        if (act == kActGeluTanh) return launch_gemm_impl<false, true, kActGeluTanh>(q, p);
+        if (act == kActSilu)     return launch_gemm_impl<false, true, kActSilu>(q, p);
+        return launch_gemm_impl<false, true, kActNone>(q, p);
+    }
+
+    if (act == kActGeluTanh) return launch_gemm_impl<false, false, kActGeluTanh>(q, p);
+    if (act == kActSilu)     return launch_gemm_impl<false, false, kActSilu>(q, p);
+    return launch_gemm_impl<false, false, kActNone>(q, p);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -584,14 +695,14 @@ void launch_rmsnorm(sycl::queue& q, uint16_t* out, const float* row_sq, const ui
             for (int j = lane; j < parts; j += kSG) sq += row_sq[size_t(row) * parts + j];
             sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
             const float inv_rms = sycl::rsqrt(sq / float(N) + eps);
-            using u16x8v = sycl::vec<uint16_t, 8>;
-            for (int c = lane * 8; c < N; c += kSG * 8) {
-                auto* o = reinterpret_cast<u16x8v*>(out + size_t(row) * N + c);
-                const u16x8v y = *o;
-                const u16x8v nw = *reinterpret_cast<const u16x8v*>(w + c);
-                u16x8v r;
+            using u16x16v = sycl::vec<uint16_t, 16>;
+            for (int c = lane * 16; c < N; c += kSG * 16) {
+                auto* o = reinterpret_cast<u16x16v*>(out + size_t(row) * N + c);
+                const u16x16v y = *o;
+                const u16x16v nw = *reinterpret_cast<const u16x16v*>(w + c);
+                u16x16v r;
                 #pragma unroll
-                for (int i = 0; i < 8; ++i) r[i] = f32_to_bf16(bf16_to_f32(y[i]) * inv_rms * bf16_to_f32(nw[i]));
+                for (int i = 0; i < 16; ++i) r[i] = f32_to_bf16(bf16_to_f32(y[i]) * inv_rms * bf16_to_f32(nw[i]));
                 *o = r;
             }
         });
