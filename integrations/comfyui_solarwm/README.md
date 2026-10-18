@@ -20,7 +20,7 @@ configuration before model construction:
 
 | Node field | Values | Default |
 | --- | --- | --- |
-| `attention_backend` | `sdpa`, `sageattnv1` | `sdpa` |
+| `attention_backend` | `sdpa`, `sageattnv1`, `sageattnv2` | `sdpa` |
 | `linear_quant` | `full_precision`, `svdquant_k1`, `svdquant_k2`, `svdquant_k4` | `full_precision` |
 | `svdquant_weights_root` | SVDQuant weight directory | `models/SolarWM-5B-sgf-stage2-81f/svdquant_int4` |
 | `stage2_vae_quant` | `full_precision`, `quarot_w8a8` | `full_precision` |

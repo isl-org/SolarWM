@@ -50,7 +50,7 @@ def test_session_controls_are_monotonic_and_focus_safe():
 def test_interactive_node_exposes_stage2_runtime_options():
     required = SolarWMInteractive.INPUT_TYPES()["required"]
     assert required["seed"][1].get("control_after_generate") is True
-    assert required["attention_backend"][1]["options"] == ["sdpa", "sageattnv1"]
+    assert required["attention_backend"][1]["options"] == ["sdpa", "sageattnv1", "sageattnv2"]
     assert required["linear_quant"][1]["options"] == [
         "full_precision",
         "svdquant_k1",
@@ -104,7 +104,7 @@ def test_interactive_config_applies_and_validates_stage2_options():
     base = {"model": {}, "runtime": {}, "checkpoint": {"path": "/checkpoint"}}
     config = _interactive_config(
         {
-            "attention_backend": "sageattnv1",
+            "attention_backend": "sageattnv2",
             "linear_quant": "svdquant_k4",
             "svdquant_weights_root": "/weights",
             "stage2_vae_quant": "quarot_w8a8",
@@ -112,7 +112,7 @@ def test_interactive_config_applies_and_validates_stage2_options():
         base,
     )
     assert config["model"] == {
-        "attention_backend": "sageattnv1",
+        "attention_backend": "sageattnv2",
         "linear_quant": "svdquant_k4",
         "svdquant_weights_root": "/weights",
     }
@@ -205,7 +205,7 @@ def test_workflow_template_widgets_values_aligned():
         assert isinstance(wv[3], int) and wv[3] == 42
         assert wv[4] in ("fixed", "increment", "decrement", "randomize"), f"control_after_generate: {wv[4]}"
         assert isinstance(wv[5], int) and wv[5] == 120, f"max_latent_frames: {wv[5]}"
-        assert wv[6] in ("sdpa", "sageattnv1"), f"attention_backend: {wv[6]}"
+        assert wv[6] in ("sdpa", "sageattnv1", "sageattnv2"), f"attention_backend: {wv[6]}"
         assert wv[7] in ("full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4"), f"linear_quant: {wv[7]}"
         assert isinstance(wv[8], str) and "svdquant" in wv[8]
         assert wv[9] in ("full_precision", "quarot_w8a8"), f"stage2_vae_quant: {wv[9]}"

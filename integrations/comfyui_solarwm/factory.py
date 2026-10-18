@@ -9,7 +9,7 @@ import threading
 from typing import Any
 
 
-_ATTENTION_BACKENDS = {"sdpa", "sageattnv1"}
+_ATTENTION_BACKENDS = {"sdpa", "sageattnv1", "sageattnv2"}
 _LINEAR_QUANTS = {"full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4"}
 _VAE_QUANTS = {"full_precision", "quarot_w8a8"}
 

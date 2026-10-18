@@ -9,7 +9,7 @@ import os
 class SolarWMInteractive:
     """Create a viewer configuration without owning model/session state."""
 
-    _ATTENTION_BACKENDS = ["sdpa", "sageattnv1"]
+    _ATTENTION_BACKENDS = ["sdpa", "sageattnv1", "sageattnv2"]
     _LINEAR_QUANTS = [
         "full_precision",
         "svdquant_k1",
