@@ -1,11 +1,11 @@
 # Wan2.2 Stage2 XPU inference optimization plan
 
-**Status:** WS1–WS5, WS9, WS12, WS14, WS16, WS20, WS21, and WS22 done and verified; WS6, WS7, WS8, WS17, and WS19 rejected on
+**Status:** WS1–WS5, WS9, WS12, WS14, WS16, WS20, WS21, WS22, WS23, and WS25 done and verified; WS6, WS7, WS8, WS17, WS19, and WS24 rejected on
 measurement (WS6's overlap machinery reverted; WS17's caching kept for correctness, not speed;
 WS7 rejected in both default and `max-autotune` compile mode; WS19 INT8 reverted for low speedup); WS14, WS20, and WS21 passed full-VAE
-accuracy and streaming decode gates; WS23 (VAE hardware epilogue & in-flight fusions) complete.
+accuracy and streaming decode gates; WS25 integrates the KernelFoundry-tuned SVDQuant kernel and passes B70 kernel/chunk gates.
 **WS13 is the largest remaining lever with a projected gain**
-**Last updated:** 2026-10-13 (B580)
+**Last updated:** 2026-10-18 (B70/B580)
 **Device:** Intel Arc B580, 30.3 GiB VRAM, `torch 2.12.1+xpu`
 **Output anchor:** `md5 380d9cf74a9018d76408a3e615558fab`,
 `sha256 2da7fa11bc10faf9d8309f84e7f5365708d05f190baaf71e6d2b4b3e27023a5c`
@@ -201,6 +201,7 @@ Pixel tiles concatenated along time -> `[1,3,F_pixel_total,480,864]`, fp32, wher
 | WS22 | DiT Operator Fusions (AdaLN-LayerNorm, Gated Residual, QK WanRMSNorm, FFN oneDNN GELU) | −25–35 ms/chunk | **5.295 → 5.068 ms/block (1.045×); −27.2 ms/chunk, 15.44 GB DRAM traffic eliminated** | low | cosine / NaN | **Done and verified** |
 | WS23 | VAE Hardware Epilogue & QuaRot In-Flight Fusions (`oneDNN append_sum` & In-Flight Transform) | 0.955 → 0.844 s/tile (−111.0 ms/tile, 11.6%) | Landed ~14–18 ms (`append_sum`) + QuaRot dynamic quant prologue buffer reuse; zero-ROI and `torch.compile`-equivalent candidates rejected | medium | PSNR / ULP | **Complete** |
 | WS24 | VAE Decoder Graph Compilation (`torch.compile` Inductor XPU & OpenVINO GPU/CPU) | 1.15–1.30× decode speedup *(projected; whole-graph fusion)* | **torch.compile: 720.7 ms/chunk (1.02× vs Eager 736.6 ms)** with ~10–25s JIT warmup and Level-Zero pad buffer spikes; **OpenVINO GPU: 1,037.6 ms/chunk (0.71× vs Eager)**; OpenVINO CPU: 87.4 s/chunk | medium | exact | **Rejected** — PyTorch Eager retained as default production path |
+| WS25 | KernelFoundry-tuned SYCL SVDQuant W4A4 dense block | 2.383 → 2.127 ms KF block; improve complete SVDQuant chunks | **Local B70 block 2.383 → 2.115 ms (1.127×); chunk-4 DiT 843.65 → 783.20 ms (1.077×); chunk-6 DiT 880.55 → 822.13 ms (1.071×)** | medium | BF16 oracle / end-to-end | **Done and verified** |
 
 WS1 is first because it is the largest single win, carries no new code risk, and is independent of
 everything else — and because doing it first means the harness and every later gate measure the
@@ -2851,6 +2852,66 @@ Benchmarking was executed on Intel Arc dGPU (`[0xe223]`) and Intel Core Ultra 5 
 - **Decision:** **REJECTED.** Whole-graph compilation via `torch.compile` and OpenVINO IR does not meet the latency-improvement criteria on Intel XPU.
 - **Production Path:** Retained **PyTorch Eager** as the default and only production execution path (`stage2_vae_compile: bool = False`).
 - **Retained Architectural Improvements:** Retained the clean, static cache buffer pre-allocation (`preallocate_cache`) and in-place tensor rolling, which eliminates dynamic cache allocations during eager streaming decode without any compiler dependency. All temporary OpenVINO export artifacts have been removed.
+
+---
+
+### Workstream 25: KernelFoundry SVDQuant Dense-Kernel Optimization (2026-10-18)
+
+#### 1. Scope and winning implementation
+
+KernelFoundry job 7024 optimized the production SYCL W4A4 SVDQuant dense block on
+`b70`, using the previously committed SYCL kernel as a frozen reference. The
+benchmark covers Q/K/V projection, FFN up with GELU and fused INT4 output
+quantization, and FFN down consuming that INT4 output. The selected kernel was
+`e8bb7f90-322a-4c19-a74d-2b78b65972a0`, committed as `dd357e3`.
+
+The useful changes were compile-time epilogue specialization, native fast
+GELU/SiLU math, two-group K-loop unrolling with scale prefetch, reuse of the
+BF16-rounded epilogue value for output quantization, wider RMSNorm loads, and
+shorter register live ranges. The kernel retained the subgroup-striped,
+prepacked DPAS-B path; naive 2D B loads, larger GRF/tile configurations, and SLM
+double buffering regressed on BMG.
+
+#### 2. KernelFoundry microbenchmarks
+
+All values are medians from the same job and frozen reference on B70.
+
+| SVDQuant operation | Frozen reference | KF winner | Speedup |
+| :--- | ---: | ---: | ---: |
+| Q projection + RMSNorm | 0.250 ms | 0.244 ms | 1.025× |
+| V projection | 0.242 ms | 0.233 ms | 1.039× |
+| FFN up + GELU + INT4 output | 0.893 ms | 0.828 ms | 1.079× |
+| FFN down from INT4 | 0.788 ms | 0.672 ms | 1.173× |
+| Complete Q/K/V + FFN dense block | 2.383 ms | 2.127 ms | **1.120×** |
+
+The largest gain is FFN down, followed by FFN up. Projection gains are modest
+because their DPAS mainloops were already efficient; the winning changes mostly
+reduce epilogue math, dequantization overhead, and register pressure.
+
+A separate local B70 run reproduced the block gain: **2.3827 → 2.1149 ms**
+(**1.127×**, 11.2% lower latency). Candidate outputs were finite; Q/K/V matched
+the frozen kernel exactly and the FFN maximum BF16 difference was `0.001953125`.
+
+#### 3. Production chunk 4 and chunk 6 A/B
+
+Matched fresh-process runs used `linear_quant=svdquant_k4`,
+`attention_backend=sdpa`, dense attention, and the same frozen-reference versus
+candidate extensions. The VAE is unchanged by this work; its small timing
+movement is run-to-run noise.
+
+| Measurement | Frozen reference | KF winner | Speedup |
+| :--- | ---: | ---: | ---: |
+| Chunk 4 DiT, five forwards | 843.65 ms | 783.20 ms | **1.077×** |
+| Chunk 4 + BF16 VAE | 1,598.31 ms | 1,543.09 ms | 1.036× |
+| Chunk 4 + QuaRot VAE | 1,517.64 ms | 1,458.22 ms | 1.041× |
+| Chunk 6 DiT, five forwards | 880.55 ms | 822.13 ms | **1.071×** |
+| Chunk 6 + BF16 VAE | 1,634.91 ms | 1,577.58 ms | 1.036× |
+| Chunk 6 + QuaRot VAE | 1,553.76 ms | 1,497.34 ms | 1.038× |
+
+The 12–13% isolated dense-block gain becomes 7–8% at DiT scope because
+attention, cross-attention, normalization, residuals, and other projections are
+unchanged. Including VAE decode dilutes the complete chunk gain to approximately
+4%, as expected from Amdahl's law.
 
 
 
