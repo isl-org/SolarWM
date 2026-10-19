@@ -586,10 +586,13 @@ def main() -> None:
             svdquant_release_repo=args.svdquant_release_repo,
             svdquant_release_tag=args.svdquant_release_tag,
         )
+    raw_stage2 = model_root / "SolarWM-5B-sgf-stage2-81f"
+    ema_stage2 = model_root / "SolarWM-5B-sgf-stage2-81f-ema-bf16"
+    if (raw_stage2 / "model.pt").is_file() and not (ema_stage2 / "COMPLETE.json").is_file():
         subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "prepare_stage2_ema.py"),
-             str(model_root / "SolarWM-5B-sgf-stage2-81f"),
-             str(model_root / "SolarWM-5B-sgf-stage2-81f-ema-bf16")],
+             str(raw_stage2),
+             str(ema_stage2)],
             check=True,
         )
     configure_interactive_config(model_root)

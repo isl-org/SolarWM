@@ -484,6 +484,11 @@ def _row_dataset(row: IndexRow) -> str:
 def _checkpoint_file(config: Mapping[str, Any]) -> Path:
     source = Path(str(config["checkpoint"]["path"])).resolve()
     if source.is_dir():
+        if source.name == "SolarWM-5B-sgf-stage2-81f":
+            ema_candidate = source.parent / "SolarWM-5B-sgf-stage2-81f-ema-bf16"
+            if (ema_candidate / "COMPLETE.json").is_file():
+                source = ema_candidate
+
         from solarwm.checkpoint import verify_checkpoint
 
         try:
@@ -514,6 +519,14 @@ def _checkpoint_file(config: Mapping[str, Any]) -> Path:
                 f"Wan inference checkpoint transaction contract differs: {drift}"
             )
         source = verified.path / "model.pt"
+    elif (
+        source.is_file()
+        and source.name == "model.pt"
+        and source.parent.name == "SolarWM-5B-sgf-stage2-81f"
+    ):
+        ema_candidate = source.parent.parent / "SolarWM-5B-sgf-stage2-81f-ema-bf16" / "model.pt"
+        if ema_candidate.is_file():
+            source = ema_candidate
     if not source.is_file():
         raise BackendContractError(f"Wan inference checkpoint is missing: {source}")
     return source
@@ -1170,41 +1183,38 @@ class CudaWanGenerationAdapter:
     def _load_role(self, role: str) -> None:
         if self._loaded_role == role:
             return
-        import torch
 
+        from solarwm.checkpoint import open_checkpoint_payload
         from .checkpoint import normalize_model_state
 
         try:
-            payload = torch.load(
-                self.checkpoint_path,
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
+            with open_checkpoint_payload(self.checkpoint_path) as payload:
+                if not isinstance(payload, Mapping):
+                    raise BackendContractError("Wan inference checkpoint payload must be a mapping")
+                _validate_checkpoint_config(
+                    payload.get("config"),
+                    self.config,
+                )
+                field = self._checkpoint_state_field(role)
+                state = payload.get(field)
+                if not isinstance(state, Mapping) or not state:
+                    raise BackendContractError(f"Wan inference checkpoint lacks {field}")
+                normalized = normalize_model_state(state, field=field)
+                result = self.diffusion.module.load_state_dict(normalized, strict=True)
+                if result.missing_keys or result.unexpected_keys:
+                    raise BackendContractError(
+                        "Wan inference checkpoint load was not exact: "
+                        f"missing={result.missing_keys[:8]} "
+                        f"unexpected={result.unexpected_keys[:8]}"
+                    )
+                self._loaded_role = role
+                del payload, state, normalized
         except Exception as exc:
+            if isinstance(exc, BackendContractError):
+                raise
             raise BackendContractError(
                 f"cannot read Wan inference checkpoint {self.checkpoint_path}: {exc}"
             ) from exc
-        if not isinstance(payload, Mapping):
-            raise BackendContractError("Wan inference checkpoint payload must be a mapping")
-        _validate_checkpoint_config(
-            payload.get("config"),
-            self.config,
-        )
-        field = self._checkpoint_state_field(role)
-        state = payload.get(field)
-        if not isinstance(state, Mapping) or not state:
-            raise BackendContractError(f"Wan inference checkpoint lacks {field}")
-        normalized = normalize_model_state(state, field=field)
-        result = self.diffusion.module.load_state_dict(normalized, strict=True)
-        if result.missing_keys or result.unexpected_keys:
-            raise BackendContractError(
-                "Wan inference checkpoint load was not exact: "
-                f"missing={result.missing_keys[:8]} "
-                f"unexpected={result.unexpected_keys[:8]}"
-            )
-        self._loaded_role = role
-        del payload, state, normalized
         from .distributed import empty_accelerator_cache
 
         empty_accelerator_cache()

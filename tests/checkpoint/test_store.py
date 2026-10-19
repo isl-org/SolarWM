@@ -10,6 +10,7 @@ from solarwm.checkpoint import (
     CheckpointContract,
     CheckpointTransaction,
     assert_resume_compatible,
+    open_checkpoint_payload,
     store,
     verify_checkpoint,
 )
@@ -143,3 +144,29 @@ def test_windows_sync_directory_skips_fsync(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(store.os, "name", "nt")
     store._sync_directory(tmp_path)
     assert not opened
+
+
+def test_open_checkpoint_payload_windows_readonly_mmap(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    ckpt_file = tmp_path / "model.pt"
+    tensors = {"weight": torch.randn(4, 4), "bias": torch.randn(4)}
+    torch.save(tensors, ckpt_file)
+
+    with open_checkpoint_payload(ckpt_file, _is_windows=True) as payload:
+        assert torch.equal(payload["weight"], tensors["weight"])
+        assert torch.equal(payload["bias"], tensors["bias"])
+
+
+def test_open_checkpoint_payload_windows_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch = pytest.importorskip("torch")
+    ckpt_file = tmp_path / "model.pt"
+    tensors = {"weight": torch.randn(2, 2)}
+    torch.save(tensors, ckpt_file)
+
+    # Simulate mmap failure on Windows to trigger fallback path
+    monkeypatch.setattr(store.mmap, "mmap", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("mmap failed")))
+    with open_checkpoint_payload(ckpt_file, _is_windows=True) as payload:
+        assert torch.equal(payload["weight"], tensors["weight"])
+

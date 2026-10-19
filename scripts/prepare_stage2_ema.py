@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import mmap
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +12,7 @@ import warnings
 
 import torch
 
-from solarwm.checkpoint import verify_checkpoint
+from solarwm.checkpoint import open_checkpoint_payload, verify_checkpoint
 from solarwm.runtime.serialization import canonical_json_bytes
 
 
@@ -32,24 +31,9 @@ def prepare(source: Path, target: Path) -> Path:
         raise ValueError("Source release does not select EMA by default")
     temporary = target.with_name(target.name + ".partial")
     if temporary.exists():
-        raise FileExistsError(f"Unfinished checkpoint processing exists: {temporary}")
-    temporary.mkdir(parents=True)
-    original = torch.UntypedStorage.from_file
-    mapped = None
-    # Windows copy-on-write mappings reserve commit for the entire checkpoint.
-    # A read-only mapping needs no such reservation; never mutate its tensors.
-    with (source / "model.pt").open("rb") as handle:
-        mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="The given buffer is not writable")
-            backing = torch.frombuffer(mapped, dtype=torch.uint8).untyped_storage()
-        try:
-            torch.UntypedStorage.from_file = staticmethod(lambda *args, **kwargs: backing)
-            payload = torch.load(
-                source / "model.pt", map_location="cpu", weights_only=True, mmap=True,
-            )
-        finally:
-            torch.UntypedStorage.from_file = original
+        shutil.rmtree(temporary, ignore_errors=True)
+    temporary.mkdir(parents=True, exist_ok=True)
+    with open_checkpoint_payload(source / "model.pt") as payload:
         if not isinstance(payload.get("generator_ema"), dict) or not payload["generator_ema"]:
             raise ValueError("Checkpoint has no EMA tensor state")
         del payload["generator"]
@@ -59,8 +43,6 @@ def prepare(source: Path, target: Path) -> Path:
         }
         print("Writing EMA-only checkpoint without loading both roles into RAM", flush=True)
         torch.save(payload, temporary / "model.pt")
-        del payload, backing
-        mapped.close()
     size = (temporary / "model.pt").stat().st_size
     manifest = json.loads((source / "checkpoint-manifest.json").read_bytes())
     manifest["files"] = [{"path": "model.pt", "size": size}]

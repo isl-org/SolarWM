@@ -446,34 +446,33 @@ class WanA14BVAE:
         self._std = torch.tensor(self.std, dtype=torch.float32)
         self._scale_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
         try:
-            state = torch.load(
-                str(weights),
-                map_location="cpu",
-                weights_only=True,
-                mmap=True,
-            )
-            if not isinstance(state, Mapping) or not state:
-                raise BackendContractError(
-                    "Wan2.1 A14B VAE checkpoint must be a non-empty state dict"
-                )
-            with torch.device("meta"):
-                module = AutoencoderKLWan()
-            target_keys = set(module.state_dict())
-            if target_keys.issubset(state):
-                normalized = dict(state)
-            else:
-                normalized = convert_wan_vae_to_diffusers(dict(state))
-            result = module.load_state_dict(normalized, strict=True, assign=True)
-            if result.missing_keys or result.unexpected_keys:
-                raise BackendContractError(
-                    "Wan2.1 A14B VAE state load was not exact: "
-                    f"missing={result.missing_keys[:8]} "
-                    f"unexpected={result.unexpected_keys[:8]}"
-                )
-            if any(parameter.is_meta for parameter in module.parameters()):
-                raise BackendContractError("Wan2.1 A14B VAE exact load left meta parameters")
-            self.module = module.eval().requires_grad_(False)
+            from solarwm.checkpoint import open_checkpoint_payload
+
+            with open_checkpoint_payload(str(weights)) as state:
+                if not isinstance(state, Mapping) or not state:
+                    raise BackendContractError(
+                        "Wan2.1 A14B VAE checkpoint must be a non-empty state dict"
+                    )
+                with torch.device("meta"):
+                    module = AutoencoderKLWan()
+                target_keys = set(module.state_dict())
+                if target_keys.issubset(state):
+                    normalized = dict(state)
+                else:
+                    normalized = convert_wan_vae_to_diffusers(dict(state))
+                result = module.load_state_dict(normalized, strict=True, assign=True)
+                if result.missing_keys or result.unexpected_keys:
+                    raise BackendContractError(
+                        "Wan2.1 A14B VAE state load was not exact: "
+                        f"missing={result.missing_keys[:8]} "
+                        f"unexpected={result.unexpected_keys[:8]}"
+                    )
+                if any(parameter.is_meta for parameter in module.parameters()):
+                    raise BackendContractError("Wan2.1 A14B VAE exact load left meta parameters")
+                self.module = module.eval().requires_grad_(False)
         except Exception as exc:
+            if isinstance(exc, BackendContractError):
+                raise
             raise BackendContractError(f"cannot load Wan2.1 A14B VAE {weights}: {exc}") from exc
 
     def to(self, device: Any, *, dtype: Any | None = None) -> WanA14BVAE:

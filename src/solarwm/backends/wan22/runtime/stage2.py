@@ -3213,6 +3213,7 @@ class CudaWanStage2GenerationAdapter:
                 import torch
                 from pathlib import Path
 
+                from solarwm.checkpoint import open_checkpoint_payload
                 from .checkpoint import normalize_model_state
                 from .distributed import empty_accelerator_cache
                 from .inference import _validate_checkpoint_config
@@ -3222,58 +3223,57 @@ class CudaWanStage2GenerationAdapter:
                 )
 
                 try:
-                    payload = torch.load(
-                        self.checkpoint_path,
-                        map_location="cpu",
-                        weights_only=True,
-                        mmap=True,
-                    )
+                    with open_checkpoint_payload(self.checkpoint_path) as payload:
+                        if not isinstance(payload, Mapping):
+                            raise BackendContractError("Wan inference checkpoint payload must be a mapping")
+
+                        _validate_checkpoint_config(payload.get("config"), self.config)
+                        field = self._checkpoint_state_field(role)
+                        state = payload.get(field)
+                        if not isinstance(state, Mapping) or not state:
+                            raise BackendContractError(f"Wan inference checkpoint lacks {field}")
+                        normalized = normalize_model_state(state, field=field)
+
+                        target_suffixes = (
+                            ".self_attn.q.weight",
+                            ".self_attn.q.bias",
+                            ".self_attn.k.weight",
+                            ".self_attn.k.bias",
+                            ".self_attn.v.weight",
+                            ".self_attn.v.bias",
+                            ".ffn.0.weight",
+                            ".ffn.0.bias",
+                            ".ffn.2.weight",
+                            ".ffn.2.bias",
+                        )
+                        filtered = {
+                            k: v
+                            for k, v in normalized.items()
+                            if not any(
+                                k.startswith(f"blocks.{b}") and any(s in k for s in target_suffixes)
+                                for b in range(30)
+                            )
+                        }
+
+                        result = self.diffusion.module.load_state_dict(filtered, strict=False)
+                        del filtered, state, normalized
                 except Exception as exc:
+                    if isinstance(exc, BackendContractError):
+                        raise
                     raise BackendContractError(
                         f"cannot read Wan inference checkpoint {self.checkpoint_path}: {exc}"
                     ) from exc
-                if not isinstance(payload, Mapping):
-                    raise BackendContractError("Wan inference checkpoint payload must be a mapping")
-
-                _validate_checkpoint_config(payload.get("config"), self.config)
-                field = self._checkpoint_state_field(role)
-                state = payload.get(field)
-                if not isinstance(state, Mapping) or not state:
-                    raise BackendContractError(f"Wan inference checkpoint lacks {field}")
-                normalized = normalize_model_state(state, field=field)
-
-                target_suffixes = (
-                    ".self_attn.q.weight",
-                    ".self_attn.q.bias",
-                    ".self_attn.k.weight",
-                    ".self_attn.k.bias",
-                    ".self_attn.v.weight",
-                    ".self_attn.v.bias",
-                    ".ffn.0.weight",
-                    ".ffn.0.bias",
-                    ".ffn.2.weight",
-                    ".ffn.2.bias",
-                )
-                filtered = {
-                    k: v
-                    for k, v in normalized.items()
-                    if not any(
-                        k.startswith(f"blocks.{b}") and any(s in k for s in target_suffixes)
-                        for b in range(30)
-                    )
-                }
-                del payload, state, normalized
-
-                result = self.diffusion.module.load_state_dict(filtered, strict=False)
-                del filtered
 
                 k_tag = linear_quant.removeprefix("svdquant_")
                 ckpt_root = self.config.get("model", {}).get("svdquant_weights_root")
-                ckpt_root = (
-                    Path(ckpt_root)
-                    if ckpt_root is not None
-                    else Path(self.checkpoint_path).parent / "svdquant_int4"
-                )
+                if ckpt_root is not None:
+                    ckpt_root = Path(ckpt_root)
+                else:
+                    ckpt_root = Path(self.checkpoint_path).parent / "svdquant_int4"
+                if not ckpt_root.exists():
+                    sibling = Path(self.checkpoint_path).parent.parent / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4"
+                    if sibling.exists():
+                        ckpt_root = sibling
                 backend_tag = stage2_attention_backend(self.config)
                 svdquant_dir = ckpt_root / f"{backend_tag}_{k_tag}"
                 if not svdquant_dir.exists() and backend_tag == "sageattnv2":

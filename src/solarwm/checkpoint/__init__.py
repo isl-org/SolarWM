@@ -5,6 +5,7 @@ from .store import (
     CheckpointTransaction,
     VerifiedCheckpoint,
     assert_resume_compatible,
+    open_checkpoint_payload,
     verify_checkpoint,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "CheckpointTransaction",
     "VerifiedCheckpoint",
     "assert_resume_compatible",
+    "open_checkpoint_payload",
     "verify_checkpoint",
 ]

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
+import mmap
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -271,3 +274,85 @@ def assert_resume_compatible(expected: CheckpointContract, actual: CheckpointCon
         if expected.as_dict()[key] != actual.as_dict()[key]
     }
     raise CheckpointError(f"exact-resume contract mismatch: {differences}")
+
+
+@contextmanager
+def open_checkpoint_payload(
+    path: str | Path,
+    *,
+    _is_windows: bool | None = None,
+) -> Iterator[Any]:
+    """Open a checkpoint payload with read-only memory mapping or platform-safe loading.
+
+    On Windows, PyTorch's default torch.load(..., mmap=True) creates a copy-on-write
+    mapping (PAGE_WRITECOPY) which requires full-file pagefile commit reservation.
+    For large checkpoints (9-37 GiB), accessing uncommitted mapped pages triggers
+    Windows 0xC0000005 access violations. A read-only mapping (PAGE_READONLY) needs
+    no pagefile commit reservation and faults pages on demand directly from disk.
+    """
+    import torch
+
+    resolved = Path(path).resolve()
+    if resolved.is_dir():
+        resolved = resolved / "model.pt"
+
+    is_windows = (os.name == "nt") if _is_windows is None else _is_windows
+    if is_windows:
+        mapped = None
+        handle = None
+        use_fallback = False
+        try:
+            handle = resolved.open("rb")
+            mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="The given buffer is not writable")
+                backing = torch.frombuffer(mapped, dtype=torch.uint8).untyped_storage()
+            original = torch.UntypedStorage.from_file
+            try:
+                torch.UntypedStorage.from_file = staticmethod(lambda *args, **kwargs: backing)
+                payload = torch.load(resolved, map_location="cpu", weights_only=True, mmap=True)
+            finally:
+                torch.UntypedStorage.from_file = original
+        except Exception:
+            use_fallback = True
+            if mapped is not None:
+                try:
+                    mapped.close()
+                except Exception:
+                    pass
+                mapped = None
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                handle = None
+
+        if use_fallback:
+            payload = torch.load(resolved, map_location="cpu", weights_only=True, mmap=False)
+            try:
+                yield payload
+            finally:
+                del payload
+        else:
+            try:
+                yield payload
+            finally:
+                del payload
+                if mapped is not None:
+                    try:
+                        mapped.close()
+                    except Exception:
+                        pass
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
+    else:
+        payload = torch.load(resolved, map_location="cpu", weights_only=True, mmap=True)
+        try:
+            yield payload
+        finally:
+            del payload
+

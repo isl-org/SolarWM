@@ -617,3 +617,52 @@ def test_background_encode_worker_recording_and_streaming(tmp_path):
         frames = list(container.decode(video=0))
         assert len(frames) == 6
 
+
+def test_checkpoint_file_prefers_ema_bf16_transaction(tmp_path: Path) -> None:
+    import hashlib
+    from solarwm.backends.wan22.runtime.inference import _checkpoint_file
+    from solarwm.runtime.serialization import canonical_json_bytes
+
+    base_dir = tmp_path / "models"
+    raw_dir = base_dir / "SolarWM-5B-sgf-stage2-81f"
+    ema_dir = base_dir / "SolarWM-5B-sgf-stage2-81f-ema-bf16"
+    raw_dir.mkdir(parents=True)
+    ema_dir.mkdir(parents=True)
+
+    contract = {
+        "family": "wan22_ti2v_5b",
+        "stage": "stage2",
+        "causal_mode": "self_gradient_forcing",
+        "objective": "flow_matching",
+        "objective_variant": "sgf_v1",
+        "camera_translation_transform": "linear",
+        "parameterization": "full-parameter-live-ema",
+        "sp_size": 1,
+        "data_generation": "inference-portable:v1",
+    }
+    for d, is_ema in ((raw_dir, False), (ema_dir, True)):
+        (d / "model.pt").write_bytes(b"dummy")
+        manifest = {
+            "schema": "solarwm.checkpoint.v2",
+            "step": 1,
+            "contract": contract,
+            "required_components": ["model.pt"],
+            "files": [{"path": "model.pt", "size": 5}],
+            "metadata": {"available_weights": ["ema"] if is_ema else ["live", "ema"]},
+        }
+        data = canonical_json_bytes(manifest)
+        (d / "checkpoint-manifest.json").write_bytes(data)
+        (d / "COMPLETE.json").write_bytes(canonical_json_bytes({
+            "schema": "solarwm.checkpoint-complete.v2",
+            "step": 1,
+            "manifest_digest": hashlib.blake2s(data).hexdigest(),
+        }))
+
+    config = {
+        "checkpoint": {"path": str(raw_dir)},
+        "model": {"family": "wan22_ti2v_5b", "camera_translation_transform": "linear"},
+        "train": {"stage": "stage2", "objective": "flow_matching"},
+    }
+    resolved = _checkpoint_file(config)
+    assert resolved == ema_dir / "model.pt"
+

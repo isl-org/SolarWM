@@ -126,7 +126,12 @@ def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> d
         model["svdquant_weights_root"] = _resolve_repo_path(weights_root)
     elif linear_quant != "full_precision":
         checkpoint_path = Path(str(config.get("checkpoint", {}).get("path", ""))).expanduser()
-        model["svdquant_weights_root"] = str(checkpoint_path / "svdquant_int4")
+        candidate = checkpoint_path / "svdquant_int4"
+        if not candidate.exists() and (
+            checkpoint_path.parent / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4"
+        ).exists():
+            candidate = checkpoint_path.parent / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4"
+        model["svdquant_weights_root"] = str(candidate)
     return config
 
 
