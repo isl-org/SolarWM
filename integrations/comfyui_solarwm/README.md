@@ -24,11 +24,12 @@ configuration before model construction:
 | `linear_quant` | `full_precision`, `svdquant_k1`, `svdquant_k2`, `svdquant_k4` | `full_precision` |
 | `svdquant_weights_root` | SVDQuant weight directory | `models/SolarWM-5B-sgf-stage2-81f/svdquant_int4` |
 | `stage2_vae_quant` | `full_precision`, `quarot_w8a8` | `full_precision` |
-| `camera_motion` | `straight_about_turn_10s`, `circle_twice_10s`, `manual_only` | `straight_about_turn_10s` |
+| `camera_motion` | `straight_about_turn_10s`, `circle_twice_10s`, `dataset_trajectory`, `manual_only` | `straight_about_turn_10s` |
 | `translation_speed` | float | `0.1` |
 | `rotation_speed` | float | `0.1` |
 | `display_scale` | `1x`, `2x`, `fit` | `2x` |
 | `display_fps` | `4`, `8`, `12`, `16`, `24`, `30` | `8` |
+| `resolution` | `480p (480x864)`, `360p (320x576)` | `480p (480x864)` |
 
 The **Open keyboard viewer** button loads the provider in a worker thread, so
 ComfyUI remains responsive while model weights are loading. A loading dialog
@@ -36,8 +37,10 @@ is shown immediately; do not use **Queue Prompt** to start the viewer.
 
 The autonomous presets are a 10-second straight walk with an about-turn
 (`straight_about_turn_10s`) or two slow circles (`circle_twice_10s`). Any
-keyboard inputs steer or override the preset, and pressing `Space` brakes to a
-halt.
+Selecting a review image with prompt/camera sidecars automatically fills the
+prompt and selects `dataset_trajectory`. That mode follows the saved dataset
+camera at the dataset FPS; keyboard input temporarily overrides it, and
+pressing `Space` brakes to a halt.
 
 Every interactive session is also recorded as an H.264 MP4. Recordings are
 written under the configured runtime output directory, or

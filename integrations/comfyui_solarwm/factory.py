@@ -29,6 +29,53 @@ def _resolve_repo_path(value: str) -> str:
     return str(path)
 
 
+def resolve_image_path(image_value: str | Path) -> Path:
+    """Resolve a ComfyUI input image or a SolarWM repository asset."""
+    repo_root = Path(__file__).resolve().parents[2]
+    image_name = str(image_value)
+    for annotation in (" [input]", " [output]", " [temp]"):
+        if image_name.endswith(annotation):
+            image_name = image_name[: -len(annotation)]
+            break
+    image_path = Path(image_name).expanduser()
+    if image_path.is_absolute():
+        return image_path
+    try:
+        import folder_paths
+
+        comfy_image_path = Path(
+            folder_paths.get_annotated_filepath(str(image_value))
+        )
+        if comfy_image_path.exists():
+            return comfy_image_path
+    except (ImportError, OSError, ValueError, AttributeError):
+        pass
+    repo_image_path = repo_root / image_path
+    return repo_image_path if repo_image_path.exists() else image_path
+
+
+def load_dataset_camera_metadata(image_value: str | Path) -> dict[str, Any] | None:
+    """Load prompt and trajectory sidecars associated with a selected image."""
+    import numpy as np
+
+    image_path = resolve_image_path(image_value)
+    prompt_path = image_path.with_suffix(".prompt.txt")
+    camera_path = image_path.with_suffix(".camera.npz")
+    if not prompt_path.is_file() or not camera_path.is_file():
+        return None
+    with np.load(camera_path, allow_pickle=False) as values:
+        trajectory = np.asarray(values["c2w"], dtype=np.float64)
+        fps = float(np.asarray(values.get("fps", 16.0)).item())
+        sample_id = str(np.asarray(values.get("sample_id", "")).item())
+    return {
+        "prompt": prompt_path.read_text(encoding="utf-8").strip(),
+        "trajectory": trajectory,
+        "fps": fps,
+        "sample_id": sample_id,
+        "image_path": str(image_path),
+    }
+
+
 def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Apply ComfyUI-only runtime choices without rewriting the YAML file."""
 
@@ -59,6 +106,20 @@ def _interactive_config(payload: Mapping[str, Any], config: dict[str, Any]) -> d
     model["attention_backend"] = attention_backend
     model["linear_quant"] = linear_quant
     runtime["stage2_vae_quant"] = stage2_vae_quant
+
+    resolution = str(payload.get("resolution", "")).strip().lower()
+    if "360p" in resolution:
+        data = config.setdefault("data", {})
+        data["height"] = 320
+        data["width"] = 576
+        data["latent_shape"] = [21, 48, 20, 36]
+        model["frame_sequence_length"] = 180
+    elif "480p" in resolution:
+        data = config.setdefault("data", {})
+        data["height"] = 480
+        data["width"] = 864
+        data["latent_shape"] = [21, 48, 30, 54]
+        model["frame_sequence_length"] = 405
 
     weights_root = str(payload.get("svdquant_weights_root", "")).strip()
     if weights_root:
@@ -109,6 +170,8 @@ def get_cached_provider(payload: Mapping[str, Any]) -> tuple[Any, dict[str, Any]
         str(config.get("model", {}).get("linear_quant", "")),
         str(config.get("model", {}).get("svdquant_weights_root", "")),
         str(config.get("runtime", {}).get("stage2_vae_quant", "")),
+        int(config.get("data", {}).get("height", 480)),
+        int(config.get("data", {}).get("width", 864)),
     )
 
     with _CACHE_LOCK:
@@ -184,26 +247,10 @@ def build_provider_inputs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     from PIL import Image
 
     provider, config = get_cached_provider(payload)
-    repo_root = Path(__file__).resolve().parents[2]
-
     image_val = payload.get("initial_image")
     if not image_val:
         raise ValueError("interactive session requires initial_image")
-    image_path = Path(str(image_val)).expanduser()
-    if not image_path.is_absolute():
-        try:
-            import folder_paths
-
-            comfy_image_path = Path(
-                folder_paths.get_annotated_filepath(str(image_val))
-            )
-            if comfy_image_path.exists():
-                image_path = comfy_image_path
-            elif (repo_root / image_path).exists():
-                image_path = repo_root / image_path
-        except (ImportError, OSError, ValueError, AttributeError):
-            if not image_path.exists() and (repo_root / image_path).exists():
-                image_path = repo_root / image_path
+    image_path = resolve_image_path(str(image_val))
     image = Image.open(image_path).convert("RGB")
     image = image.resize(
         (int(config["data"]["width"]), int(config["data"]["height"])),
@@ -224,7 +271,12 @@ def build_provider_inputs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         first_latent = provider.vae.encode(
             pixels[:, :1].permute(0, 2, 1, 3, 4).contiguous()
         ).to(torch.bfloat16)
-        condition = provider.text_encoder([str(payload.get("prompt", ""))])
+        prompt = str(payload.get("prompt", ""))
+        if str(payload.get("camera_motion", "")) == "dataset_trajectory":
+            dataset_metadata = load_dataset_camera_metadata(str(image_val))
+            if dataset_metadata is not None:
+                prompt = dataset_metadata["prompt"]
+        condition = provider.text_encoder([prompt])
         prompt_embeds = condition["prompt_embeds"]
         if prompt_embeds.device != provider.device:
             condition = {

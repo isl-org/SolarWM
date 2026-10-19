@@ -12,31 +12,110 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
 from solarwm.backends.wan22.runtime.interactive import Stage2InteractiveSession
 from solarwm.backends.wan22.runtime.interactive_camera import (
     FreeFlyCamera,
     camera_tokens_from_poses,
 )
+from .factory import load_dataset_camera_metadata
 
 
 ProviderFactory = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
 
-def _rgb_frame(pixels: Any, frame_index: int = 0) -> Any:
-    import numpy as np
+def _batch_to_rgb_frames(pixels: Any) -> np.ndarray:
+    """Vectorized un-normalization, clamp, and uint8 conversion with single D2H transfer.
 
-    frame = pixels[0, int(frame_index)].detach().float().cpu().numpy()
-    if frame.ndim != 3:
-        raise ValueError(f"decoded frame must have three dimensions, got {frame.shape}")
-    if frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
-        frame = np.transpose(frame, (1, 2, 0))
-    if frame.shape[-1] == 1:
-        frame = np.repeat(frame, 3, axis=-1)
-    elif frame.shape[-1] == 4:
-        frame = frame[..., :3]
-    if frame.shape[-1] != 3:
-        raise ValueError(f"decoded frame must have 1, 3, or 4 channels, got {frame.shape}")
-    return np.clip((frame + 1.0) * 127.5, 0, 255).round().astype(np.uint8)
+    Returns a contiguous CPU ndarray of shape [T, H, W, 3] with dtype uint8.
+    """
+    if isinstance(pixels, torch.Tensor):
+        p = pixels.detach()
+        if p.ndim == 5:
+            p = p[0]
+        elif p.ndim == 3:
+            p = p.unsqueeze(0)
+        if p.ndim != 4:
+            raise ValueError(
+                f"expected 3D, 4D, or 5D pixels tensor, got shape {tuple(pixels.shape)}"
+            )
+
+        if p.shape[1] in (1, 3, 4) and p.shape[-1] not in (1, 3, 4):
+            p = p.permute(0, 2, 3, 1)
+
+        if p.shape[-1] == 1:
+            p = p.repeat(1, 1, 1, 3)
+        elif p.shape[-1] == 4:
+            p = p[..., :3]
+
+        if p.shape[-1] != 3:
+            raise ValueError(
+                f"expected 1, 3, or 4 channels, got shape {tuple(pixels.shape)}"
+            )
+
+        if p.dtype == torch.uint8:
+            return p.contiguous().cpu().numpy()
+
+        return (
+            ((p.float() + 1.0) * 127.5)
+            .clamp(0, 255)
+            .round()
+            .to(torch.uint8)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+
+    if not isinstance(pixels, np.ndarray):
+        pixels = np.asarray(pixels)
+
+    arr = pixels[0] if pixels.ndim == 5 else pixels
+    if arr.ndim == 3:
+        arr = np.expand_dims(arr, 0)
+    if arr.ndim != 4:
+        raise ValueError(
+            f"expected 3D, 4D, or 5D pixels array, got shape {pixels.shape}"
+        )
+
+    if arr.shape[1] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (0, 2, 3, 1))
+
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.shape[-1] == 4:
+        arr = arr[..., :3]
+
+    if arr.shape[-1] != 3:
+        raise ValueError(
+            f"expected 1, 3, or 4 channels, got shape {pixels.shape}"
+        )
+
+    if arr.dtype == np.uint8:
+        return np.ascontiguousarray(arr)
+
+    return np.ascontiguousarray(
+        np.clip((arr.astype(np.float32) + 1.0) * 127.5, 0, 255)
+        .round()
+        .astype(np.uint8)
+    )
+
+
+def _rgb_frame(pixels: Any, frame_index: int = 0) -> np.ndarray:
+    if (
+        isinstance(pixels, np.ndarray)
+        and pixels.ndim == 3
+        and pixels.shape[-1] == 3
+        and pixels.dtype == np.uint8
+    ):
+        return pixels
+    batch = _batch_to_rgb_frames(pixels)
+    if frame_index >= len(batch):
+        raise IndexError(
+            f"frame_index {frame_index} out of range for batch of size {len(batch)}"
+        )
+    return batch[frame_index]
 
 
 def _jpeg_bytes(pixels: Any, frame_index: int = 0) -> bytes:
@@ -63,7 +142,7 @@ class _VideoRecorder:
         self.container: Any | None = None
         self.stream: Any | None = None
 
-    def write(self, pixels: Any, frame_index: int) -> None:
+    def write(self, pixels: Any, frame_index: int = 0) -> None:
         import av
 
         frame = _rgb_frame(pixels, frame_index)
@@ -88,6 +167,7 @@ class _VideoRecorder:
         finally:
             self.container.close()
             self.container = None
+            self.stream = None
 
 
 @dataclass
@@ -112,8 +192,13 @@ class SessionState:
     )
     lock: threading.Lock = field(default_factory=threading.Lock)
     _recorder: _VideoRecorder | None = field(default=None, init=False, repr=False)
+    _encode_queue: queue.Queue[tuple[np.ndarray, list[dict[str, Any]]] | None] = field(
+        default_factory=lambda: queue.Queue(maxsize=2), init=False, repr=False
+    )
+    _encode_worker: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def start(self) -> None:
+        self._start_encode_worker()
         self.worker = threading.Thread(
             target=self._run,
             name=f"solarwm-interactive-{self.session_id[:8]}",
@@ -121,8 +206,50 @@ class SessionState:
         )
         self.worker.start()
 
+    def _start_encode_worker(self) -> None:
+        if self._encode_worker is None or not self._encode_worker.is_alive():
+            self._encode_worker = threading.Thread(
+                target=self._process_encode_queue,
+                name=f"solarwm-encode-{self.session_id[:8]}",
+                daemon=True,
+            )
+            self._encode_worker.start()
+
+    def _process_encode_queue(self) -> None:
+        try:
+            while True:
+                item = self._encode_queue.get()
+                if item is None:
+                    self._encode_queue.task_done()
+                    break
+                try:
+                    rgb_frames, events_to_publish = item
+                    num_frames = int(rgb_frames.shape[0])
+                    for offset in range(num_frames):
+                        frame = rgb_frames[offset]
+                        if self.recording_path is not None:
+                            if self._recorder is None:
+                                self._recorder = _VideoRecorder(
+                                    self.recording_path,
+                                    self.recording_fps,
+                                )
+                            self._recorder.write(frame)
+                        self._publish(events_to_publish[offset])
+                        self._publish(("jpeg", _jpeg_bytes(frame)))
+                except Exception as exc:
+                    self._publish(
+                        {"type": "error", "error": f"Encoding error: {exc}"}
+                    )
+                finally:
+                    self._encode_queue.task_done()
+        finally:
+            if self._recorder is not None:
+                self._recorder.close()
+                self._recorder = None
+
     def _run(self) -> None:
         last_step = time.perf_counter()
+        self._start_encode_worker()
         try:
             self._publish({"type": "ready", "session_id": self.session_id})
             while not self.stop_requested and not self.runtime.done:
@@ -158,22 +285,23 @@ class SessionState:
                 )
                 with self.device_lock:
                     frame = self.runtime.step(camera_tokens, pose=poses[-1])
-                first_pixel = self.runtime.emitted_pixel_frames - int(frame.pixels.shape[1])
-                for offset in range(int(frame.pixels.shape[1])):
-                    if self.recording_path is not None:
-                        if self._recorder is None:
-                            self._recorder = _VideoRecorder(
-                                self.recording_path,
-                                self.recording_fps,
-                            )
-                        self._recorder.write(frame.pixels, offset)
-                    self._publish(
+                    rgb_frames = (
+                        _batch_to_rgb_frames(frame.pixels)
+                        if getattr(frame, "pixels", None) is not None
+                        else np.zeros((0, 0, 0, 3), dtype=np.uint8)
+                    )
+
+                num_frames = int(rgb_frames.shape[0])
+                first_pixel = self.runtime.emitted_pixel_frames - num_frames
+                events_to_publish: list[dict[str, Any]] = []
+                for offset in range(num_frames):
+                    events_to_publish.append(
                         {
                             "type": "frame",
                             "session_id": self.session_id,
                             "index": frame.index,
                             "pixel_index": first_pixel + offset,
-                            "pixel_count": int(frame.pixels.shape[1]),
+                            "pixel_count": num_frames,
                             "generated_at": frame.generated_at,
                             "diffusion_seconds": frame.diffusion_seconds,
                             "decode_seconds": frame.decode_seconds,
@@ -186,7 +314,12 @@ class SessionState:
                             "pose": frame.pose.tolist() if frame.pose is not None else None,
                         }
                     )
-                    self._publish(("jpeg", _jpeg_bytes(frame.pixels, offset)))
+                self._encode_queue.put((rgb_frames, events_to_publish))
+
+            self._encode_queue.put(None)
+            if self._encode_worker is not None:
+                self._encode_worker.join()
+
             self._publish(
                 {
                     "type": "stopped",
@@ -204,13 +337,18 @@ class SessionState:
                 {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
             )
         finally:
+            if self._encode_worker is not None and self._encode_worker.is_alive():
+                try:
+                    self._encode_queue.put_nowait(None)
+                except Exception:
+                    pass
+                self._encode_worker.join(timeout=5.0)
             if self._recorder is not None:
                 self._recorder.close()
+                self._recorder = None
             self.runtime.close()
             self.decode_context.__exit__(None, None, None)
             try:
-                import torch
-
                 if hasattr(torch, "xpu") and torch.xpu.is_available():
                     torch.xpu.empty_cache()
                 elif torch.cuda.is_available():
@@ -323,7 +461,19 @@ class SolarWMSessionManager:
                 )
             )
             is_circle = camera_motion == "circle_twice_10s"
+            dataset_metadata = None
+            camera_pose = None
+            if camera_motion == "dataset_trajectory":
+                dataset_metadata = load_dataset_camera_metadata(
+                    str(payload.get("initial_image", ""))
+                )
+                if dataset_metadata is None:
+                    raise ValueError(
+                        "dataset_trajectory requires prompt/camera sidecars for initial_image"
+                    )
+                camera_pose = dataset_metadata["trajectory"][0]
             camera = FreeFlyCamera(
+                pose=camera_pose if camera_pose is not None else np.eye(4),
                 translation_speed=float(
                     payload.get(
                         "translation_speed",
@@ -340,6 +490,12 @@ class SolarWMSessionManager:
                 turn_delay_seconds=0.0 if is_circle else 4.0,
                 turn_duration_seconds=10.0 if is_circle else 2.0,
                 turn_angle_rad=4.0 * 3.141592653589793 if is_circle else 3.141592653589793,
+                dataset_trajectory=(
+                    None if dataset_metadata is None else dataset_metadata["trajectory"]
+                ),
+                dataset_fps=(
+                    16.0 if dataset_metadata is None else dataset_metadata["fps"]
+                ),
                 acceleration=float(inf_cfg.get("default_acceleration", 2.5)),
                 damping=float(inf_cfg.get("default_damping", 3.0)),
             )

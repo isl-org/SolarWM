@@ -9,7 +9,13 @@ from typing import Any, Protocol, runtime_checkable
 
 from solarwm.errors import BackendContractError
 
-from .contracts import PROFILES, WAN_FAMILIES, WAN_TI2V_5B_720P_153F_SCHEMA
+from .contracts import (
+    PROFILES,
+    WAN_FAMILIES,
+    WAN_TI2V_5B_360P_81F_SCHEMA,
+    WAN_TI2V_5B_360P_153F_SCHEMA,
+    WAN_TI2V_5B_720P_153F_SCHEMA,
+)
 
 
 @dataclass(frozen=True)
@@ -53,13 +59,31 @@ PREENCODED_PROFILES = {
         latent_shape=(39, 48, 44, 80),
         prompt_shape=(512, 4096),
     ),
+    WAN_TI2V_5B_360P_81F_SCHEMA: PreencodedProfile(
+        schema=WAN_TI2V_5B_360P_81F_SCHEMA,
+        family="wan22_ti2v_5b",
+        pixel_frames=81,
+        latent_shape=(21, 48, 20, 36),
+        prompt_shape=(512, 4096),
+    ),
+    WAN_TI2V_5B_360P_153F_SCHEMA: PreencodedProfile(
+        schema=WAN_TI2V_5B_360P_153F_SCHEMA,
+        family="wan22_ti2v_5b",
+        pixel_frames=153,
+        latent_shape=(39, 48, 20, 36),
+        prompt_shape=(512, 4096),
+    ),
 }
 
 PREENCODE_WINDOW_ASSIGNMENTS = frozenset({"deterministic_hash_v1", "materialized_index_v1"})
 
 
 def expected_tensor_shapes(
-    *, family: str, pixel_frames: int
+    *,
+    family: str,
+    pixel_frames: int,
+    height: int | None = None,
+    width: int | None = None,
 ) -> tuple[tuple[int, int, int, int], tuple[int, int], tuple[int, int, int, int] | None]:
     if family not in WAN_FAMILIES:
         raise BackendContractError(f"unknown Wan family {family!r}")
@@ -67,6 +91,10 @@ def expected_tensor_shapes(
         raise BackendContractError("Wan tensor profiles support 81 or 153 pixel frames")
     latent_frames = 21 if pixel_frames == 81 else 39
     if family == "wan22_ti2v_5b":
+        if height == 320 or (height is None and width == 576):
+            return (latent_frames, 48, 20, 36), (512, 4096), None
+        if height == 704 or (height is None and width == 1280):
+            return (latent_frames, 48, 44, 80), (512, 4096), None
         return (latent_frames, 48, 30, 54), (512, 4096), None
     return (
         (latent_frames, 16, 60, 104),
@@ -85,7 +113,11 @@ def validate_tensor_data_config(data: Mapping[str, Any], *, family: str) -> None
             profile.i2v_y_shape,
         )
     else:
-        latent, prompt, i2v_y = expected_tensor_shapes(family=family, pixel_frames=pixel_frames)
+        height = int(data.get("height", 0) or 0) or None
+        width = int(data.get("width", 0) or 0) or None
+        latent, prompt, i2v_y = expected_tensor_shapes(
+            family=family, pixel_frames=pixel_frames, height=height, width=width
+        )
     if str(data.get("latent_dtype", "")) != "bfloat16":
         raise BackendContractError("data.latent_dtype must be bfloat16")
     if tuple(data.get("latent_shape", ())) != latent:

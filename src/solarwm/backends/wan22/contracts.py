@@ -15,6 +15,8 @@ WAN_TI2V_5B = "wan22_ti2v_5b"
 WAN_I2V_A14B = "wan22_i2v_a14b"
 WAN_FAMILIES = frozenset({WAN_TI2V_5B, WAN_I2V_A14B})
 WAN_TI2V_5B_720P_153F_SCHEMA = "solarwm.wan22_ti2v_5b.720p.153f.v1"
+WAN_TI2V_5B_360P_81F_SCHEMA = "solarwm.wan22_ti2v_5b.360p.81f.v1"
+WAN_TI2V_5B_360P_153F_SCHEMA = "solarwm.wan22_ti2v_5b.360p.153f.v1"
 
 
 @dataclass(frozen=True)
@@ -75,15 +77,45 @@ TI2V_720P_153F_PROFILE = FamilyProfile(
     fsdp_strategy="HYBRID_SHARD",
 )
 
+TI2V_360P_PROFILE = FamilyProfile(
+    family=WAN_TI2V_5B,
+    model_name="Wan2.2-TI2V-5B-Camera",
+    timestep_shift=5.0,
+    latent_channels=48,
+    height=320,
+    width=576,
+    latent_height=20,
+    latent_width=36,
+    frame_sequence_length=180,
+    sequence_parallel_size=1,
+    fsdp_strategy="HYBRID_SHARD",
+)
+
 
 def _profile_for_config(config: Mapping[str, Any], family: str) -> FamilyProfile:
     data = _mapping(config, "data")
-    if (
-        family == WAN_TI2V_5B
-        and str(data.get("encoding", "")).strip().lower() == "preencoded"
-        and str(data.get("preencode_schema", "")) == WAN_TI2V_5B_720P_153F_SCHEMA
-    ):
-        return TI2V_720P_153F_PROFILE
+    if family == WAN_TI2V_5B:
+        schema = str(data.get("preencode_schema", "")).strip()
+        if (
+            str(data.get("encoding", "")).strip().lower() == "preencoded"
+            and schema == WAN_TI2V_5B_720P_153F_SCHEMA
+        ):
+            return TI2V_720P_153F_PROFILE
+        height = int(data.get("height", 0) or 0)
+        latent_shape = tuple(data.get("latent_shape", ()))
+        model = config.get("model", {})
+        model_fsl = (
+            int(model.get("frame_sequence_length", 0) or 0)
+            if isinstance(model, Mapping)
+            else 0
+        )
+        if (
+            schema in {WAN_TI2V_5B_360P_81F_SCHEMA, WAN_TI2V_5B_360P_153F_SCHEMA}
+            or height == 320
+            or latent_shape[-2:] == (20, 36)
+            or model_fsl == 180
+        ):
+            return TI2V_360P_PROFILE
     return PROFILES[family]
 
 

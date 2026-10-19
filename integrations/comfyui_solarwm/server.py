@@ -38,6 +38,35 @@ def register_routes() -> None:
             )
         return web.json_response({"session_id": session.session_id})
 
+    @routes.get("/solarwm/image-metadata")
+    async def image_metadata(request: web.Request) -> web.Response:
+        from .factory import load_dataset_camera_metadata
+
+        image_path = request.query.get("path", "")
+        if not image_path:
+            return web.json_response({"error": "missing image path"}, status=400)
+        try:
+            metadata = await asyncio.to_thread(
+                load_dataset_camera_metadata, image_path
+            )
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"{type(exc).__name__}: {exc}"},
+                status=400,
+            )
+        if metadata is None:
+            return web.json_response(
+                {"prompt": "", "has_trajectory": False},
+            )
+        return web.json_response(
+            {
+                "prompt": metadata["prompt"],
+                "has_trajectory": True,
+                "trajectory_fps": metadata["fps"],
+                "sample_id": metadata["sample_id"],
+            }
+        )
+
     @routes.get("/solarwm/sessions/{session_id}")
     async def session_status(request: web.Request) -> web.Response:
         try:

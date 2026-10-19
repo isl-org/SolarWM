@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from queue import Queue
 
@@ -8,11 +9,17 @@ import numpy as np
 import pytest
 import torch
 
-from integrations.comfyui_solarwm.factory import _interactive_config
+from integrations.comfyui_solarwm.factory import (
+    _interactive_config,
+    load_dataset_camera_metadata,
+    resolve_image_path,
+)
 from integrations.comfyui_solarwm.manager import (
     SessionState,
     _VideoRecorder,
+    _batch_to_rgb_frames,
     _jpeg_bytes,
+    _rgb_frame,
 )
 from integrations.comfyui_solarwm.node import SolarWMInteractive
 from solarwm.backends.wan22.runtime.interactive_camera import FreeFlyCamera
@@ -64,6 +71,7 @@ def test_interactive_node_exposes_stage2_runtime_options():
     assert required["camera_motion"][1]["options"] == [
         "straight_about_turn_10s",
         "circle_twice_10s",
+        "dataset_trajectory",
         "manual_only",
     ]
     assert required["camera_motion"][1]["default"] == "straight_about_turn_10s"
@@ -73,6 +81,8 @@ def test_interactive_node_exposes_stage2_runtime_options():
     assert required["display_scale"][1]["default"] == "2x"
     assert required["display_fps"][1]["options"] == [4, 8, 12, 16, 24, 30]
     assert required["display_fps"][1]["default"] == 8
+    assert required["resolution"][1]["options"] == ["480p (480x864)", "360p (320x576)"]
+    assert required["resolution"][1]["default"] == "480p (480x864)"
 
     values = SolarWMInteractive().build_config(
         "config.yaml",
@@ -87,6 +97,9 @@ def test_interactive_node_exposes_stage2_runtime_options():
         "straight_about_turn_10s",
         0.5,
         0.393,
+        display_scale="2x",
+        display_fps=8,
+        resolution="360p (320x576)",
     )
     payload = json.loads(values[0])
     assert payload["attention_backend"] == "sageattnv1"
@@ -98,6 +111,7 @@ def test_interactive_node_exposes_stage2_runtime_options():
     assert payload["rotation_speed"] == 0.393
     assert payload["display_scale"] == "2x"
     assert payload["display_fps"] == 8
+    assert payload["resolution"] == "360p (320x576)"
 
 
 def test_interactive_config_applies_and_validates_stage2_options():
@@ -117,6 +131,24 @@ def test_interactive_config_applies_and_validates_stage2_options():
         "svdquant_weights_root": "/weights",
     }
     assert config["runtime"] == {"stage2_vae_quant": "quarot_w8a8"}
+
+    config_360p = _interactive_config(
+        {"resolution": "360p (320x576)"},
+        {"model": {}, "runtime": {}, "data": {}},
+    )
+    assert config_360p["data"]["height"] == 320
+    assert config_360p["data"]["width"] == 576
+    assert config_360p["data"]["latent_shape"] == [21, 48, 20, 36]
+    assert config_360p["model"]["frame_sequence_length"] == 180
+
+    config_480p = _interactive_config(
+        {"resolution": "480p (480x864)"},
+        {"model": {}, "runtime": {}, "data": {}},
+    )
+    assert config_480p["data"]["height"] == 480
+    assert config_480p["data"]["width"] == 864
+    assert config_480p["data"]["latent_shape"] == [21, 48, 30, 54]
+    assert config_480p["model"]["frame_sequence_length"] == 405
 
     with pytest.raises(ValueError, match="unsupported linear_quant"):
         _interactive_config({"linear_quant": "int8"}, base)
@@ -143,6 +175,34 @@ def test_interactive_config_resolves_relative_model_paths():
     assert config["model"]["svdquant_weights_root"] == str(
         repo_root / "models/SolarWM-5B-sgf-stage2-81f/svdquant_int4"
     )
+
+
+def test_dataset_sidecars_load_for_selected_image(tmp_path):
+    image_path = tmp_path / "sample.webp"
+    prompt_path = image_path.with_suffix(".prompt.txt")
+    camera_path = image_path.with_suffix(".camera.npz")
+    trajectory = np.repeat(np.eye(4, dtype=np.float64)[None], 2, axis=0)
+    prompt_path.write_text("A test prompt\n", encoding="utf-8")
+    np.savez_compressed(
+        camera_path,
+        c2w=trajectory,
+        fps=np.float32(16.0),
+        sample_id=np.asarray("dataset/sample"),
+    )
+
+    metadata = load_dataset_camera_metadata(image_path)
+
+    assert metadata is not None
+    assert metadata["prompt"] == "A test prompt"
+    assert metadata["sample_id"] == "dataset/sample"
+    assert metadata["fps"] == 16.0
+    assert np.array_equal(metadata["trajectory"], trajectory)
+
+
+def test_repository_image_lookup_strips_comfyui_annotation():
+    image_path = next(Path("assets/realcam_vid").glob("*.webp")).resolve()
+
+    assert resolve_image_path(f"{image_path} [input]") == image_path
 
 
 def test_jpeg_encoder_accepts_decoded_channel_first_frames():
@@ -193,12 +253,12 @@ def test_workflow_template_widgets_values_aligned():
         workflow = json.loads(path.read_text(encoding="utf-8"))
         node = next(n for n in workflow["nodes"] if n.get("type") == "SolarWMInteractive")
         wv = node["widgets_values"]
-        # Exactly 15 widgets:
+        # Exactly 16 widgets:
         # [config_path, initial_image, prompt, seed, control_after_generate,
         #  max_latent_frames, attention_backend, linear_quant, svdquant_weights_root,
         #  stage2_vae_quant, camera_motion, translation_speed, rotation_speed,
-        #  display_scale, display_fps]
-        assert len(wv) == 15, f"{path} widgets_values length mismatch: {len(wv)} != 15"
+        #  display_scale, display_fps, resolution]
+        assert len(wv) == 16, f"{path} widgets_values length mismatch: {len(wv)} != 16"
         assert isinstance(wv[0], str) and wv[0].endswith(".yaml")
         assert isinstance(wv[1], str) and ("eastshade" in wv[1] or wv[1].endswith((".webp", ".png", ".jpg")))
         assert isinstance(wv[2], str)
@@ -218,6 +278,7 @@ def test_workflow_template_widgets_values_aligned():
         assert isinstance(wv[12], (int, float)) and abs(wv[12] - 0.1) < 1e-3
         assert wv[13] in ("1x", "2x", "fit") and wv[13] == "2x"
         assert wv[14] in (4, 8, 12, 16, 24, 30) and wv[14] == 8
+        assert wv[15] in ("480p (480x864)", "360p (320x576)") and wv[15] == "480p (480x864)"
 
     for path in template_paths[:2]:
         workflow = json.loads(path.read_text(encoding="utf-8"))
@@ -411,3 +472,148 @@ def test_session_chunk0_aligns_initial_anchor_pose(monkeypatch):
     assert np.isclose(chunk1_poses[1][2, 3], 0.500, atol=1e-5)
     # Latent 5 at t=1.25 (+0.625m)
     assert np.isclose(chunk1_poses[2][2, 3], 0.625, atol=1e-5)
+
+
+def test_batch_to_rgb_frames_parity_and_shapes():
+    # 1. 5D tensor in [-1.0, 1.0] range
+    torch.manual_seed(42)
+    pixels = (torch.rand((1, 4, 3, 16, 24), dtype=torch.float32) * 2.0) - 1.0
+    batch = _batch_to_rgb_frames(pixels)
+    assert batch.shape == (4, 16, 24, 3)
+    assert batch.dtype == np.uint8
+
+    # Exact parity against standard formula
+    for t in range(4):
+        ref = (
+            np.clip(
+                (pixels[0, t].permute(1, 2, 0).cpu().numpy() + 1.0) * 127.5,
+                0,
+                255,
+            )
+            .round()
+            .astype(np.uint8)
+        )
+        assert np.array_equal(batch[t], ref)
+        assert np.array_equal(_rgb_frame(pixels, t), ref)
+
+    # 2. 1-channel grayscale expansion
+    mono = torch.zeros((1, 2, 1, 8, 8), dtype=torch.float32)
+    mono_rgb = _batch_to_rgb_frames(mono)
+    assert mono_rgb.shape == (2, 8, 8, 3)
+    assert np.all(mono_rgb == 128)
+
+    # 3. 4-channel RGBA truncation
+    rgba = torch.ones((1, 2, 4, 8, 8), dtype=torch.float32)
+    rgba_rgb = _batch_to_rgb_frames(rgba)
+    assert rgba_rgb.shape == (2, 8, 8, 3)
+    assert np.all(rgba_rgb == 255)
+
+    # 4. uint8 tensor passthrough
+    u8 = torch.randint(0, 256, (2, 8, 8, 3), dtype=torch.uint8)
+    u8_out = _batch_to_rgb_frames(u8)
+    assert np.array_equal(u8.numpy(), u8_out)
+
+    # 5. Pre-converted 3D uint8 array identity in _rgb_frame
+    single_frame = batch[0]
+    assert _rgb_frame(single_frame) is single_frame
+
+
+def test_background_encode_worker_recording_and_streaming(tmp_path):
+    import av
+    from PIL import Image
+    from io import BytesIO
+
+    record_file = tmp_path / "test_async_record.mp4"
+
+    class StepFrame:
+        def __init__(self, step_idx):
+            self.index = step_idx
+            self.pixels = (
+                torch.rand((1, 3, 3, 16, 24), dtype=torch.float32) * 2.0 - 1.0
+            )
+            self.generated_at = time.perf_counter()
+            self.diffusion_seconds = 0.05
+            self.decode_seconds = 0.02
+            self.pose = np.eye(4)
+            self.horizon_ratio = 0.5
+            self.horizon_step = 1
+            self.horizon_limit = 10
+
+    class MockAsyncRuntime:
+        done = False
+        latent_index = 0
+        emitted_pixel_frames = 0
+        chunk = 3
+        frame_sequence_length = 2
+        device = "cpu"
+        dtype = None
+        provider = type("P", (), {"config": {"data": {"fps": 16.0}}})()
+
+        def step(self, camera_tokens, pose=None):
+            step_frame = StepFrame(self.latent_index)
+            self.latent_index += self.chunk
+            self.emitted_pixel_frames += 3
+            if self.latent_index >= 6:
+                self.done = True
+            return step_frame
+
+        def close(self):
+            pass
+
+    class DummyContext:
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    session = SessionState(
+        session_id="test_async_session",
+        runtime=MockAsyncRuntime(),
+        camera=FreeFlyCamera(),
+        decode_context=DummyContext(),
+        recording_path=record_file,
+        recording_fps=16.0,
+        events=Queue(maxsize=100),
+    )
+
+    session._run()
+
+    # Worker thread must be cleanly stopped and joined
+    assert session._encode_worker is not None
+    assert not session._encode_worker.is_alive()
+    assert session._recorder is None
+
+    # Collect all events emitted through the session
+    events = []
+    while not session.events.empty():
+        events.append(session.events.get_nowait())
+
+    # Check event order and contents:
+    # 1 "ready" event
+    # 6 pairs of ("frame" dict, ("jpeg", bytes))
+    # 1 "stopped" event
+    assert events[0] == {"type": "ready", "session_id": "test_async_session"}
+
+    frame_events = [e for e in events if isinstance(e, dict) and e.get("type") == "frame"]
+    jpeg_events = [e for e in events if isinstance(e, tuple) and e[0] == "jpeg"]
+    stopped_events = [e for e in events if isinstance(e, dict) and e.get("type") == "stopped"]
+
+    assert len(frame_events) == 6
+    assert len(jpeg_events) == 6
+    assert len(stopped_events) == 1
+    assert stopped_events[0]["reason"] == "horizon"
+    assert stopped_events[0]["video_path"] == str(record_file)
+
+    # Check JPEG bytes validity
+    for _, jbytes in jpeg_events:
+        with Image.open(BytesIO(jbytes)) as img:
+            assert img.size == (24, 16)
+            assert img.format == "JPEG"
+
+    # Check MP4 recording validity
+    assert record_file.exists()
+    with av.open(str(record_file), mode="r") as container:
+        stream = container.streams.video[0]
+        assert stream.width == 24
+        assert stream.height == 16
+        frames = list(container.decode(video=0))
+        assert len(frames) == 6
+

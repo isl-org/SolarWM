@@ -29,6 +29,7 @@ _LOOK_KEYS = {
 }
 _STRAIGHT_ABOUT_TURN = "straight_about_turn_10s"
 _CIRCLE_TWICE = "circle_twice_10s"
+_DATASET_TRAJECTORY = "dataset_trajectory"
 _AUTONOMOUS_MOTIONS = {_STRAIGHT_ABOUT_TURN, _CIRCLE_TWICE}
 
 
@@ -83,29 +84,52 @@ class FreeFlyCamera:
     turn_delay_seconds: float = 4.0
     turn_duration_seconds: float = 2.0
     turn_angle_rad: float = np.pi
+    dataset_trajectory: np.ndarray | None = field(default=None, repr=False)
+    dataset_fps: float = 16.0
     _velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
     _angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
     _elapsed_time: float = field(default=0.0, init=False)
     _turn_accumulated: float = field(default=0.0, init=False)
+    _dataset_offset: np.ndarray = field(
+        default_factory=lambda: np.eye(4, dtype=np.float64),
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.pose = np.asarray(self.pose, dtype=np.float64).copy()
         _validate_pose(self.pose)
+        if self.dataset_trajectory is not None:
+            trajectory = np.asarray(self.dataset_trajectory, dtype=np.float64)
+            if trajectory.ndim != 3 or trajectory.shape[1:] != (4, 4):
+                raise ValueError("dataset camera trajectory must have shape [N, 4, 4]")
+            for pose in trajectory:
+                _validate_pose(pose)
+            if not np.isfinite(self.dataset_fps) or self.dataset_fps <= 0:
+                raise ValueError("dataset camera trajectory fps must be positive")
+            self.dataset_trajectory = trajectory.copy()
         if self.default_motion == _CIRCLE_TWICE:
             self.turn_delay_seconds = 0.0
             self.turn_duration_seconds = 10.0
             self.turn_angle_rad = 4.0 * np.pi
         self._origin = self.pose.copy()
+        self._dataset_offset = np.eye(4, dtype=np.float64)
         if self.default_motion in _AUTONOMOUS_MOTIONS:
             self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
 
     def reset(self, pose: np.ndarray | None = None) -> None:
+        reset_pose = (
+            self.dataset_trajectory[0]
+            if pose is None and self.dataset_trajectory is not None
+            else np.eye(4, dtype=np.float64) if pose is None else pose
+        )
         self.pose = np.asarray(
-            np.eye(4, dtype=np.float64) if pose is None else pose,
+            reset_pose,
             dtype=np.float64,
         ).copy()
         _validate_pose(self.pose)
         self._origin = self.pose.copy()
+        self._dataset_offset = np.eye(4, dtype=np.float64)
         self._angular_velocity.fill(0.0)
         self._elapsed_time = 0.0
         self._turn_accumulated = 0.0
@@ -116,6 +140,27 @@ class FreeFlyCamera:
             self.turn_angle_rad = np.pi
         if self.default_motion in _AUTONOMOUS_MOTIONS:
             self._velocity = np.array([0.0, 0.0, self.translation_speed], dtype=np.float64)
+
+    def _dataset_pose_at(self, seconds: float) -> np.ndarray:
+        assert self.dataset_trajectory is not None
+        position = max(0.0, float(seconds)) * float(self.dataset_fps)
+        if position >= len(self.dataset_trajectory) - 1:
+            return self.dataset_trajectory[-1].copy()
+        lower = int(np.floor(position))
+        alpha = position - lower
+        upper = lower + 1
+        translation = (
+            (1.0 - alpha) * self.dataset_trajectory[lower, :3, 3]
+            + alpha * self.dataset_trajectory[upper, :3, 3]
+        )
+        rotation = _orthonormalize(
+            (1.0 - alpha) * self.dataset_trajectory[lower, :3, :3]
+            + alpha * self.dataset_trajectory[upper, :3, :3]
+        )
+        result = np.eye(4, dtype=np.float64)
+        result[:3, :3] = rotation
+        result[:3, 3] = translation
+        return result
 
     def brake(self) -> None:
         self._velocity.fill(0.0)
@@ -132,6 +177,17 @@ class FreeFlyCamera:
         )
         has_manual_translation = any(key in keys for key in _TRANSLATION_KEYS)
         has_manual_rotation = any(key in keys for key in _LOOK_KEYS)
+        if (
+            self.default_motion == _DATASET_TRAJECTORY
+            and self.dataset_trajectory is not None
+            and not has_manual_translation
+            and not has_manual_rotation
+        ):
+            self._elapsed_time += dt
+            self.pose = self._dataset_offset @ self._dataset_pose_at(self._elapsed_time)
+            self._velocity.fill(0.0)
+            self._angular_velocity.fill(0.0)
+            return self.pose.copy()
 
         if has_manual_translation:
             translation = sum(
@@ -243,6 +299,14 @@ class FreeFlyCamera:
         self.pose[:3, 3] += mid_rot @ (self._velocity * dt)
         self.pose[:3, :3] = _orthonormalize(mid_rot @ half_rot)
         self._elapsed_time += dt
+        if (
+            self.default_motion == _DATASET_TRAJECTORY
+            and self.dataset_trajectory is not None
+            and (has_manual_translation or has_manual_rotation)
+        ):
+            self._dataset_offset = self.pose @ np.linalg.inv(
+                self._dataset_pose_at(self._elapsed_time)
+            )
         return self.pose.copy()
 
     def level_roll(self, amount: float = 0.2) -> np.ndarray:

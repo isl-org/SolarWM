@@ -20,24 +20,43 @@ class SolarWMInteractive:
     _CAMERA_MOTIONS = [
         "straight_about_turn_10s",
         "circle_twice_10s",
+        "dataset_trajectory",
         "manual_only",
     ]
     _DISPLAY_SCALES = ["1x", "2x", "fit"]
     _DISPLAY_FPS = [4, 8, 12, 16, 24, 30]
+    _RESOLUTIONS = ["480p (480x864)", "360p (320x576)"]
 
     @staticmethod
     def _image_options() -> tuple[list[str], dict[str, object]]:
         """Expose ComfyUI's uploadable image combo with a safe local fallback."""
         default = "assets/eastshade.webp"
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        repo_assets = []
+        assets_root = os.path.join(repo_root, "assets")
+        if os.path.isdir(assets_root):
+            for root, _, filenames in os.walk(assets_root):
+                for filename in filenames:
+                    if os.path.splitext(filename)[1].lower() in {
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".webp",
+                    }:
+                        repo_assets.append(
+                            os.path.relpath(
+                                os.path.join(root, filename), repo_root
+                            ).replace(os.sep, "/")
+                        )
         try:
             import folder_paths
 
             files = folder_paths.filter_files_content_types(
                 os.listdir(folder_paths.get_input_directory()), ["image"]
             )
-            options = sorted(files)
+            options = sorted(set(files + repo_assets))
         except (ImportError, OSError, AttributeError):
-            options = []
+            options = sorted(set(repo_assets))
         if default not in options:
             options.insert(0, default)
         return options, {"default": default, "image_upload": True}
@@ -119,6 +138,10 @@ class SolarWMInteractive:
                     "COMBO",
                     {"options": cls._DISPLAY_FPS, "default": 8},
                 ),
+                "resolution": (
+                    "COMBO",
+                    {"options": cls._RESOLUTIONS, "default": "480p (480x864)"},
+                ),
             }
         }
 
@@ -144,6 +167,7 @@ class SolarWMInteractive:
         rotation_speed: float = 0.1,
         display_scale: str = "2x",
         display_fps: int = 8,
+        resolution: str = "480p (480x864)",
         control_after_generate: str = "fixed",
         **kwargs,
     ):
@@ -164,6 +188,7 @@ class SolarWMInteractive:
             "rotation_speed": float(rotation_speed),
             "display_scale": str(display_scale),
             "display_fps": int(display_fps),
+            "resolution": str(resolution),
             "controls": "keyboard-free-fly-v1",
         }
         return (json.dumps(payload, sort_keys=True),)

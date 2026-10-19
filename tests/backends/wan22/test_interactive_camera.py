@@ -167,6 +167,46 @@ def test_default_camera_initial_velocity_is_constant_speed():
     assert np.allclose(camera._velocity, [0.0, 0.0, 0.1])
 
 
+def test_dataset_trajectory_motion_follows_saved_poses():
+    trajectory = np.repeat(np.eye(4, dtype=np.float64)[None], 3, axis=0)
+    trajectory[1, 2, 3] = 1.0
+    trajectory[2, 2, 3] = 2.0
+    camera = FreeFlyCamera(
+        default_motion="dataset_trajectory",
+        dataset_trajectory=trajectory,
+        dataset_fps=4.0,
+    )
+
+    assert np.allclose(camera.pose, trajectory[0])
+    camera.update(set(), 0.25)
+    assert np.allclose(camera.pose, trajectory[1])
+    camera.update(set(), 0.25)
+    assert np.allclose(camera.pose, trajectory[2])
+
+
+def test_dataset_trajectory_manual_override_resumes_without_jump():
+    trajectory = np.repeat(np.eye(4, dtype=np.float64)[None], 3, axis=0)
+    trajectory[1, 2, 3] = 1.0
+    trajectory[2, 2, 3] = 2.0
+    camera = FreeFlyCamera(
+        default_motion="dataset_trajectory",
+        dataset_trajectory=trajectory,
+        dataset_fps=4.0,
+        translation_speed=1.0,
+        acceleration=100.0,
+        damping=100.0,
+    )
+
+    camera.update(set(), 0.25)
+    camera.update({"KeyD"}, 0.25)
+    manual_pose = camera.pose.copy()
+    resumed_pose = camera.update(set(), 0.0)
+
+    assert manual_pose[0, 3] > 0.0
+    assert np.allclose(resumed_pose, manual_pose, atol=1e-6)
+    assert np.isclose(resumed_pose[2, 3], 1.0, atol=1e-6)
+
+
 def test_midpoint_integration_keeps_trajectory_tangent_to_heading():
     camera = FreeFlyCamera(
         translation_speed=0.5,

@@ -112,6 +112,14 @@
             "name": "rotation_speed"
           },
           "link": null
+        },
+        {
+          "name": "resolution",
+          "type": "COMBO",
+          "widget": {
+            "name": "resolution"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -140,7 +148,8 @@
         0.1,
         0.1,
         "2x",
-        8
+        8,
+        "480p (480x864)"
       ]
     }
   ],

@@ -1,10 +1,47 @@
 import { app } from "../../../scripts/app.js";
 import { makeSolarWMViewer } from "./solarwm_interactive.js";
 
+async function loadSelectedImageMetadata(path) {
+  if (!path) return null;
+  const response = await fetch(
+    `/solarwm/image-metadata?path=${encodeURIComponent(path)}`,
+  );
+  if (!response.ok) return null;
+  return response.json();
+}
+
 app.registerExtension({
   name: "SolarWM.InteractiveCamera",
   async nodeCreated(node) {
     if (node.comfyClass !== "SolarWMInteractive") return;
+    const imageWidget = node.widgets?.find(
+      (widget) => widget.name === "initial_image",
+    );
+    const promptWidget = node.widgets?.find(
+      (widget) => widget.name === "prompt",
+    );
+    const cameraWidget = node.widgets?.find(
+      (widget) => widget.name === "camera_motion",
+    );
+    const syncSelectedImage = async (value) => {
+      const metadata = await loadSelectedImageMetadata(value);
+      if (!metadata || !metadata.has_trajectory) return;
+      if (promptWidget && metadata.prompt) {
+        promptWidget.value = metadata.prompt;
+      }
+      if (cameraWidget) {
+        cameraWidget.value = "dataset_trajectory";
+      }
+      node.graph?.setDirtyCanvas(true, true);
+    };
+    if (imageWidget) {
+      const previousCallback = imageWidget.callback;
+      imageWidget.callback = async (value) => {
+        if (previousCallback) previousCallback.call(imageWidget, value);
+        await syncSelectedImage(value);
+      };
+      void syncSelectedImage(imageWidget.value);
+    }
     node.addWidget("button", "Open keyboard viewer", null, async () => {
       const values = Object.fromEntries(
         node.widgets
