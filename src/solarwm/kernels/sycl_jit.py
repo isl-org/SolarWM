@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import hashlib
 import importlib
 import importlib.machinery
@@ -11,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import warnings
 from pathlib import Path
@@ -82,7 +86,8 @@ def compile_sycl_extension(
             raise FileNotFoundError(f"Source file not found: {s}")
 
     key = compute_jit_key(src_paths, [*extra_cflags, *extra_ldflags], gpu_arch=gpu_arch)
-    module_filename = f"{extension_name}_{key}.so"
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or (".pyd" if os.name == "nt" else ".so")
+    module_filename = f"{extension_name}_{key}{ext_suffix}"
     final_so = cache_dir / module_filename
     lock_file = cache_dir / f"{extension_name}_{key}.lock"
 
@@ -92,7 +97,8 @@ def compile_sycl_extension(
     env = get_sycl_env()
 
     with open(lock_file, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
             if final_so.is_file():
                 return final_so
@@ -107,15 +113,15 @@ def compile_sycl_extension(
                     "-fno-sycl-instrument-device-code",
                     "-std=c++20",
                     "-O3",
-                    "-fPIC",
                     f"-DTORCH_EXTENSION_NAME={extension_name}",
                     "-DTORCH_API_INCLUDE_EXTENSION_H",
-                    "-D_GLIBCXX_USE_CXX11_ABI=1",
                     "-isystem", str(env.torch_inc),
                     "-isystem", str(env.torch_inc / "torch" / "csrc" / "api" / "include"),
                     "-isystem", str(env.py_inc),
                     "-Wno-deprecated-declarations",
                 ]
+                if os.name != "nt":
+                    cflags.extend(["-fPIC", "-D_GLIBCXX_USE_CXX11_ABI=1"])
 
                 if include_sycl_tla:
                     cflags.extend([
@@ -155,10 +161,14 @@ def compile_sycl_extension(
                     "-Xsycl-target-backend=spir64_gen", f"-device {gpu_arch}",
                     "-Xspirv-translator", f"-spirv-ext={spirv_ext}",
                     f"-L{env.torch_lib}",
-                    f"-Wl,-rpath,{env.torch_lib}",
                     "-lc10", "-lc10_xpu", "-ltorch", "-ltorch_cpu", "-ltorch_xpu", "-ltorch_python",
                     *extra_ldflags,
                 ]
+                if os.name != "nt":
+                    link_cmd.insert(10, f"-Wl,-rpath,{env.torch_lib}")
+                else:
+                    link_cmd.insert(1, f"-L{Path(sys.base_prefix) / 'libs'}")
+
                 link_res = subprocess.run(link_cmd, capture_output=True, text=True, timeout=timeout)
                 if link_res.returncode != 0:
                     raise RuntimeError(
@@ -168,7 +178,8 @@ def compile_sycl_extension(
                 shutil.move(str(tmp_so), str(final_so))
                 return final_so
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 def load_sycl_extension(

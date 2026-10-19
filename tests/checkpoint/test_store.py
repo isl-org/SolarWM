@@ -129,3 +129,17 @@ def test_verification_rejects_non_v2_schema(tmp_path: Path) -> None:
 def test_exact_resume_rejects_camera_transform_drift() -> None:
     with pytest.raises(CheckpointError, match="camera_translation_transform"):
         assert_resume_compatible(_contract(), _contract(camera_translation_transform="logd4"))
+
+
+def test_windows_sync_directory_skips_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened = []
+
+    def mock_open(path, flags, *args):
+        opened.append((path, flags))
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(store.os, "open", mock_open)
+    # On Windows, _sync_directory does nothing and does not call os.open
+    monkeypatch.setattr(store.os, "name", "nt")
+    store._sync_directory(tmp_path)
+    assert not opened

@@ -138,6 +138,15 @@ def _component_files(root: Path, required: Sequence[str]) -> tuple[ComponentFile
     return tuple(records)
 
 
+def _sync_directory(path: Path) -> None:
+    if os.name != "nt":
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
 class CheckpointTransaction:
     """Build a checkpoint privately and publish it with one atomic rename.
 
@@ -194,11 +203,7 @@ class CheckpointTransaction:
         if self.target.exists():
             raise CheckpointError(f"checkpoint target appeared during commit: {self.target}")
         os.replace(self.path, self.target)
-        directory_fd = os.open(self.target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _sync_directory(self.target.parent)
         self._committed = True
         return verify_checkpoint(self.target)
 

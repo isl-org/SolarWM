@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
 import shutil
 import tarfile
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any
 
 from solarwm.config.loader import canonical_json
 from solarwm.data.index import IndexRow, validate_relative_key
 from solarwm.data.transport import GCSResolver, LocalResolver
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+    warnings.warn(
+        "SolarWM source-length cache locking is unavailable; continuing without "
+        "it. This is not required for interactive inference.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 _SOURCE_MEMBERS = {
     "video_member": "source.mp4",
@@ -74,7 +85,8 @@ def source_files(row: dict[str, Any], args: Any) -> Path:
     identity = source_identity(row, args)
     receipt_path = case / "SOURCE.json"
     with (case / ".source.lock").open("a+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         previous = json.loads(receipt_path.read_text()) if receipt_path.is_file() else None
         if previous is not None and previous.get("identity") != identity:
             raise ValueError("Source cache belongs to another dataset or row; use a new work_dir")

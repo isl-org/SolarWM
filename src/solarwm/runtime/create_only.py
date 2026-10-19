@@ -22,6 +22,15 @@ except ImportError:  # pragma: no cover - exercised on Windows
     )
 
 
+def _sync_directory(path: Path) -> None:
+    if os.name != "nt":
+        directory_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
 def _raise(error_type: type[Exception], message: str) -> None:
     raise error_type(message)
 
@@ -98,11 +107,7 @@ def publish_directory_no_replace(
                 error_type=error_type,
                 label=label,
             )
-            directory_fd = os.open(target.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _sync_directory(target.parent)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -143,11 +148,7 @@ def write_file_create_only(
         except FileExistsError:
             _raise(error_type, f"{label} already exists: {destination}")
         temporary.unlink()
-        directory_fd = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _sync_directory(destination.parent)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -178,11 +179,7 @@ def link_file_create_only(
         _raise(error_type, f"{label} already exists: {target}")
     except OSError as exc:
         _raise(error_type, f"{label} create-only link failed: {exc}")
-    directory_fd = os.open(target.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    _sync_directory(target.parent)
 
 
 __all__ = [

@@ -49,3 +49,18 @@ def test_create_only_link_never_replaces_existing_bytes(tmp_path: Path) -> None:
             label="test link",
         )
     assert destination.read_bytes() == b"immutable-video"
+
+
+def test_windows_sync_directory_skips_fsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from solarwm.runtime import create_only
+
+    opened = []
+
+    def mock_open(path, flags, *args):
+        opened.append((path, flags))
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(create_only.os, "open", mock_open)
+    monkeypatch.setattr(create_only.os, "name", "nt")
+    create_only._sync_directory(tmp_path)
+    assert not opened

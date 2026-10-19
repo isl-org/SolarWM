@@ -38,7 +38,12 @@ def find_icpx() -> Path | None:
     # Check ONEAPI_ROOT or standard /opt/intel/oneapi paths
     candidates = []
     if "ONEAPI_ROOT" in os.environ:
-        candidates.append(Path(os.environ["ONEAPI_ROOT"]) / "compiler" / "latest" / "bin" / "icpx")
+        root = Path(os.environ["ONEAPI_ROOT"])
+        candidates.extend([
+            root / "compiler" / "latest" / "bin" / "icpx",
+            root / "compiler" / "latest" / "bin" / "icx",
+            root / "compiler" / "latest" / "bin" / "icx.exe",
+        ])
     candidates.extend([
         Path("/opt/intel/oneapi/compiler/latest/bin/icpx"),
         Path("/opt/intel/oneapi/compiler/2025.3/bin/icpx"),
@@ -46,7 +51,7 @@ def find_icpx() -> Path | None:
         Path("/opt/intel/oneapi/compiler/2024.2/bin/icpx"),
     ])
     for c in candidates:
-        if c.is_file() and os.access(c, os.X_OK):
+        if c.is_file() and (os.name == "nt" or os.access(c, os.X_OK)):
             return c.resolve()
     return None
 
