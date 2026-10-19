@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import os
 from os.path import expandvars
 from pathlib import Path
 import threading
@@ -19,7 +20,10 @@ _CACHED_PROVIDER_KEY: tuple[Any, ...] | None = None
 
 
 def _resolve_repo_path(value: str) -> str:
-    path = Path(expandvars(value)).expanduser()
+    expanded = expandvars(value)
+    if os.name == "nt" and expanded.startswith("/") and not expanded.startswith("//"):
+        return expanded
+    path = Path(expanded).expanduser()
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[2] / path
     return str(path)

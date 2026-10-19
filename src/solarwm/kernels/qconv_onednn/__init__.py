@@ -11,6 +11,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import sysconfig
 from pathlib import Path
 from typing import Sequence
@@ -19,6 +20,7 @@ import torch
 
 _MOD_NAME = "qconv_onednn_ops"
 _MODULE = None
+_DLL_DIRECTORY = None
 
 
 def _module_suffix() -> str:
@@ -117,6 +119,8 @@ def _build_extension(module_path: Path) -> bool:
     if os.name != "nt":
         cmd[2:2] = ["-fPIC"]
         cmd[-4:-4] = [f"-Wl,-rpath,{torch_lib}", f"-Wl,-rpath,{dnnl_lib}"]
+    else:
+        cmd.insert(1, f"-L{Path(sys.base_prefix) / 'libs'}")
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -126,7 +130,7 @@ def _build_extension(module_path: Path) -> bool:
 
 
 def _get_module():
-    global _MODULE
+    global _MODULE, _DLL_DIRECTORY
     if _MODULE is not None:
         return _MODULE
 
@@ -137,6 +141,10 @@ def _get_module():
             return None
 
     try:
+        if os.name == "nt" and _DLL_DIRECTORY is None:
+            dll_dir = _dnnl_root() / "bin"
+            if dll_dir.is_dir():
+                _DLL_DIRECTORY = os.add_dll_directory(str(dll_dir))
         spec = importlib.util.spec_from_file_location(_MOD_NAME, str(module_path))
         if spec is None or spec.loader is None:
             return None

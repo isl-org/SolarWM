@@ -30,7 +30,13 @@ The target runtime metric is the **sum of execution times across 5 layers**:
 - **Runtime Reference Baseline**: PyTorch native BF16 operations (`bf16_linear` / `torch.nn.functional.linear` + `wan_rmsnorm`).
 
 ## Portability & Build Requirements
-- Self-contained `sycl-tla` headers and applications are bundled in the package (`sycl-tla/`).
+- Download `sycl-tla` headers and applications explicitly before building:
+  `git clone --depth 1 --branch v0.9.3 https://github.com/intel/sycl-tla.git sycl-tla`.
+  This release resolves to commit `7b56b936b87f799f80dde60c2fd8d11c1128cebb`.
+- Install `kernelfoundry` in the target Python environment for the build harness.
+- The optional VAE qconv extension needs the matching oneAPI Toolkit oneDNN
+  development component (`intel.oneapi.win.dnnl`), including `dnnl.lib` and
+  `dnnl.dll` on Windows; PyTorch's bundled headers are not a substitute.
 - No machine-specific hardcoded paths are used; include directories are resolved relative to the task root.
 - The build harness assumes Intel oneAPI's `icpx` (or Windows `icx`) compiler is
   present in `PATH`.
