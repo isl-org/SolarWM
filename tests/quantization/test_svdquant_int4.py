@@ -13,6 +13,7 @@ from scripts.quantization.svdquant_int4 import (
     pack_int4_signed,
     quantize_activations_dynamic,
     quantize_weights_rtn_g64,
+    reshard_svdquant_directory,
     search_act_clip_ratio,
     unpack_int4_signed,
 )
@@ -141,3 +142,72 @@ def test_export_and_manifest_roundtrip(tmp_path):
         loaded = json.load(f)
     assert loaded["format_version"] == "solarwm-svdquant-v1"
     assert "svdquant_weights.safetensors" in loaded["shards"]
+
+
+def test_export_multiset_safetensors(tmp_path):
+    oc, ic = 64, 128
+    dummy_tensors_0 = {
+        "blocks.0.self_attn.q.qweight": torch.zeros((oc, ic // 2), dtype=torch.int8),
+    }
+    dummy_tensors_1 = {
+        "blocks.0.self_attn.q.qweight": torch.ones((oc, ic // 2), dtype=torch.int8),
+    }
+    quantized_sets = {"set0": dummy_tensors_0, "set1": dummy_tensors_1}
+    manifest = {
+        "format_version": "solarwm-svdquant-v1",
+        "rank": 32,
+        "group_size": 64,
+        "num_sets": 2,
+    }
+
+    manifest_path = export_svdquant_safetensors(tmp_path, quantized_sets, manifest)
+    assert manifest_path.exists()
+
+    with open(manifest_path) as f:
+        loaded = json.load(f)
+    assert loaded["shards"] == [
+        "svdquant_weights_set0.safetensors",
+        "svdquant_weights_set1.safetensors",
+    ]
+    assert loaded["weight_map"]["set0.blocks.0.self_attn.q.qweight"] == "svdquant_weights_set0.safetensors"
+    assert loaded["weight_map"]["set1.blocks.0.self_attn.q.qweight"] == "svdquant_weights_set1.safetensors"
+    assert (tmp_path / "svdquant_weights_set0.safetensors").is_file()
+    assert (tmp_path / "svdquant_weights_set1.safetensors").is_file()
+
+
+def test_reshard_svdquant_directory(tmp_path):
+    oc, ic = 64, 128
+    from safetensors.torch import save_file
+
+    # Simulate old arbitrary chunking where set0 and set1 were combined into a single file
+    combined = {
+        "set0.blocks.0.self_attn.q.qweight": torch.zeros((oc, ic // 2), dtype=torch.int8),
+        "set1.blocks.0.self_attn.q.qweight": torch.ones((oc, ic // 2), dtype=torch.int8),
+    }
+    save_file(combined, str(tmp_path / "svdquant_weights-00000-of-00001.safetensors"))
+    manifest = {
+        "format_version": "solarwm-svdquant-v1",
+        "shards": ["svdquant_weights-00000-of-00001.safetensors"],
+        "weight_map": {
+            "set0.blocks.0.self_attn.q.qweight": "svdquant_weights-00000-of-00001.safetensors",
+            "set1.blocks.0.self_attn.q.qweight": "svdquant_weights-00000-of-00001.safetensors",
+        },
+    }
+    with open(tmp_path / "manifest.json", "w") as f:
+        json.dump(manifest, f)
+
+    shards = reshard_svdquant_directory(tmp_path)
+    assert shards == [
+        "svdquant_weights_set0.safetensors",
+        "svdquant_weights_set1.safetensors",
+    ]
+    assert not (tmp_path / "svdquant_weights-00000-of-00001.safetensors").exists()
+    assert (tmp_path / "svdquant_weights_set0.safetensors").is_file()
+    assert (tmp_path / "svdquant_weights_set1.safetensors").is_file()
+
+    with open(tmp_path / "manifest.json") as f:
+        updated = json.load(f)
+    assert updated["shards"] == shards
+    assert updated["weight_map"]["set0.blocks.0.self_attn.q.qweight"] == "svdquant_weights_set0.safetensors"
+    assert updated["weight_map"]["set1.blocks.0.self_attn.q.qweight"] == "svdquant_weights_set1.safetensors"
+

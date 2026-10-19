@@ -68,49 +68,46 @@ ComfyUI must run with the environment
 created by this installer, or with SolarWM installed into its own Python
 environment, because the custom node imports the `solarwm` package.
 
-## Optional private SVDQuant weights
+## SVDQuant INT4 weights
 
-The installer accepts a private repository whose root contains
-`svdquant_int4/`:
+SVDQuant quantized weights are hosted as GitHub release assets on `isl-org/SolarWM` under the `ptc` release tag. Each noise-level checkpoint corresponds to a single `.safetensors` file (~1.83 GiB / 1.96 GB), strictly complying with GitHub's 2 GiB per-asset limit without arbitrary sharding:
+
+- **k1** (1 checkpoint, `set0`): single file `svdquant_weights.safetensors` (~1.83 GiB)
+- **k2** (2 checkpoints, `set0` & `set1`): two files `svdquant_weights_set0.safetensors` and `svdquant_weights_set1.safetensors` (~1.83 GiB each)
+- **k4** (4 checkpoints, `set0` .. `set3`): four files `svdquant_weights_set0.safetensors` through `svdquant_weights_set3.safetensors` (~1.83 GiB each)
+
+By default, running `scripts/install_solarwm.py` downloads the `sdpa_k1` variant automatically:
 
 ```bash
-python scripts/install_solarwm.py \
-  --svdquant-repo your-org/SolarWM-5B-svdquant-int4
+# Downloads base weights, stage2 checkpoint, and sdpa_k1 SVDQuant weights
+python scripts/install_solarwm.py
+
+# Download a specific variant (e.g. sdpa_k2 or sdpa_k4)
+python scripts/install_solarwm.py --svdquant-variant sdpa_k2
+
+# Skip SVDQuant weight download
+python scripts/install_solarwm.py --svdquant-variant none
 ```
 
-The repository must be accessible to the Hugging Face account used by `hf`.
-The weights are not uploaded by the installer.
+The installer downloads the variant's `manifest.json` and all shards into:
+`models/SolarWM-5B-sgf-stage2-81f/svdquant_int4/{variant}/`
 
-## Upload SVDQuant weights to a private Hugging Face repository
+### Uploading SVDQuant weights to the GitHub release
 
-These commands create and populate a private model repository. They are
-provided for the owner of the weights and are not run by SolarWM:
-
-```bash
-export HF_REPO=your-org/SolarWM-5B-svdquant-int4
-export MODEL_ROOT=/path/to/SolarWM/models
-export SVDQUANT_ROOT="$MODEL_ROOT/SolarWM-5B-sgf-stage2-81f/svdquant_int4"
-
-python -m pip install --upgrade huggingface_hub
-hf auth login
-hf repo create "$HF_REPO" --repo-type model --private
-hf upload \
-  "$HF_REPO" \
-  "$SVDQUANT_ROOT" \
-  svdquant_int4 \
-  --repo-type model
-```
-
-For a large upload that should be resumable, stage the directory so the
-repository has the same layout, then use:
+To upload a newly calibrated or exported SVDQuant variant to the release:
 
 ```bash
-mkdir -p /tmp/solarwm-svdquant-upload
-cp -a "$SVDQUANT_ROOT" /tmp/solarwm-svdquant-upload/
-hf upload-large-folder \
-  "$HF_REPO" \
-  /tmp/solarwm-svdquant-upload \
-  --repo-type model
+VARIANT=sdpa_k2
+SRC_DIR=models/SolarWM-5B-sgf-stage2-81f/svdquant_int4/$VARIANT
+STAGE_DIR=/tmp/svdquant_upload
+
+mkdir -p "$STAGE_DIR"
+cp "$SRC_DIR/manifest.json" "$STAGE_DIR/${VARIANT}_manifest.json"
+for f in "$SRC_DIR"/*.safetensors; do
+  ln -f "$f" "$STAGE_DIR/${VARIANT}_$(basename "$f")"
+done
+
+gh release upload ptc "$STAGE_DIR"/* --clobber -R isl-org/SolarWM
 ```
 
 After upload, verify the private repository without downloading it:

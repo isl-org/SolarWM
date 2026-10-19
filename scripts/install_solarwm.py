@@ -7,6 +7,7 @@ import argparse
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -25,6 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_DIR = REPO_ROOT / "models"
 DATA_ROOT = Path.home() / "SolarWM-Data" / "releases-v1"
 HF_MODEL_REPO = "junchaoh-cs/SolarWM"
+DEFAULT_SVDQUANT_RELEASE_REPO = "isl-org/SolarWM"
+DEFAULT_SVDQUANT_RELEASE_TAG = "ptc"
+DEFAULT_SVDQUANT_VARIANT = "sdpa_k1"
 INTERACTIVE_CONFIG = (
     REPO_ROOT
     / "configs"
@@ -139,8 +143,26 @@ def parse_args() -> argparse.Namespace:
         help=f"Local model directory (default: {DEFAULT_MODEL_DIR})",
     )
     parser.add_argument(
+        "--svdquant-variant",
+        default=DEFAULT_SVDQUANT_VARIANT,
+        help=(
+            f"SVDQuant variant to download from GitHub release (default: {DEFAULT_SVDQUANT_VARIANT}; "
+            "options: sdpa_k1, sdpa_k2, sdpa_k4, sageattnv1_k1, sageattnv1_k2, sageattnv1_k4, none)"
+        ),
+    )
+    parser.add_argument(
+        "--svdquant-release-repo",
+        default=DEFAULT_SVDQUANT_RELEASE_REPO,
+        help=f"GitHub repository for SVDQuant release assets (default: {DEFAULT_SVDQUANT_RELEASE_REPO})",
+    )
+    parser.add_argument(
+        "--svdquant-release-tag",
+        default=DEFAULT_SVDQUANT_RELEASE_TAG,
+        help=f"GitHub release tag for SVDQuant assets (default: {DEFAULT_SVDQUANT_RELEASE_TAG})",
+    )
+    parser.add_argument(
         "--svdquant-repo",
-        help="Optional private Hugging Face repo containing a svdquant_int4/ directory",
+        help="Optional private Hugging Face repo containing a svdquant_int4/ directory (fallback)",
     )
     parser.add_argument(
         "--skip-weights",
@@ -335,14 +357,101 @@ def model_weights_are_present(model_root: Path) -> bool:
     return all(path.exists() for path in required_files)
 
 
-def svdquant_weights_are_present(model_root: Path) -> bool:
+def svdquant_weights_are_present(model_root: Path, variant: str | None = None) -> bool:
     root = model_root / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4"
-    return root.is_dir() and any(root.rglob("*.safetensors"))
+    if not root.is_dir():
+        return False
+    if variant and variant.lower() not in ("none", "skip", "all"):
+        v_dir = root / variant
+        if not v_dir.is_dir() or not (v_dir / "manifest.json").is_file():
+            return False
+        return any(v_dir.glob("*.safetensors"))
+    return any(root.rglob("*.safetensors"))
+
+
+def download_file_with_progress(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.with_suffix(f"{dest.suffix}.part")
+    req = urllib.request.Request(url, headers={"User-Agent": "SolarWM-Installer"})
+    with urllib.request.urlopen(req) as resp, open(tmp_path, "wb") as f:
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk_size = 8 * 1024 * 1024
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            if total > 0:
+                percent = downloaded * 100.0 / total
+                print(
+                    f"\rDownloading {dest.name}: {downloaded / (1024*1024):.1f}/{total / (1024*1024):.1f} MB ({percent:.1f}%)",
+                    end="",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\rDownloading {dest.name}: {downloaded / (1024*1024):.1f} MB",
+                    end="",
+                    flush=True,
+                )
+    print()
+    tmp_path.replace(dest)
+
+
+def download_svdquant_release_variant(
+    model_root: Path,
+    variant: str = DEFAULT_SVDQUANT_VARIANT,
+    repo: str = DEFAULT_SVDQUANT_RELEASE_REPO,
+    tag: str = DEFAULT_SVDQUANT_RELEASE_TAG,
+) -> Path:
+    variant_dir = model_root / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4" / variant
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = variant_dir / "manifest.json"
+
+    if manifest_path.is_file():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            shards = manifest_data.get("shards", [])
+            if shards and all((variant_dir / s).is_file() and (variant_dir / s).stat().st_size > 0 for s in shards):
+                print(f"SVDQuant {variant} weights already present in {variant_dir}")
+                return variant_dir
+        except Exception:
+            pass
+
+    manifest_url = f"https://github.com/{repo}/releases/download/{tag}/{variant}_manifest.json"
+    print(f"Downloading SVDQuant {variant} manifest from {manifest_url}")
+    download_file_with_progress(manifest_url, manifest_path)
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+
+    shards = manifest_data.get("shards", [])
+    if not shards:
+        fail(f"No shards found in manifest for SVDQuant {variant}")
+
+    for shard in shards:
+        shard_dest = variant_dir / shard
+        if shard_dest.is_file() and shard_dest.stat().st_size > 0:
+            print(f"Shard {shard} already exists, skipping")
+            continue
+        asset_name = f"{variant}_{shard}"
+        shard_url = f"https://github.com/{repo}/releases/download/{tag}/{asset_name}"
+        print(f"Downloading SVDQuant asset {asset_name} -> {shard_dest.name}")
+        download_file_with_progress(shard_url, shard_dest)
+
+    print(f"SVDQuant {variant} weights downloaded to {variant_dir}")
+    return variant_dir
 
 
 def download_weights(
     local_dir: Path,
-    svdquant_repo: str | None,
+    svdquant_repo: str | None = None,
+    svdquant_variant: str | None = DEFAULT_SVDQUANT_VARIANT,
+    svdquant_release_repo: str = DEFAULT_SVDQUANT_RELEASE_REPO,
+    svdquant_release_tag: str = DEFAULT_SVDQUANT_RELEASE_TAG,
 ) -> Path:
     local_dir = normalize_path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +478,13 @@ def download_weights(
             svdquant_root.mkdir(parents=True, exist_ok=True)
             print(f"Downloading {svdquant_repo} to {svdquant_root}")
             snapshot_download(repo_id=svdquant_repo, local_dir=svdquant_root)
+    elif svdquant_variant and svdquant_variant.lower() not in ("none", "skip"):
+        download_svdquant_release_variant(
+            model_root,
+            variant=svdquant_variant,
+            repo=svdquant_release_repo,
+            tag=svdquant_release_tag,
+        )
     return model_root
 
 
@@ -463,7 +579,13 @@ def main() -> None:
         build_xpu_kernels(device, args.gpu_arch)
     model_root = normalize_path(args.local_dir)
     if not args.skip_weights:
-        model_root = download_weights(args.local_dir, args.svdquant_repo)
+        model_root = download_weights(
+            args.local_dir,
+            svdquant_repo=args.svdquant_repo,
+            svdquant_variant=args.svdquant_variant,
+            svdquant_release_repo=args.svdquant_release_repo,
+            svdquant_release_tag=args.svdquant_release_tag,
+        )
         subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "prepare_stage2_ema.py"),
              str(model_root / "SolarWM-5B-sgf-stage2-81f"),

@@ -3,7 +3,7 @@
 from .act_policy import search_act_clip_ratio
 from .attn_dispatch import ATTENTION_BACKENDS, resolve_attention_backend, with_attention_backend
 from .capture import ActivationCaptureHook, HessianCollector
-from .exporter import export_svdquant_safetensors, load_svdquant_manifest
+from .exporter import export_svdquant_safetensors, load_svdquant_manifest, reshard_svdquant_directory
 from .gptq import gptq_quantize_residual
 from .quantizer import (
     dequantize_int4_weights,
@@ -33,4 +33,5 @@ __all__ = [
     "HessianCollector",
     "export_svdquant_safetensors",
     "load_svdquant_manifest",
+    "reshard_svdquant_directory",
 ]
