@@ -118,3 +118,30 @@ After upload, verify the private repository without downloading it:
 ```bash
 hf tree "$HF_REPO" --repo-type model
 ```
+# Windows XPU Triton prerequisites
+
+The weights download step also runs `scripts/prepare_stage2_ema.py` to create
+`SolarWM-5B-sgf-stage2-81f-ema-bf16`, a separate EMA-only BF16 inference
+transaction. The original live+EMA FP32 release is retained. Local interactive
+configs select the derived checkpoint when present. This reduces the Stage2
+file from approximately 37.25 GiB to 9.31 GiB; BF16 conversion matches the
+existing inference model dtype. It does not reduce runtime activation or KV-cache
+requirements. The processor uses a read-only file mapping to avoid Windows'
+whole-file private-mapping commit reservation and writes updated manifests.
+
+On Windows XPU installations, `scripts/install_solarwm.py` also downloads the
+official Level Zero SDK 1.34.0, checks its pinned SHA-256, and extracts it under
+the active virtual environment's `level-zero-sdk` directory. A venv-local
+`solarwm_triton_environment.pth` startup hook sets `LEVEL_ZERO_V1_SDK_PATH`
+(preserving an existing setting) and initializes an installed MSVC x64 toolset
+when no compiler is already configured. Restart ComfyUI after installation.
+This does not install MSVC: install Visual Studio C++ Build Tools and the
+Windows SDK first. Explicit `CXX` and existing compiler environments are preserved.
+
+The PyTorch XPU dependency `intel-sycl-rt` supplies SYCL development files under
+`.venv\Library\include\sycl\sycl.hpp` and `.venv\Library\lib\sycl.lib` on Windows,
+outside `site-packages`. Triton discovers these through wheel metadata. If the
+files are missing, restore the matching `intel-sycl-rt` wheel; alternatively,
+install the matching oneAPI DPC++ component and initialize its environment.
+Do not set `ONEAPI_ROOT` to a nonexistent toolkit, since that overrides Triton's
+wheel-based discovery.

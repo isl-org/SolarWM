@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import importlib.util
 import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import sysconfig
+import tempfile
+import urllib.request
+import zipfile
 from typing import Any, NoReturn
 
 
@@ -53,6 +59,65 @@ BASE_PACKAGES = ("numpy>=1.24", "PyYAML>=6.0")
 PACKAGE_NAME = re.compile(r"^[A-Za-z0-9_.-]+")
 WINDOWS_DRIVE_PATH = re.compile(r"^([A-Za-z]):[\\/](.*)$")
 CYGDRIVE_PATH = re.compile(r"^/cygdrive/([A-Za-z])(?:/(.*))?$")
+LEVEL_ZERO_VERSION = "1.34.0"
+LEVEL_ZERO_SHA256 = "3050280cc94b7a5db7fb173391fcced9b7284ae196bcaf05a566d2911baa7733"
+LEVEL_ZERO_URL = (
+    "https://github.com/oneapi-src/level-zero/releases/download/v1.34.0/"
+    "level-zero-win-sdk-1.34.0.zip"
+)
+
+
+def setup_triton_environment() -> None:
+    """Install development files and a startup hook in this venv, not globally."""
+    if os.name != "nt":
+        return
+    sdk = Path(sys.prefix) / "level-zero-sdk" / LEVEL_ZERO_VERSION
+    required = (sdk / "include" / "level_zero" / "ze_api.h", sdk / "lib" / "ze_loader.lib")
+    if not all(path.is_file() for path in required):
+        with tempfile.TemporaryDirectory(prefix="solarwm-level-zero-") as temporary:
+            archive = Path(temporary) / "sdk.zip"
+            print(f"Downloading Level Zero Windows SDK {LEVEL_ZERO_VERSION}")
+            certificate = os.environ.get("SSL_CERT_FILE") or os.environ.get("NODE_EXTRA_CA_CERTS")
+            context = ssl.create_default_context(cafile=certificate or None)
+            with urllib.request.urlopen(LEVEL_ZERO_URL, context=context, timeout=120) as response:
+                with archive.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            if digest != LEVEL_ZERO_SHA256:
+                fail(f"Level Zero SDK checksum mismatch: {digest}")
+            with zipfile.ZipFile(archive) as contents:
+                for entry in contents.infolist():
+                    target = (sdk / entry.filename).resolve()
+                    if not target.is_relative_to(sdk.resolve()):
+                        fail(f"Unsafe SDK archive entry: {entry.filename}")
+                contents.extractall(sdk)
+        if not all(path.is_file() for path in required):
+            fail("Level Zero SDK extraction did not produce headers and ze_loader.lib")
+
+    from importlib.metadata import distribution
+
+    sycl_files = distribution("intel-sycl-rt").files or ()
+    headers = [path.locate() for path in sycl_files if path.name == "sycl.hpp"]
+    libraries = [path.locate() for path in sycl_files if path.name == "sycl.lib"]
+    if not any(path.is_file() for path in headers) or not any(
+        path.is_file() for path in libraries
+    ):
+        fail(
+            "intel-sycl-rt lacks SYCL development files. Restore the matching wheel, "
+            "or install the matching oneAPI DPC++ component and configure ONEAPI_ROOT."
+        )
+    print(f"SYCL headers: {next(path for path in headers if path.is_file())}")
+    print(f"SYCL import library: {next(path for path in libraries if path.is_file())}")
+    hook = Path(sysconfig.get_path("purelib")) / "solarwm_triton_environment.pth"
+    hook.write_text(
+        "import solarwm.runtime.triton_environment; "
+        "solarwm.runtime.triton_environment.configure()\n",
+        encoding="utf-8",
+    )
+    from solarwm.runtime.triton_environment import configure
+
+    configure()
+    print(f"Installed venv-local Triton environment hook: {hook}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -331,7 +396,11 @@ def configure_interactive_config(model_root: Path) -> None:
         if not isinstance(model, dict) or not isinstance(checkpoint, dict):
             fail(f"SolarWM config model/checkpoint sections must be mappings: {config_path}")
         model["base_path"] = str(model_root / "SolarWM-5B-base")
-        checkpoint["path"] = str(model_root / "SolarWM-5B-sgf-stage2-81f")
+        ema_root = model_root / "SolarWM-5B-sgf-stage2-81f-ema-bf16"
+        checkpoint["path"] = str(
+            ema_root if (ema_root / "COMPLETE.json").is_file()
+            else model_root / "SolarWM-5B-sgf-stage2-81f"
+        )
 
         updated = yaml.safe_dump(config, sort_keys=False, default_flow_style=False)
         if config_path.exists() and config_path.read_text(encoding="utf-8") == updated:
@@ -388,11 +457,19 @@ def main() -> None:
     print(f"Detected device: {device} (torch {torch.__version__})")
 
     install_runtime(device)
+    if device == "xpu":
+        setup_triton_environment()
     if args.build_kernels:
         build_xpu_kernels(device, args.gpu_arch)
     model_root = normalize_path(args.local_dir)
     if not args.skip_weights:
         model_root = download_weights(args.local_dir, args.svdquant_repo)
+        subprocess.run(
+            [sys.executable, str(REPO_ROOT / "scripts" / "prepare_stage2_ema.py"),
+             str(model_root / "SolarWM-5B-sgf-stage2-81f"),
+             str(model_root / "SolarWM-5B-sgf-stage2-81f-ema-bf16")],
+            check=True,
+        )
     configure_interactive_config(model_root)
     if args.comfyui:
         configure_comfyui(normalize_path(args.comfyui), model_root)

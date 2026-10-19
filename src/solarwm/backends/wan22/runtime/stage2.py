@@ -1747,7 +1747,7 @@ def _verified_stage2_inference_checkpoint(
     metadata = verified.metadata
     if (
         metadata.get("schema") != "solarwm.wan22-stage2-inference.v1"
-        or metadata.get("available_weights") != ["live", "ema"]
+        or metadata.get("available_weights") not in (["live", "ema"], ["ema"])
         or metadata.get("ema_present") is not True
     ):
         raise BackendContractError("Stage2 inference checkpoint metadata differs")

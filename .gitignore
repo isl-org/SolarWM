@@ -25,3 +25,8 @@ configs/**/*.local.yaml
 *.tar.gz
 *.part
 .env
+hf_token.txt
+hf_token.ps1
+packages/wan22_svdquant_dense_block/sycl-tla/
+src/solarwm/kernels/qconv_onednn/*.exp
+src/solarwm/kernels/qconv_onednn/*.lib
