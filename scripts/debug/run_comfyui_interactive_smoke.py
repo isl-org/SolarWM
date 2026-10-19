@@ -9,7 +9,14 @@ import queue
 import sys
 
 import os
-os.environ["UR_L0_USE_RELAXED_ALLOCATION_LIMITS"]="1"
+
+# Intel Level-Zero and SYCL relaxed allocation limits (must be set before importing torch / Level Zero driver)
+os.environ.setdefault("NEOReadDebugKeys", "1")
+os.environ.setdefault("ZE_ENABLE_RELAXED_ALLOCATION_LIMITS", "1")
+os.environ.setdefault("UR_L0_USE_RELAXED_ALLOCATION_LIMITS", "1")
+os.environ.setdefault("SYCL_PI_LEVEL_ZERO_RELAXED_ALLOCATION_LIMITS", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+os.environ.setdefault("PYTORCH_XPU_ALLOC_CONF", "max_split_size_mb:128")
 
 import torch
 
@@ -43,6 +50,30 @@ def main() -> None:
     parser.add_argument("--prompt", default="A natural outdoor scene with a steady camera.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-latent-frames", type=int, default=3)
+    parser.add_argument(
+        "--resolution",
+        choices=["360p (320x576)", "480p (480x864)", "360p", "480p"],
+        default="360p (320x576)",
+        help="Resolution to generate (default: 360p (320x576)).",
+    )
+    parser.add_argument(
+        "--linear-quant",
+        choices=["full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4"],
+        default="full_precision",
+        help="Linear layer quantization backend.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=["sdpa", "sageattnv1", "sageattnv2"],
+        default="sdpa",
+        help="Attention implementation backend.",
+    )
+    parser.add_argument(
+        "--stage2-vae-quant",
+        choices=["full_precision", "quarot_w8a8"],
+        default="full_precision",
+        help="Stage2 VAE quantization mode.",
+    )
     args = parser.parse_args()
     if args.max_latent_frames < 1:
         parser.error("--max-latent-frames must be positive")
@@ -56,6 +87,11 @@ def main() -> None:
     manager.set_provider_factory(build_provider_inputs)
     session = None
     frames = 0
+    resolution_str = args.resolution
+    if resolution_str == "360p":
+        resolution_str = "360p (320x576)"
+    elif resolution_str == "480p":
+        resolution_str = "480p (480x864)"
     try:
         session = manager.create({
             "config_path": str(args.config.resolve()),
@@ -63,9 +99,10 @@ def main() -> None:
             "prompt": args.prompt,
             "seed": args.seed,
             "max_latent_frames": args.max_latent_frames,
-            "attention_backend": "sdpa",
-            "linear_quant": "full_precision",
-            "stage2_vae_quant": "full_precision",
+            "resolution": resolution_str,
+            "attention_backend": args.attention_backend,
+            "linear_quant": args.linear_quant,
+            "stage2_vae_quant": args.stage2_vae_quant,
             "camera_motion": "manual_only",
         })
         while True:

@@ -3162,7 +3162,7 @@ class CudaWanStage2GenerationAdapter:
                         width=int(values["data"]["latent_shape"][-1]),
                         device=self.device,
                     )
-                    if self._direct_model
+                    if self._direct_model and not values.get("inference", {}).get("interactive")
                     else None
                 )
                 self._loaded_role: str | None = None

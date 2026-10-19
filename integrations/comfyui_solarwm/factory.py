@@ -276,6 +276,11 @@ def build_provider_inputs(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         first_latent = provider.vae.encode(
             pixels[:, :1].permute(0, 2, 1, 3, 4).contiguous()
         ).to(torch.bfloat16)
+        del pixels
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
         prompt = str(payload.get("prompt", ""))
         if str(payload.get("camera_motion", "")) == "dataset_trajectory":
             dataset_metadata = load_dataset_camera_metadata(str(image_val))
