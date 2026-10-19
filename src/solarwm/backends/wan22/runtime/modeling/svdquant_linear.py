@@ -66,12 +66,32 @@ def get_sycl_svdquant_kernel() -> Any:
                 break
         if pkg_dir is not None and str(pkg_dir) not in sys.path:
             sys.path.insert(0, str(pkg_dir))
+
+        # 1. Try prebuilt extension first
         try:
             _SYCL_KERNEL = importlib.import_module("svdquant_dense_kernel_grf128_n_tile64")
-        except Exception as exc:
-            import warnings
-            warnings.warn(f"Failed to load compiled SYCL SVDQuant kernel: {exc}", stacklevel=2)
+        except Exception:
             _SYCL_KERNEL = None
+
+        # 2. If prebuilt not found, lazily compile with shared sycl_jit
+        if _SYCL_KERNEL is None and pkg_dir is not None:
+            kernel_src = pkg_dir / "kernel.sycl"
+            if kernel_src.is_file():
+                try:
+                    from solarwm.kernels.sycl_jit import load_sycl_extension
+
+                    _SYCL_KERNEL = load_sycl_extension(
+                        extension_name="svdquant_dense_kernel_grf128_n_tile64",
+                        sources=[kernel_src],
+                        extra_cflags=["-DKF_GRF=128", "-DKF_N_TILE=64", f"-I{pkg_dir}"],
+                        gpu_arch="bmg-g31",
+                        include_sycl_tla=True,
+                    )
+                except Exception as exc:
+                    import warnings
+
+                    warnings.warn(f"Failed to JIT-compile SYCL SVDQuant kernel: {exc}", stacklevel=2)
+                    _SYCL_KERNEL = None
     return _SYCL_KERNEL
 
 

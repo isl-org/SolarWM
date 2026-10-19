@@ -167,6 +167,7 @@ def measure_pipeline(
         "linear_quant": linear_quant,
         "attn_backend": attn_backend,
         "radial": radial,
+        "chunk_dit_total_ms": chunk_total_times,
         "chunk4_steps_ms": chunk_step_times.get(4, {}),
         "chunk4_dit_total_ms": chunk_total_times.get(4, 0.0),
         "chunk4_bf16_vae_ms": bf16_vae_chunk_ms,
@@ -183,27 +184,42 @@ def measure_pipeline(
 
 
 if __name__ == "__main__":
-    configs = [
-        ("full_precision", "sdpa"),
-        ("svdquant_k4", "sdpa"),
-        ("svdquant_k4", "sageattnv1"),
-        ("svdquant_k1", "sdpa"),
-    ]
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attn-backends", nargs="+", default=None, help="List of attention backends to evaluate with svdquant_k4 (e.g. sdpa sageattnv1 sageattnv2)")
+    parser.add_argument("--output-json", default="outputs/svdquant_eval/eval_153f/chunk4_timing.json")
+    args = parser.parse_args()
+
+    if args.attn_backends:
+        configs = [("svdquant_k4", ab) for ab in args.attn_backends]
+    else:
+        configs = [
+            ("full_precision", "sdpa"),
+            ("svdquant_k4", "sdpa"),
+            ("svdquant_k4", "sageattnv1"),
+            ("svdquant_k4", "sageattnv2"),
+            ("svdquant_k1", "sdpa"),
+        ]
     results = []
     for lq, ab in configs:
-        print(f"\nEvaluating Chunk 4: Linear={lq}, Attn={ab}...")
+        print(f"\nEvaluating Linear={lq}, Attn={ab}...")
         res = measure_pipeline(linear_quant=lq, attn_backend=ab)
         results.append(res)
         c4_steps = res["chunk4_steps_ms"]
-        print(f"  Step 0: {c4_steps.get(0, 0):.2f} ms")
-        print(f"  Step 1: {c4_steps.get(1, 0):.2f} ms")
-        print(f"  Step 2: {c4_steps.get(2, 0):.2f} ms")
-        print(f"  Step 3: {c4_steps.get(3, 0):.2f} ms")
-        print(f"  Commit: {c4_steps.get('commit', 0):.2f} ms")
+        print(f"  Chunk 4 Step 0: {c4_steps.get(0, 0):.2f} ms")
+        print(f"  Chunk 4 Step 1: {c4_steps.get(1, 0):.2f} ms")
+        print(f"  Chunk 4 Step 2: {c4_steps.get(2, 0):.2f} ms")
+        print(f"  Chunk 4 Step 3: {c4_steps.get(3, 0):.2f} ms")
+        print(f"  Chunk 4 Commit: {c4_steps.get('commit', 0):.2f} ms")
         print(f"  Total DiT Chunk 4: {res['chunk4_dit_total_ms']:.2f} ms")
+        total_6chunks = sum(res["chunk_dit_total_ms"].values())
+        print(f"  Chunk 0-5 DiT times: {', '.join(f'c{c}: {t:.1f}ms' for c, t in sorted(res['chunk_dit_total_ms'].items()))}")
+        print(f"  Total 6-chunk DiT time: {total_6chunks:.2f} ms")
         print(f"  Standard BF16 VAE Chunk 4: {res['chunk4_bf16_vae_ms']:.2f} ms")
         print(f"  QuaRot W8A8 VAE Chunk 4:   {res['chunk4_quarot_vae_ms']:.2f} ms (Speedup: {res['chunk4_bf16_vae_ms'] / res['chunk4_quarot_vae_ms']:.2f}x)")
 
-    with open("outputs/svdquant_eval/eval_153f/chunk4_timing.json", "w") as f:
+    out_path = Path(args.output_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
-    print("\nSaved Chunk 4 timing to outputs/svdquant_eval/eval_153f/chunk4_timing.json")
+    print(f"\nSaved timing to {out_path}")

@@ -102,6 +102,7 @@ def _require(condition: bool, message: str) -> None:
 STAGE2_ATTENTION_KERNELS = {
     "sdpa": "fused_rope_prope_sdpa",
     "sageattnv1": "fused_rope_prope_sage",
+    "sageattnv2": "fused_rope_prope_sagev2",
 }
 STAGE2_LINEAR_QUANTS = ("full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4")
 STAGE2_VAE_QUANTS = ("full_precision", "quarot_w8a8")

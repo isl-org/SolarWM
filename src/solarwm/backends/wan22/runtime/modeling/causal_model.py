@@ -64,7 +64,17 @@ except ImportError:
     k_window_mean = None
     build_sage_block_indices = None
 
-FUSED_ATTENTION_KERNELS = (None, "fused_rope_prope_sdpa", "fused_rope_prope_sage")
+try:
+    from solarwm.kernels.fused_rope_prope_sage import sageattn_v2
+except ImportError:
+    sageattn_v2 = None
+
+FUSED_ATTENTION_KERNELS = (
+    None,
+    "fused_rope_prope_sdpa",
+    "fused_rope_prope_sage",
+    "fused_rope_prope_sagev2",
+)
 
 # Lazily-imported FlexAttention symbols. Some torch builds don't ship
 # torch.nn.attention.flex_attention; we only require it when stage1 TF mode
@@ -724,6 +734,8 @@ class CausalWanSelfAttention(nn.Module):
         self.use_echorope = bool(use_echorope)
         if fused_kernel not in FUSED_ATTENTION_KERNELS:
             raise ValueError(f"fused_kernel must be one of {FUSED_ATTENTION_KERNELS}; got {fused_kernel!r}")
+        if fused_kernel == "fused_rope_prope_sagev2" and radial_attention:
+            raise ValueError("radial_attention is not supported with fused_rope_prope_sagev2")
         self.fused_kernel = fused_kernel
         self.rope_dtype = rope_dtype
         self.radial_attention = bool(radial_attention)
@@ -758,8 +770,8 @@ class CausalWanSelfAttention(nn.Module):
             return False
         if q.device.type == "xpu" and rope_prope_transform is not None:
             return True
-        if self.fused_kernel == "fused_rope_prope_sage":
-            raise RuntimeError("fused_rope_prope_sage requires an XPU device with Triton")
+        if self.fused_kernel in ("fused_rope_prope_sage", "fused_rope_prope_sagev2"):
+            raise RuntimeError(f"{self.fused_kernel} requires an XPU device")
         return False
 
     def _radial_kwargs(
@@ -1318,6 +1330,7 @@ class CausalWanSelfAttention(nn.Module):
                 )
 
                 is_sage = self.fused_kernel == "fused_rope_prope_sage"
+                is_sagev2 = self.fused_kernel == "fused_rope_prope_sagev2"
 
                 history_key = (global_end_index, new_ring_start, num_hist_tokens)
                 if num_hist_tokens > 0 and kv_cache.get("_encoded_history_key") != history_key:
@@ -1329,7 +1342,7 @@ class CausalWanSelfAttention(nn.Module):
                     else:
                         hist_cam_viewmats = hist_cam_K = None
 
-                    hist_prope_key = ("fused_hist_prope", is_sage, history_key)
+                    hist_prope_key = ("fused_hist_prope", is_sage, is_sagev2, history_key)
                     cached_hist_prope = prope_cache.get(hist_prope_key) if prope_cache is not None else None
                     if cached_hist_prope is None:
                         fr = _freqs_real(freqs, self.rope_dtype)
@@ -1392,10 +1405,37 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k_encoded"][:, :num_hist_tokens].copy_(k_hist_enc)
                     kv_cache["v_encoded"][:, :num_hist_tokens].copy_(v_hist_enc)
                     kv_cache["_encoded_history_key"] = history_key
-                    if is_sage and k_window_mean is not None:
-                        kv_cache["_sage_km"] = k_window_mean(k_hist_enc.transpose(1, 2))
+                    if is_sagev2 and sageattn_v2 is not None:
+                        k_hist_v2 = k_hist_enc if k_hist_enc.dim() == 4 else k_hist_enc.unsqueeze(0)
+                        km_v2 = sageattn_v2.k_centre(k_hist_v2)
+                        kv_cache["_sagev2_km"] = km_v2
+                        aligned_hist_tokens = (num_hist_tokens // 64) * 64
+                        if aligned_hist_tokens > 0:
+                            aligned_tiles = aligned_hist_tokens // 16
+                            k_hist_aligned = k_hist_v2[:, :aligned_hist_tokens].contiguous()
+                            k4_hist, ks_hist = sageattn_v2.pack_k(k_hist_aligned, km_v2)
+                            kv_cache["_sagev2_hist_k4"] = k4_hist[:, :, :aligned_tiles]
+                            kv_cache["_sagev2_hist_k_scale"] = ks_hist[:, :, :aligned_hist_tokens]
+                        else:
+                            kv_cache.pop("_sagev2_hist_k4", None)
+                            kv_cache.pop("_sagev2_hist_k_scale", None)
+                    elif is_sage:
+                        if k_window_mean is not None:
+                            km = k_window_mean(k_hist_enc.transpose(1, 2))
+                            kv_cache["_sage_km"] = km
+                        else:
+                            km = None
+                        aligned_hist_tokens = (num_hist_tokens // 32) * 32
+                        if aligned_hist_tokens > 0 and quantise_k is not None:
+                            k_hist_aligned = k_hist_enc.transpose(1, 2)[:, :, :aligned_hist_tokens].contiguous()
+                            hist_k_int8, hist_k_scale = quantise_k(k_hist_aligned, km=km)
+                            kv_cache["_sage_hist_k_int8"] = hist_k_int8
+                            kv_cache["_sage_hist_k_scale"] = hist_k_scale
+                        else:
+                            kv_cache.pop("_sage_hist_k_int8", None)
+                            kv_cache.pop("_sage_hist_k_scale", None)
 
-                new_prope_key = ("fused_new_prope", is_sage, num_hist_frames, num_new_frames)
+                new_prope_key = ("fused_new_prope", is_sage, is_sagev2, num_hist_frames, num_new_frames)
                 cached_new_prope = prope_cache.get(new_prope_key) if prope_cache is not None else None
                 if cached_new_prope is None:
                     fr = _freqs_real(freqs, self.rope_dtype)
@@ -1468,9 +1508,36 @@ class CausalWanSelfAttention(nn.Module):
                 rc = radial_kwargs.get("radial_config") if radial_kwargs else None
                 radial_enabled = rc is not None and getattr(rc, "enabled", False)
 
-                if is_sage:
+                if is_sagev2:
+                    if sageattn_v2 is None:
+                        raise RuntimeError("sageattn_v2 extension is not available")
+                    # Layout: [B, H, L, D] -> [B, L, H, D] contiguous
+                    q_v2 = q_eff.transpose(1, 2).contiguous()
+                    k_v2 = attn_k.transpose(1, 2).contiguous()
+                    v_v2 = attn_v.transpose(1, 2).contiguous()
+                    if "_sagev2_hist_k4" in kv_cache:
+                        km_v2 = kv_cache["_sagev2_km"]
+                        aligned_tokens = (num_hist_tokens // 64) * 64
+                        k_tail = k_v2[:, aligned_tokens:].contiguous()
+                        k4_tail, ks_tail = sageattn_v2.pack_k(k_tail, km_v2)
+                        k4 = torch.cat([kv_cache["_sagev2_hist_k4"], k4_tail], dim=2)
+                        k_scale = torch.cat([kv_cache["_sagev2_hist_k_scale"], ks_tail], dim=2)
+                        q4, q_scale, q_mean = sageattn_v2.quantize_q(q_v2)
+                        delta_s = sageattn_v2.compute_delta_s(k_v2, km_v2, q_mean)
+                        o_v2 = sageattn_v2.attention(q4, q_scale, q_mean, k4, k_scale, delta_s, v_v2, q_v2.size(1))
+                    else:
+                        o_v2 = sageattn_v2.forward(q_v2, k_v2, v_v2)
+                    o = o_v2.transpose(1, 2).contiguous()
+                elif is_sage:
                     km = kv_cache.get("_sage_km")
-                    k_int8, k_scale = quantise_k(attn_k, km=km)
+                    if "_sage_hist_k_int8" in kv_cache:
+                        aligned_tokens = (num_hist_tokens // 32) * 32
+                        k_tail = attn_k[:, :, aligned_tokens:].contiguous()
+                        tail_int8, tail_scale = quantise_k(k_tail, km=km)
+                        k_int8 = torch.cat([kv_cache["_sage_hist_k_int8"], tail_int8], dim=2)
+                        k_scale = torch.cat([kv_cache["_sage_hist_k_scale"], tail_scale], dim=2)
+                    else:
+                        k_int8, k_scale = quantise_k(attn_k, km=km)
                     if radial_enabled:
                         tokens_per_frame = radial_kwargs.get("radial_tokens_per_frame") or frame_seqlen
                         q_start = radial_kwargs.get("radial_query_start_frame", 0)

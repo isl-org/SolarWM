@@ -2,6 +2,8 @@
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
 #include <cute/tensor.hpp>
+#include <cute/util/xe_split_barrier.hpp>
+using namespace cute;
 #include <flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp>
 #include <flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -353,6 +355,114 @@ void launch_quantize_k(sycl::queue &queue, const Element *k, const float *k_mean
         });
   });
 }
+
+template <typename Element, int HeadDim>
+void launch_pack_k(sycl::queue &queue, const Element *k, const float *k_mean,
+                   uint32_t *k4, float *k_scale,
+                   int batch, int kv_len, int heads, int kv_pad) {
+  constexpr int CH = HeadDim / 16, G = HeadDim / 64, SGS = 8;
+  const int blocks = (kv_pad / 16 + SGS - 1) / SGS;
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for(
+        sycl::nd_range<3>({size_t(batch) * heads, size_t(blocks), size_t(SGS * 16)},
+                          {1, 1, SGS * 16}),
+        syclex::properties{syclex::sub_group_size<16>, intelex::grf_size<256>},
+        [=](sycl::nd_item<3> it) {
+          const int bh = it.get_group(0), b = bh / heads, hd = bh % heads;
+          const int lid = it.get_local_id(2), sg_id = lid / 16, lane = lid % 16;
+          const auto sg = it.get_sub_group();
+          const int tile = sycl::min(int(it.get_group(1)) * SGS + sg_id, kv_pad / 16 - 1);
+          const int row0 = tile * 16;
+          float mean[CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) mean[c] = k_mean[int64_t(bh) * HeadDim + CH * lane + c];
+          float x[16][CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++) {
+            const bool valid = row0 + r < kv_len;
+            const auto p = *reinterpret_cast<const Pack<Element, CH> *>(
+                k + ((int64_t(b) * kv_len + sycl::min(row0 + r, kv_len - 1)) * heads + hd) * HeadDim +
+                CH * lane);
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) x[r][c] = valid ? static_cast<float>(p.v[c]) - mean[c] : 0.0f;
+          }
+          if ((int(it.get_group(1)) * SGS + sg_id) * 16 >= kv_pad) return;
+          uint32_t w[16];
+          const float amax = quantize_rows16(sg, x, w);
+          k_scale[int64_t(bh) * kv_pad + row0 + lane] = amax / 7.0f;
+          uint32_t *dst = k4 + (int64_t(bh) * (kv_pad / 16) + tile) * (G * 128);
+          if constexpr (CH == 8) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r += 4)
+              *reinterpret_cast<sycl::vec<uint32_t, 4> *>(dst + lane * 16 + r) =
+                  sycl::vec<uint32_t, 4>(w[r], w[r + 1], w[r + 2], w[r + 3]);
+          } else {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r++) {
+              const uint32_t pair = w[r] | (sycl::shift_group_left(sg, w[r], 1) << 16);
+              if (lane % 2 == 0) dst[(lane / 2) * 16 + r] = pair;
+            }
+          }
+        });
+  });
+}
+
+template <typename Element, int HeadDim>
+void launch_compute_delta_s(sycl::queue &queue, const Element *k, const float *k_mean,
+                            const float *q_mean, float *delta_s,
+                            int batch, int kv_len, int heads, int kv_pad, int q_blocks,
+                            float scale_log2) {
+  constexpr int CH = HeadDim / 16, SGS = 8;
+  const int blocks = (kv_pad / 16 + SGS - 1) / SGS;
+  queue.submit([&](sycl::handler &h) {
+    sycl::local_accessor<float, 1> qm_slm(sycl::range<1>(q_blocks * HeadDim), h);
+    h.parallel_for(
+        sycl::nd_range<3>({size_t(batch) * heads, size_t(blocks), size_t(SGS * 16)},
+                          {1, 1, SGS * 16}),
+        syclex::properties{syclex::sub_group_size<16>, intelex::grf_size<256>},
+        [=](sycl::nd_item<3> it) {
+          const int bh = it.get_group(0), b = bh / heads, hd = bh % heads;
+          const int lid = it.get_local_id(2), sg_id = lid / 16, lane = lid % 16;
+          const auto sg = it.get_sub_group();
+          const int tile = sycl::min(int(it.get_group(1)) * SGS + sg_id, kv_pad / 16 - 1);
+          const int row0 = tile * 16;
+          float mean[CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) mean[c] = k_mean[int64_t(bh) * HeadDim + CH * lane + c];
+          float x[16][CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++) {
+            const bool valid = row0 + r < kv_len;
+            const auto p = *reinterpret_cast<const Pack<Element, CH> *>(
+                k + ((int64_t(b) * kv_len + sycl::min(row0 + r, kv_len - 1)) * heads + hd) * HeadDim +
+                CH * lane);
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) x[r][c] = valid ? static_cast<float>(p.v[c]) - mean[c] : 0.0f;
+          }
+          for (int i = lid; i < q_blocks * HeadDim; i += SGS * 16)
+            qm_slm[i] = q_mean[int64_t(bh) * q_blocks * HeadDim + i];
+          sycl::group_barrier(it.get_group());
+          if ((int(it.get_group(1)) * SGS + sg_id) * 16 >= kv_pad) return;
+
+          const bool lane_valid = row0 + lane < kv_len;
+          for (int qb = 0; qb < q_blocks; qb++) {
+            float part[16];
+            float qm[CH];
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) qm[c] = qm_slm[qb * HeadDim + CH * lane + c];
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r++) {
+              part[r] = 0.0f;
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < CH; c++) part[r] = sycl::fma(qm[c], x[r][c], part[r]);
+            }
+            const float ds = transpose_reduce16(sg, part, sycl::plus<float>{});
+            delta_s[(int64_t(bh) * q_blocks + qb) * kv_pad + row0 + lane] =
+                lane_valid ? ds * scale_log2 : -INFINITY;
+          }
+        });
+  });
+}
 // The CUTLASS XeDefault FMHA mainloop with GEMM 1 on INT4 DPAS. TiledMMAQK is
 // only used for the layout of the S fragment; P*V and the epilogue are the
 // CUTLASS FP16 / BF16 ones.
@@ -375,6 +485,7 @@ struct Mainloop {
   static constexpr int SGPerWG = Cfg::SGs::value;
   static constexpr int G = HeadDim / 64;   // INT4 DPAS steps per head
   static constexpr int NB = KTile / 16;    // 16-key DPAS column blocks per KV tile
+  static constexpr bool PerTensorScale = false;
   using TensorV2D = decltype(make_tensor(make_gmem_ptr(static_cast<Element *>(nullptr)),
                                          make_layout(make_shape(0, 0), make_stride(_1{}, 0))));
   using TensorO2D = decltype(make_tensor(make_gmem_ptr(static_cast<Element *>(nullptr)),
@@ -601,7 +712,7 @@ struct AttentionKernel {
              (kv_len + ML::KTile - 1) / ML::KTile, thr_id);
     typename Epilogue::SharedStorage shared{};
     Epilogue epilogue{typename Epilogue::Params{}, shared};
-    epilogue(O, tArA, tA_max, tA_sum, make_coord(blk_q, 0), thr_id);
+    epilogue.template operator()<true>(O, tArA, tA_max, tA_sum, make_coord(blk_q, 0), thr_id, hd, b);
   }
 };
 
@@ -656,6 +767,36 @@ std::vector<torch::Tensor> quantize_k(torch::Tensor k, torch::Tensor k_mean, tor
                                       out[1].data_ptr<float>(), out[2].data_ptr<float>(), batch,
                                       kv_len, heads, kv_pad, q_blocks, softmax_scale_log2<HeadDim>());
   return out;
+}
+template <typename Element, int HeadDim>
+std::vector<torch::Tensor> pack_k(torch::Tensor k, torch::Tensor k_mean) {
+  constexpr int G = HeadDim / 64;
+  const int batch = k.size(0), kv_len = k.size(1), heads = k.size(2);
+  const int kv_pad = round_up(kv_len, kKvAlign);
+  auto f32 = k.options().dtype(torch::kFloat32);
+  std::vector<torch::Tensor> out{
+      torch::empty({batch, heads, kv_pad / 16, G, 8, 16}, k.options().dtype(torch::kInt32)),
+      torch::empty({batch, heads, kv_pad}, f32)};
+  launch_pack_k<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                  reinterpret_cast<const Element *>(k.data_ptr()),
+                                  k_mean.data_ptr<float>(),
+                                  reinterpret_cast<uint32_t *>(out[0].data_ptr()),
+                                  out[1].data_ptr<float>(), batch,
+                                  kv_len, heads, kv_pad);
+  return out;
+}
+template <typename Element, int HeadDim>
+torch::Tensor compute_delta_s(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
+  const int batch = k.size(0), kv_len = k.size(1), heads = k.size(2), q_blocks = q_mean.size(2);
+  const int kv_pad = round_up(kv_len, kKvAlign);
+  auto f32 = k.options().dtype(torch::kFloat32);
+  auto delta_s = torch::empty({batch, heads, q_blocks, kv_pad}, f32);
+  launch_compute_delta_s<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                          reinterpret_cast<const Element *>(k.data_ptr()),
+                                          k_mean.data_ptr<float>(), q_mean.data_ptr<float>(),
+                                          delta_s.data_ptr<float>(), batch,
+                                          kv_len, heads, kv_pad, q_blocks, softmax_scale_log2<HeadDim>());
+  return delta_s;
 }
 template <typename Element, int HeadDim>
 Quantized quantize(torch::Tensor q, torch::Tensor k) {
@@ -720,9 +861,72 @@ torch::Tensor forward_entry(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
     return sage::attention<E, D>(sage::quantize<E, D>(q, k), v, static_cast<int>(q.size(1)));
   });
 }
+std::vector<torch::Tensor> quantize_q_entry(torch::Tensor q) {
+  TORCH_CHECK(q.is_xpu() && q.is_contiguous() && q.dim() == 4, "q must be contiguous [B,S,H,D] on XPU");
+  return sage::dispatch(q.scalar_type(), q.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::quantize_q<E, D>(q);
+  });
+}
+
+torch::Tensor k_centre_entry(torch::Tensor k) {
+  TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
+  return sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::k_centre<E, D>(k);
+  });
+}
+
+std::vector<torch::Tensor> quantize_k_entry(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
+  TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
+  return sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::quantize_k<E, D>(k, k_mean, q_mean);
+  });
+}
+
+std::vector<torch::Tensor> pack_k_entry(torch::Tensor k, torch::Tensor k_mean) {
+  TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
+  return sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::pack_k<E, D>(k, k_mean);
+  });
+}
+
+torch::Tensor compute_delta_s_entry(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
+  TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
+  return sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::compute_delta_s<E, D>(k, k_mean, q_mean);
+  });
+}
+
+torch::Tensor attention_entry(
+    torch::Tensor q4, torch::Tensor q_scale, torch::Tensor q_mean,
+    torch::Tensor k4, torch::Tensor k_scale, torch::Tensor delta_s,
+    torch::Tensor v, int64_t q_len
+) {
+  sage::Quantized qd{q4, q_scale, q_mean, k4, k_scale, delta_s};
+  return sage::dispatch(v.scalar_type(), v.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::attention<E, D>(qd, v, static_cast<int>(q_len));
+  });
+}
 }  // namespace
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("forward", &forward_entry,
              "Fused attention with smoothed INT4 Q*K^T (quantize + attention)");
+  module.def("quantize_q", &quantize_q_entry, "Quantize Q to INT4 and compute q_scale, q_mean");
+  module.def("k_centre", &k_centre_entry, "Compute K centre [B, H, D]");
+  module.def("quantize_k", &quantize_k_entry, "Quantize K to INT4, k_scale, and compute delta_s");
+  module.def("pack_k", &pack_k_entry, "Quantize K to INT4 DPAS-B layout and compute k_scale");
+  module.def("compute_delta_s", &compute_delta_s_entry, "Compute delta_s from k, k_mean, and q_mean");
+  module.def("attention", &attention_entry, "Execute INT4 DPAS attention core given quantized inputs and BF16 V");
 }
 // [EVOLVE_END]

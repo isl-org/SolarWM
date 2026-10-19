@@ -227,11 +227,25 @@ def build_qconv_kernel() -> None:
         print(f"Warning: oneDNN qconv kernel check failed; using fallback: {exc}")
 
 
+def build_sageattn_v2_kernel(gpu_arch: str) -> None:
+    print(f"Building or verifying SageAttention v2 SYCL kernel for {gpu_arch}")
+    try:
+        from solarwm.kernels.fused_rope_prope_sage.sageattn_v2 import ensure_sageattn_v2
+
+        if ensure_sageattn_v2(gpu_arch=gpu_arch):
+            print("SageAttention v2 SYCL kernel is ready")
+        else:
+            print("Warning: SageAttention v2 SYCL kernel build failed")
+    except Exception as exc:
+        print(f"Warning: SageAttention v2 SYCL kernel check failed: {exc}")
+
+
 def build_xpu_kernels(device: str, gpu_arch: str) -> None:
     if device != "xpu":
         print(f"Skipping Intel XPU kernel builds for detected device: {device}")
         return
     build_svdquant_kernel(gpu_arch)
+    build_sageattn_v2_kernel(gpu_arch)
     build_qconv_kernel()
 
 

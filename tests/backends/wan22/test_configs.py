@@ -98,7 +98,7 @@ def test_stage2_camera_inference_requires_chunk_aligned_buffer_capacity(maximum:
         create_backend(family="wan22_ti2v_5b").validate_config(config)
 
 
-@pytest.mark.parametrize("backend", ("sdpa", "sageattnv1"))
+@pytest.mark.parametrize("backend", ("sdpa", "sageattnv1", "sageattnv2"))
 @pytest.mark.parametrize("linear_quant", ("full_precision", "svdquant_k1", "svdquant_k2", "svdquant_k4"))
 def test_stage2_attention_backend_and_linear_quant_are_independent(
     backend: str, linear_quant: str
@@ -113,7 +113,7 @@ def test_stage2_attention_backend_and_linear_quant_are_independent(
 @pytest.mark.parametrize(
     ("section", "key", "value", "match"),
     (
-        ("model", "attention_backend", "sageattnv2", "model.attention_backend"),
+        ("model", "attention_backend", "sageattnv3", "model.attention_backend"),
         ("model", "linear_quant", "bf16", "model.linear_quant"),
         ("runtime", "stage2_vae_quant", "int8", "runtime.stage2_vae_quant"),
         ("runtime", "stage2_fused_kernel", "fused_rope_prope_sdpa", "use model.attention_backend"),

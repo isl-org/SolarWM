@@ -3274,7 +3274,12 @@ class CudaWanStage2GenerationAdapter:
                     if ckpt_root is not None
                     else Path(self.checkpoint_path).parent / "svdquant_int4"
                 )
-                svdquant_dir = ckpt_root / f"{stage2_attention_backend(self.config)}_{k_tag}"
+                backend_tag = stage2_attention_backend(self.config)
+                svdquant_dir = ckpt_root / f"{backend_tag}_{k_tag}"
+                if not svdquant_dir.exists() and backend_tag == "sageattnv2":
+                    fallback_dir = ckpt_root / f"sdpa_{k_tag}"
+                    if fallback_dir.exists():
+                        svdquant_dir = fallback_dir
                 if not svdquant_dir.exists():
                     raise BackendContractError(f"SVDQuant checkpoint dir does not exist: {svdquant_dir}")
 

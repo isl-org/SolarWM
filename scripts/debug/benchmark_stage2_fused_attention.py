@@ -273,6 +273,7 @@ def run_benchmark(
         ("fused_rope_prope_sdpa (radial)", "fused_rope_prope_sdpa", True),
         ("fused_rope_prope_sage (dense)", "fused_rope_prope_sage", False),
         ("fused_rope_prope_sage (radial)", "fused_rope_prope_sage", True),
+        ("fused_rope_prope_sagev2 (dense)", "fused_rope_prope_sagev2", False),
     ]
 
     chunk4_results = {}
@@ -440,16 +441,18 @@ def run_benchmark(
         chunk4_results[label]["chunk_speedup"] = base_chunk / chunk4_results[label]["mean_chunk_total_ms"]
         chunk4_results[label]["chunk_savings_ms"] = base_chunk - chunk4_results[label]["mean_chunk_total_ms"]
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 105)
     print(" SUMMARY: Chunk 4 Steady-State Runtime & Speedups")
-    print("=" * 80)
-    print(f"{'Variant':<24} | {'Denoise Fwd':>12} | {'Commit Fwd':>12} | {'Chunk 4 Total':>14} | {'Speedup':>9}")
-    print("-" * 80)
+    print("=" * 105)
+    print(f"{'Variant':<32} | {'Denoise Fwd':>12} | {'Cold Step 0':>12} | {'Cached Step 1+':>14} | {'Chunk 4 Total':>14} | {'Speedup':>9}")
+    print("-" * 105)
     for label in chunk4_results:
         res = chunk4_results[label]
         sp = res.get("chunk_speedup", 1.0)
-        print(f"{label:<24} | {res['mean_denoise_fwd_ms']:9.2f} ms | {res['mean_commit_fwd_ms']:9.2f} ms | {res['mean_chunk_total_ms']:11.2f} ms | {sp:7.2f}x")
-    print("=" * 80)
+        step0 = res['avg_denoise_per_step_ms'][0] if res['avg_denoise_per_step_ms'] else 0.0
+        step1_plus = (sum(res['avg_denoise_per_step_ms'][1:]) / len(res['avg_denoise_per_step_ms'][1:])) if len(res['avg_denoise_per_step_ms']) > 1 else step0
+        print(f"{label:<32} | {res['mean_denoise_fwd_ms']:9.2f} ms | {step0:9.2f} ms | {step1_plus:11.2f} ms | {res['mean_chunk_total_ms']:11.2f} ms | {sp:7.2f}x")
+    print("=" * 105)
 
     return chunk4_results
 

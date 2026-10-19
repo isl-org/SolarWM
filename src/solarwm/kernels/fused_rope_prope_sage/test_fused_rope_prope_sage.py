@@ -37,8 +37,13 @@ if PARENT not in sys.path:
 
 from fused_rope_prope_sage import fused_sdpa as fk
 from fused_rope_prope_sage import fused_sage
+from fused_rope_prope_sage import sageattn_v2
 from fused_rope_prope_sage.fused_sdpa import fused_rope_prope_sdpa_split
-from fused_rope_prope_sage.fused_sage import fused_rope_prope_sage, hadamard4
+from fused_rope_prope_sage.fused_sage import (
+    fused_rope_prope_sage,
+    fused_rope_prope_sagev2,
+    hadamard4,
+)
 from fused_rope_prope_sage.unfused_kernel import (
     apply_prope,
     apply_rope,
@@ -188,31 +193,82 @@ SAGE_MIN_COSINE = 0.9995      # direction, which RMS alone does not pin
 SAGE_MAX_GAIN = 0.005         # error proportional to the signal
 SAGE_MAX_CHANNEL_BIAS = 0.001  # error surviving an average over tokens and heads
 
+# Calibrated ULP thresholds
+SAGE_V1_MEDIAN_ULP = 5.0
+SAGE_V1_P90_ULP = 25.0
+
+SAGE_V2_MEDIAN_ULP = 50.0
+SAGE_V2_P90_ULP = 350.0
+SAGE_V2_MIN_COSINE = 0.97
+
+
+def ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Element-wise ULP distance between two float16 or bfloat16 tensors.
+
+    Interprets floating point bit patterns as signed integers with sign-magnitude
+    ordering, yielding the exact number of representable floating-point steps
+    between a and b.
+    """
+    assert a.shape == b.shape and a.dtype == b.dtype
+    assert a.dtype in (torch.float16, torch.bfloat16)
+    ai = a.view(torch.int16)
+    bi = b.view(torch.int16)
+
+    def to_ordered(v):
+        sign = (v >> 15) & 1
+        mag = (v & 0x7FFF).to(torch.int32)
+        return torch.where(sign == 1, -mag, mag)
+
+    return (to_ordered(ai) - to_ordered(bi)).abs()
+
 
 def assert_sage_gates(sage, reference):
-    sage, reference = sage.double(), reference.double()
-    delta = sage - reference
-    signal = reference.pow(2).mean().sqrt()
+    assert not torch.isnan(sage).any(), "NaN in sage output"
+    assert not torch.isinf(sage).any(), "Inf in sage output"
+    u = ulp_distance(sage, reference).float()
+    med_ulp = u.median().item()
+    p90_ulp = u.quantile(0.90).item()
+    assert med_ulp <= SAGE_V1_MEDIAN_ULP, f"v1 median ULP {med_ulp:.1f} > {SAGE_V1_MEDIAN_ULP}"
+    assert p90_ulp <= SAGE_V1_P90_ULP, f"v1 p90 ULP {p90_ulp:.1f} > {SAGE_V1_P90_ULP}"
+
+    sage_d, reference_d = sage.double(), reference.double()
+    delta = sage_d - reference_d
+    signal = reference_d.pow(2).mean().sqrt()
 
     rms = (delta.pow(2).mean().sqrt() / signal).item()
     assert rms < SAGE_MAX_RMS, f"RMS delta {rms * 100:.2f}% of output RMS"
 
     per_head = (delta.pow(2).mean(dim=(0, 1, 3)).sqrt()
-                / reference.pow(2).mean(dim=(0, 1, 3)).sqrt())
+                / reference_d.pow(2).mean(dim=(0, 1, 3)).sqrt())
     assert per_head.max() < SAGE_MAX_HEAD_RMS, (
         f"worst head {per_head.max().item() * 100:.2f}% "
         f"(median {per_head.median().item() * 100:.2f}%)")
 
     cos = torch.nn.functional.cosine_similarity(
-        sage.reshape(-1, sage.shape[-1]),
-        reference.reshape(-1, reference.shape[-1]), dim=-1).mean()
+        sage_d.reshape(-1, sage_d.shape[-1]),
+        reference_d.reshape(-1, reference_d.shape[-1]), dim=-1).mean()
     assert cos > SAGE_MIN_COSINE, f"mean cosine similarity {cos.item():.6f}"
 
-    gain = (delta * reference).sum() / reference.pow(2).sum()
+    gain = (delta * reference_d).sum() / reference_d.pow(2).sum()
     assert gain.abs() < SAGE_MAX_GAIN, f"systematic gain {gain.item() * 100:+.3f}%"
 
     bias = delta.mean(dim=(0, 1, 2)).pow(2).mean().sqrt() / signal
     assert bias < SAGE_MAX_CHANNEL_BIAS, f"per-channel bias {bias.item() * 100:.4f}%"
+
+
+def assert_sagev2_gates(sagev2, reference):
+    assert not torch.isnan(sagev2).any(), "NaN in sagev2 output"
+    assert not torch.isinf(sagev2).any(), "Inf in sagev2 output"
+    u = ulp_distance(sagev2, reference).float()
+    med_ulp = u.median().item()
+    p90_ulp = u.quantile(0.90).item()
+    assert med_ulp <= SAGE_V2_MEDIAN_ULP, f"v2 median ULP {med_ulp:.1f} > {SAGE_V2_MEDIAN_ULP}"
+    assert p90_ulp <= SAGE_V2_P90_ULP, f"v2 p90 ULP {p90_ulp:.1f} > {SAGE_V2_P90_ULP}"
+
+    cos = torch.nn.functional.cosine_similarity(
+        sagev2.float().reshape(-1, sagev2.shape[-1]),
+        reference.float().reshape(-1, reference.shape[-1]), dim=-1).mean()
+    assert cos > SAGE_V2_MIN_COSINE, f"v2 mean cosine similarity {cos.item():.6f} <= {SAGE_V2_MIN_COSINE}"
 
 
 @pytest.fixture(scope="module")
@@ -327,9 +383,51 @@ def _sage_vs_reference(inputs):
                       invoke(fused_rope_prope_sdpa_split, inputs))
 
 
+def _sagev2_vs_reference(inputs):
+    assert_sagev2_gates(invoke(fused_rope_prope_sagev2, inputs),
+                        invoke(fused_rope_prope_sdpa_split, inputs))
+
+
 @pytest.mark.parametrize("rope_dtype", ROPE_DTYPES)
 def test_sage_accuracy_per_rope_precision(device, rope_dtype):
     _sage_vs_reference(create_test_inputs(device, rope_dtype))
+
+
+@pytest.mark.parametrize("rope_dtype", ROPE_DTYPES)
+def test_sagev2_accuracy_per_rope_precision(device, rope_dtype):
+    _sagev2_vs_reference(create_test_inputs(device, rope_dtype))
+
+
+@pytest.mark.parametrize("overrides", [
+    pytest.param({}, id="production-chunk"),
+    pytest.param({"head_dim": 64, "num_heads": 16}, id="head_dim-64"),
+    pytest.param({"kv_frames": 4}, id="short-kv"),
+    pytest.param({"q_frames": 1}, id="single-query-frame"),
+    pytest.param({"h_patches": 8, "w_patches": 8}, id="8x8-patches"),
+])
+def test_sagev2_accuracy_per_shape(device, overrides):
+    _sagev2_vs_reference(create_test_inputs(device, "float32", **overrides))
+
+
+def test_sagev2_batched_matches_independent_runs(device):
+    _assert_batched_matches_independent_runs(device, fused_rope_prope_sagev2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_sagev2_core_dtypes_and_headdim(device, dtype, head_dim):
+    q = torch.randn(1, 128, 4, head_dim, dtype=dtype, device=device) * 0.1
+    k = torch.randn(1, 128, 4, head_dim, dtype=dtype, device=device) * 0.1
+    v = torch.randn(1, 128, 4, head_dim, dtype=dtype, device=device) * 0.1
+    out = sageattn_v2.forward(q, k, v)
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    ).transpose(1, 2).contiguous()
+    u = ulp_distance(out, ref).float()
+    assert u.median().item() <= 10.0
+    assert u.quantile(0.90).item() <= 40.0
 
 
 def test_sage_logd4_camera_transform(device):
@@ -394,9 +492,9 @@ def _sage_intermediates(inputs, monkeypatch):
     captured = {}
     attend = fused_sage._attend_int8
 
-    def spy(q_eff, k_int8, k_scale, v_eff, *args):
+    def spy(q_eff, k_int8, k_scale, v_eff, *args, **kwargs):
         captured.update(q_eff=q_eff, k_int8=k_int8, k_scale=k_scale, v_eff=v_eff)
-        return attend(q_eff, k_int8, k_scale, v_eff, *args)
+        return attend(q_eff, k_int8, k_scale, v_eff, *args, **kwargs)
 
     monkeypatch.setattr(fused_sage, "_attend_int8", spy)
     invoke(fused_rope_prope_sage, inputs)
@@ -486,6 +584,7 @@ BENCH_SHAPES = {
 KERNELS = {
     "reference": fused_rope_prope_sdpa_split,
     "sage": fused_rope_prope_sage,
+    "sagev2": fused_rope_prope_sagev2,
     "unfused": fused_rope_prope_sdpa_reference,
 }
 
@@ -520,6 +619,8 @@ def benchmark(device, rope_dtype="float32", seed=17):
         truth = float64_truth(inputs)
         results[shape] = {}
         for name, kernel in KERNELS.items():
+            if name == "sagev2" and inputs["q"].shape[-1] < 64:
+                continue
             out = invoke(kernel, inputs)
             med, _ = timeit(lambda: invoke(kernel, inputs))
             results[shape][name] = (med, rel_rms(out, reference), rel_rms(out, truth))
@@ -546,6 +647,8 @@ def test_benchmark(device):
         assert row["reference"][1] == 0.0
         assert row["unfused"][1] == 0.0
         assert row["sage"][1] < SAGE_MAX_RMS
+        if "sagev2" in row:
+            assert row["sagev2"][1] < 0.25
     production = results["production-chunk"]
     assert production["sage"][0] < production["reference"][0]
 

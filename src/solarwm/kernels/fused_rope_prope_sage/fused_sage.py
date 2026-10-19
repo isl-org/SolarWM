@@ -698,9 +698,75 @@ def hadamard4(device, dtype=torch.float32) -> torch.Tensor:
     return _HADAMARD4_CACHE[key]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End-to-end
-# ─────────────────────────────────────────────────────────────────────────────
+def fused_rope_prope_sagev2(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    freqs: torch.Tensor,
+    q_grid_sizes: torch.Tensor,
+    k_grid_sizes: torch.Tensor,
+    q_viewmats: torch.Tensor,
+    q_Ks: Optional[torch.Tensor] = None,
+    kv_viewmats: Optional[torch.Tensor] = None,
+    kv_Ks: Optional[torch.Tensor] = None,
+    q_start_frame: int = 0,
+    k_start_frame: int = 0,
+    rope_dtype: Union[str, torch.dtype] = "float64",
+    camera_translation_transform: str = "linear",
+    radial_config: Optional[RadialAttentionConfig] = None,
+    radial_query_start_frame: int = 0,
+    radial_kv_start_frame: int = 0,
+    radial_tokens_per_frame: Optional[int] = None,
+) -> torch.Tensor:
+    """RoPE+PRoPE fused pipeline using SageAttention v2 INT4 SYCL core."""
+    if radial_config is not None and getattr(radial_config, "enabled", False):
+        raise ValueError("radial_attention is not supported with fused_rope_prope_sagev2")
+    if kv_viewmats is None:
+        kv_viewmats, kv_Ks = q_viewmats, q_Ks
+
+    fr = _freqs_real(freqs, rope_dtype)
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    batch, seq_q, heads, d = q.shape
+    seq_k = k.shape[1]
+    ncam_q, ncam_k = q_viewmats.shape[1], kv_viewmats.shape[1]
+    if seq_q % ncam_q or seq_k % ncam_k:
+        raise ValueError("sequence length must be divisible by the camera count")
+
+    linear = (camera_translation_transform in (None, "linear")
+              and (q_Ks is None) == (kv_Ks is None))
+    # Sage v2 does NOT use Hadamard-4 rotation (rot=None)
+    cs_q, cs_k, p_q_t, p_kv_k, p_kv_v, p_q = _build_tables(
+        fr, q_grid_sizes, k_grid_sizes, seq_q, seq_k, q_start_frame, k_start_frame,
+        q_viewmats, q_Ks, kv_viewmats, kv_Ks, rot=None, cameras=linear)
+    if not linear:
+        p_q_t, p_kv_v, p_q = _prope_tables_batched(
+            q_viewmats, q_Ks, kv_viewmats, kv_Ks, camera_translation_transform)
+        p_kv_k = p_kv_v
+
+    from .fused_sdpa import ROPE_MODE, normalize_rope_precision, rope_prope_transform
+    mode = ROPE_MODE[normalize_rope_precision(rope_dtype)[0]]
+
+    # Transform Q, K, V
+    q_eff = rope_prope_transform(q, p_q_t, cs_q, mode, out_layout="HND")
+    k_eff = rope_prope_transform(k, p_kv_k, cs_k, mode, out_layout="HND")
+    v_eff = rope_prope_transform(v, p_kv_v, None, mode, out_layout="HND")
+
+    # Transpose [B, H, L, D] -> [B, L, H, D] contiguous for SYCL ABI
+    q_in = q_eff.transpose(1, 2).contiguous()
+    k_in = k_eff.transpose(1, 2).contiguous()
+    v_in = v_eff.transpose(1, 2).contiguous()
+
+    from . import sageattn_v2
+    # Run INT4 SYCL attention core
+    o_v2 = sageattn_v2.forward(q_in, k_in, v_in)
+
+    # Transpose back [B, L, H, D] -> [B, H, L, D]
+    o = o_v2.transpose(1, 2).contiguous()
+
+    # Apply output PRoPE with p_q
+    out = rope_prope_transform(o, p_q, None, in_layout="HND", out_layout="NHD")
+    return out
 
 def fused_rope_prope_sage(
     q: torch.Tensor,

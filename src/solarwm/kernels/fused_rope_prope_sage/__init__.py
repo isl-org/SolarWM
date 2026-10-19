@@ -18,6 +18,7 @@ from .fused_sdpa import (
 )
 from .fused_sage import (
     fused_rope_prope_sage,
+    fused_rope_prope_sagev2,
     quantise_k,
     _attend_int8,
     hadamard4,
@@ -38,6 +39,7 @@ fused_rope_prope_sdpa = fused_rope_prope_sdpa_split
 
 __all__ = [
     "fused_rope_prope_sage",
+    "fused_rope_prope_sagev2",
     "fused_rope_prope_sdpa",
     "fused_rope_prope_sdpa_split",
     "fused_rope_prope_sdpa_reference",
