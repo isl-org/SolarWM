@@ -42,6 +42,25 @@ prompt and selects `dataset_trajectory`. That mode follows the saved dataset
 camera at the dataset FPS; keyboard input temporarily overrides it, and
 pressing `Space` brakes to a halt.
 
+### Drawn camera paths
+
+Add a **SolarWM Camera Path** node and connect its `camera_path` output to the
+optional `camera_path` input of **SolarWM Interactive Camera**. Drag on the
+top-down canvas to draw a path from the start marker; dragging again near the
+end of the path extends it, and **Undo**/**Clear** edit it. The canvas is
+labelled with the W/A/S/D movement it encodes: up moves forward along the
+model's `+Z` view direction (the direction the autonomous presets walk), down
+backward, left and right strafe like `A`/`D`. `extent` sets the model-space
+distance from the canvas centre to its edge. The path only translates the
+camera in the start pose's W/A/S/D plane and never turns it.
+
+When a path is connected it replaces `camera_motion`: the viewer converts it
+into a `dataset_trajectory` at the node's `translation_speed`, with rounded
+corners and a short ease-in/out, so keyboard input overrides it and `Space`
+brakes exactly as for dataset trajectories. The node shows the path length and
+the seconds and latents it needs at the connected node's speed, highlighting
+when that exceeds `max_latent_frames`.
+
 Every interactive session is also recorded as an H.264 MP4. Recordings are
 written under the configured runtime output directory, or
 `outputs/solarwm_interactive/` when the example config still contains a

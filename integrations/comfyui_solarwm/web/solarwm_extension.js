@@ -1,5 +1,12 @@
 import { app } from "../../../scripts/app.js";
 import { makeSolarWMViewer } from "./solarwm_interactive.js";
+import { solarwmCameraPath } from "./solarwm_camera_path.js";
+
+function connectedCameraPath(node) {
+  const slot = node.inputs?.findIndex((input) => input.name === "camera_path") ?? -1;
+  if (slot < 0 || node.inputs[slot].link == null) return undefined;
+  return solarwmCameraPath(node.getInputNode(slot));
+}
 
 async function loadSelectedImageMetadata(path) {
   if (!path) return null;
@@ -96,6 +103,14 @@ app.registerExtension({
         }
       };
       try {
+        const cameraPath = connectedCameraPath(node);
+        if (cameraPath === null) {
+          throw new Error("the connected SolarWM Camera Path is empty; draw a path first");
+        }
+        if (cameraPath) {
+          values.camera_path = cameraPath;
+          values.camera_motion = "dataset_trajectory";
+        }
         const response = await fetch("/solarwm/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

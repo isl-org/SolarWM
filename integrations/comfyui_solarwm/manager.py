@@ -20,6 +20,7 @@ from solarwm.backends.wan22.runtime.interactive_camera import (
     FreeFlyCamera,
     camera_tokens_from_poses,
 )
+from .camera_path import drawn_path_from_payload, drawn_path_trajectory
 from .factory import load_dataset_camera_metadata
 
 
@@ -442,6 +443,7 @@ class SolarWMSessionManager:
                 "SolarWM provider factory is not configured; call "
                 "configure_provider_factory() from the ComfyUI deployment"
             )
+        drawn_path = drawn_path_from_payload(payload)
         # Ensure any existing active sessions are terminated before starting a new one
         with self._lock:
             stale_ids = list(self._sessions.keys())
@@ -463,7 +465,22 @@ class SolarWMSessionManager:
             is_circle = camera_motion == "circle_twice_10s"
             dataset_metadata = None
             camera_pose = None
-            if camera_motion == "dataset_trajectory":
+            if drawn_path is not None:
+                camera_motion = "dataset_trajectory"
+                dataset_metadata = {
+                    "trajectory": drawn_path_trajectory(
+                        drawn_path,
+                        speed=float(
+                            payload.get(
+                                "translation_speed",
+                                inf_cfg.get("default_translation_speed", 0.1),
+                            )
+                        ),
+                    ),
+                    "fps": 16.0,
+                }
+                camera_pose = dataset_metadata["trajectory"][0]
+            elif camera_motion == "dataset_trajectory":
                 dataset_metadata = load_dataset_camera_metadata(
                     str(payload.get("initial_image", ""))
                 )
