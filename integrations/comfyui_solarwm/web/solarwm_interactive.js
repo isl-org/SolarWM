@@ -190,6 +190,13 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
     send();
   }
 
+  const viewerKeyCodes = new Set([
+    ...SOLARWM_CODES,
+    "Digit0", "Digit1", "Digit2", "Digit3", "Numpad1", "Numpad2", "Numpad3",
+    "KeyF", "KeyG", "KeyK", "Enter", "Space", "Escape", "Slash", "Home",
+    "Minus", "Equal", "BracketLeft", "BracketRight",
+  ]);
+
   function refreshStatus() {
     if (!latestFrameStatus) return;
     status.value =
@@ -221,57 +228,50 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
   displayFps.addEventListener("change", restartDisplayTimer);
   restartDisplayTimer();
 
-  root.addEventListener("keydown", (event) => {
+  function handleKeyDown(event) {
     if (event.ctrlKey || event.altKey || event.metaKey) return;
+    if (!viewerKeyCodes.has(event.code)) return;
+    event.preventDefault();
+    event.stopPropagation();
     if (event.code === "Digit1" || event.code === "Numpad1") {
-      event.preventDefault();
       applyScale("1x");
       return;
     }
     if (event.code === "Digit2" || event.code === "Numpad2") {
-      event.preventDefault();
       applyScale("2x");
       return;
     }
     if (event.code === "Digit3" || event.code === "Numpad3" || event.code === "KeyF") {
-      event.preventDefault();
       applyScale("fit");
       return;
     }
     if (event.code === "Space") {
-      event.preventDefault();
       send("brake");
       return;
     }
     if (event.code === "KeyG") {
-      event.preventDefault();
       running = !running;
       send(running ? "resume" : "pause");
       return;
     }
     if (event.code === "Enter") {
-      event.preventDefault();
       send("step");
       return;
     }
     if (event.code === "KeyK") {
-      event.preventDefault();
       send("drop");
       return;
     }
     if (event.code === "Escape") {
-      event.preventDefault();
       clearKeys();
       root.blur();
       return;
     }
     if (event.code === "Slash" && (event.shiftKey || event.key === "?")) {
-      event.preventDefault();
       help.hidden = !help.hidden;
       return;
     }
     if (event.code === "Home" && event.shiftKey && sessionConfig) {
-      event.preventDefault();
       if (!window.confirm("Start a new SolarWM session from the initial pose?")) return;
       fetch("/solarwm/sessions", {
         method: "POST",
@@ -291,48 +291,47 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
       return;
     }
     if (event.code === "KeyX") {
-      event.preventDefault();
       send("level_roll");
       return;
     }
     if (event.code === "Minus") {
-      event.preventDefault();
       send("speed_down");
       return;
     }
     if (event.code === "Equal") {
-      event.preventDefault();
       send("speed_up");
       return;
     }
     if (event.code === "BracketLeft") {
-      event.preventDefault();
       send("look_down");
       return;
     }
     if (event.code === "BracketRight") {
-      event.preventDefault();
       send("look_up");
       return;
     }
     if (event.code === "Digit0") {
-      event.preventDefault();
       send("defaults");
       return;
     }
     if (SOLARWM_CODES.has(event.code)) {
-      event.preventDefault();
       pressed.add(event.code);
       send();
     }
-  });
-  root.addEventListener("keyup", (event) => {
+  }
+
+  function handleKeyUp(event) {
+    if (!viewerKeyCodes.has(event.code)) return;
+    event.preventDefault();
+    event.stopPropagation();
     if (SOLARWM_CODES.has(event.code)) {
-      event.preventDefault();
       pressed.delete(event.code);
       send();
     }
-  });
+  }
+
+  window.addEventListener("keydown", handleKeyDown, true);
+  window.addEventListener("keyup", handleKeyUp, true);
   root.addEventListener("blur", clearKeys);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) clearKeys();
@@ -359,12 +358,21 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
     refreshStatus();
   });
   socket.addEventListener("close", () => {
+    window.removeEventListener("keydown", handleKeyDown, true);
+    window.removeEventListener("keyup", handleKeyUp, true);
     clearKeys();
     if (displayTimer !== null) clearInterval(displayTimer);
     frameQueue.length = 0;
     if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
   });
-  return { close: () => socket.close(), clearKeys };
+  return {
+    close: () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keyup", handleKeyUp, true);
+      socket.close();
+    },
+    clearKeys,
+  };
 }
 
 export { makeSolarWMViewer };
