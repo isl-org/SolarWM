@@ -395,22 +395,15 @@ class SVDQuantModelManager:
         into the up projection).
         """
         ckpt = Path(checkpoint_dir)
-        manifest_path = ckpt / "manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"manifest.json not found in {checkpoint_dir}")
+        from solarwm.checkpoint.svdquant import validate_checkpoint
 
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+        manifest, shard_files = validate_checkpoint(ckpt)
 
         set_mapping = manifest.get(
             "set_mapping",
             {"0": "set0", "1": "set0", "2": "set0", "3": "set0", "commit": "set0"},
         )
         activation_policy = manifest.get("activation_policy", {})
-
-        shard_files = sorted(ckpt.glob("*.safetensors"))
-        if not shard_files:
-            raise FileNotFoundError(f"No safetensors files found in {checkpoint_dir}")
 
         parsed: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
         for sf in shard_files:
@@ -424,6 +417,17 @@ class SVDQuantModelManager:
                 parsed.setdefault(module_name, {}).setdefault(set_name, {})[param_name] = tensor
             del sf_tensors
 
+        required = {"qweight", "w_scale", "smooth_scale", "lora_a", "lora_b"}
+        expected_sets = set(set_mapping.values())
+        for b_idx in range(len(self.model.blocks)):
+            for suffix in SYCLSVDQuantLinear.TARGET_SUFFIXES:
+                name = f"blocks.{b_idx}.{suffix}"
+                module_sets = parsed.get(name, {})
+                if set(module_sets) != expected_sets:
+                    raise ValueError(f"SVDQuant sets missing or unexpected for {name}")
+                for set_name, tensors in module_sets.items():
+                    if not required <= tensors.keys():
+                        raise ValueError(f"SVDQuant parameters missing for {set_name}.{name}")
         self.restore_bf16()
         for b_idx, block in enumerate(self.model.blocks):
             block_key = f"blocks.{b_idx}"

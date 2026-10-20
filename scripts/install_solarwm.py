@@ -48,6 +48,7 @@ BASE_PATTERNS = (
 )
 STAGE2_PATTERN = "SolarWM-5B-sgf-stage2-81f/**"
 WAN_RUNTIME_PACKAGES = (
+    "accelerate>=1.0",
     "av",
     "diffusers==0.38.0",
     "decord>=0.6",
@@ -358,14 +359,19 @@ def model_weights_are_present(model_root: Path) -> bool:
 
 
 def svdquant_weights_are_present(model_root: Path, variant: str | None = None) -> bool:
+    from solarwm.checkpoint.svdquant import validate_checkpoint
+
     root = model_root / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4"
     if not root.is_dir():
         return False
     if variant and variant.lower() not in ("none", "skip", "all"):
         v_dir = root / variant
-        if not v_dir.is_dir() or not (v_dir / "manifest.json").is_file():
+        try:
+            validate_checkpoint(v_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"SVDQuant {variant} is not complete: {exc}")
             return False
-        return any(v_dir.glob("*.safetensors"))
+        return True
     return any(root.rglob("*.safetensors"))
 
 
@@ -408,22 +414,26 @@ def download_svdquant_release_variant(
 ) -> Path:
     variant_dir = model_root / "SolarWM-5B-sgf-stage2-81f" / "svdquant_int4" / variant
     variant_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = variant_dir / "manifest.json"
+    from solarwm.checkpoint.svdquant import resolve_manifest, resolve_shard, validate_checkpoint
 
+    manifest_path = variant_dir / "manifest.json"
+    try:
+        manifest_path = resolve_manifest(variant_dir)
+    except FileNotFoundError:
+        pass
     if manifest_path.is_file():
         try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest_data = json.load(f)
-            shards = manifest_data.get("shards", [])
-            if shards and all((variant_dir / s).is_file() and (variant_dir / s).stat().st_size > 0 for s in shards):
-                print(f"SVDQuant {variant} weights already present in {variant_dir}")
-                return variant_dir
-        except Exception:
-            pass
+            validate_checkpoint(variant_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"SVDQuant {variant} needs repair: {exc}")
+        else:
+            print(f"SVDQuant {variant} weights already present in {variant_dir}")
+            return variant_dir
 
     manifest_url = f"https://github.com/{repo}/releases/download/{tag}/{variant}_manifest.json"
     print(f"Downloading SVDQuant {variant} manifest from {manifest_url}")
-    download_file_with_progress(manifest_url, manifest_path)
+    if not manifest_path.is_file():
+        download_file_with_progress(manifest_url, manifest_path)
 
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest_data = json.load(f)
@@ -434,7 +444,11 @@ def download_svdquant_release_variant(
 
     for shard in shards:
         shard_dest = variant_dir / shard
-        if shard_dest.is_file() and shard_dest.stat().st_size > 0:
+        try:
+            existing = resolve_shard(variant_dir, shard)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and existing.stat().st_size > 0:
             print(f"Shard {shard} already exists, skipping")
             continue
         asset_name = f"{variant}_{shard}"
@@ -442,6 +456,7 @@ def download_svdquant_release_variant(
         print(f"Downloading SVDQuant asset {asset_name} -> {shard_dest.name}")
         download_file_with_progress(shard_url, shard_dest)
 
+    validate_checkpoint(variant_dir)
     print(f"SVDQuant {variant} weights downloaded to {variant_dir}")
     return variant_dir
 

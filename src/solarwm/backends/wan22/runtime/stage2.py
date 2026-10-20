@@ -3128,11 +3128,20 @@ class CudaWanStage2GenerationAdapter:
                         dtype=encoder_dtype,
                     )
                     self.text_encoder.to(encoder_device, dtype=encoder_dtype)
-                    self.diffusion = build_diffusion_architecture(values)
+                    if self.device.type == "xpu":
+                        from accelerate import init_empty_weights
+
+                        with init_empty_weights():
+                            self.diffusion = build_diffusion_architecture(values)
+                    else:
+                        self.diffusion = build_diffusion_architecture(values)
                     if stage2_linear_quant(values) != "full_precision":
                         from .modeling.svdquant_linear import stub_dit_linear_layers
 
                         stub_dit_linear_layers(self.diffusion.module)
+                    if self.device.type == "xpu":
+                        self.diffusion.module.to(dtype=inference_dtype)
+                        self.diffusion.module.to_empty(device=self.device)
                     self.diffusion.module.eval().requires_grad_(False).to(
                         device=self.device, dtype=inference_dtype
                     )
@@ -3246,16 +3255,20 @@ class CudaWanStage2GenerationAdapter:
                             ".ffn.2.weight",
                             ".ffn.2.bias",
                         )
-                        filtered = {
-                            k: v
-                            for k, v in normalized.items()
-                            if not any(
-                                k.startswith(f"blocks.{b}") and any(s in k for s in target_suffixes)
-                                for b in range(30)
-                            )
+                        replaced_keys = {
+                            f"blocks.{b}{suffix}" for b in range(len(self.diffusion.module.blocks))
+                            for suffix in target_suffixes
                         }
+                        filtered = {k: v for k, v in normalized.items() if k not in replaced_keys}
 
                         result = self.diffusion.module.load_state_dict(filtered, strict=False)
+                        unexpected_missing = set(result.missing_keys) - replaced_keys
+                        if unexpected_missing or result.unexpected_keys:
+                            raise BackendContractError(
+                                "SVDQuant base checkpoint differs: "
+                                f"missing={sorted(unexpected_missing)[:8]}, "
+                                f"unexpected={result.unexpected_keys[:8]}"
+                            )
                         del filtered, state, normalized
                 except Exception as exc:
                     if isinstance(exc, BackendContractError):

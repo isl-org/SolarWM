@@ -1,4 +1,5 @@
 /* Keyboard-only SolarWM viewer. Loaded by ComfyUI's custom-node web loader. */
+import { api } from "../../../scripts/api.js";
 
 const SOLARWM_CODES = new Set([
   "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
@@ -167,10 +168,12 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
   let displayTimer = null;
   let currentObjectUrl = null;
   let latestFrameStatus = "";
-  let socket = new WebSocket(
-    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}` +
-      `/solarwm/sessions/${encodeURIComponent(sessionId)}/stream`,
+  const streamUrl = new URL(
+    api.apiURL(`/solarwm/sessions/${encodeURIComponent(sessionId)}/stream`),
+    window.location.href,
   );
+  streamUrl.protocol = streamUrl.protocol === "https:" ? "wss:" : "ws:";
+  let socket = new WebSocket(streamUrl);
   socket.binaryType = "blob";
   let running = true;
 
@@ -273,7 +276,7 @@ function makeSolarWMViewer(sessionId, root, sessionConfig = null, onSession = nu
     if (event.code === "Home" && event.shiftKey && sessionConfig) {
       event.preventDefault();
       if (!window.confirm("Start a new SolarWM session from the initial pose?")) return;
-      fetch("/solarwm/sessions", {
+      api.fetchApi("/solarwm/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(sessionConfig),

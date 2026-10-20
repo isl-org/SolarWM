@@ -1,9 +1,10 @@
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 import { makeSolarWMViewer } from "./solarwm_interactive.js";
 
 async function loadSelectedImageMetadata(path) {
   if (!path) return null;
-  const response = await fetch(
+  const response = await api.fetchApi(
     `/solarwm/image-metadata?path=${encodeURIComponent(path)}`,
   );
   if (!response.ok) return null;
@@ -79,7 +80,7 @@ app.registerExtension({
         cancelled = true;
         if (viewer) viewer.close();
         if (activeSessionId) {
-          await fetch(`/solarwm/sessions/${activeSessionId}`, { method: "DELETE" });
+          await api.fetchApi(`/solarwm/sessions/${activeSessionId}`, { method: "DELETE" });
         }
         root.remove();
       };
@@ -88,7 +89,7 @@ app.registerExtension({
         status.textContent = "Unloading model from VRAM…";
         if (viewer) viewer.close();
         try {
-          const resp = await fetch("/solarwm/model/unload", { method: "POST" });
+          const resp = await api.fetchApi("/solarwm/model/unload", { method: "POST" });
           const res = await resp.json();
           status.textContent = res.message || "Model unloaded from VRAM";
         } catch (e) {
@@ -96,7 +97,7 @@ app.registerExtension({
         }
       };
       try {
-        const response = await fetch("/solarwm/sessions", {
+        const response = await api.fetchApi("/solarwm/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(values),
@@ -105,7 +106,7 @@ app.registerExtension({
         if (!response.ok) throw new Error(payload.error || "SolarWM session failed");
         activeSessionId = payload.session_id;
         if (cancelled) {
-          await fetch(`/solarwm/sessions/${activeSessionId}`, { method: "DELETE" });
+          await api.fetchApi(`/solarwm/sessions/${activeSessionId}`, { method: "DELETE" });
           return;
         }
         const viewerRoot = document.createElement("div");

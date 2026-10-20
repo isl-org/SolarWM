@@ -2714,9 +2714,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         super()._apply(fn, recurse)
         device = self.patch_embedding.weight.device
         if device.type != "meta":
-            self._time_embedding_frequencies = self._time_embedding_frequencies.to(
-                device=device
-            )
+            if self._time_embedding_frequencies.device.type == "meta":
+                self._time_embedding_frequencies = sinusoidal_embedding_frequencies(
+                    self.freq_dim, device=device
+                )
+            else:
+                self._time_embedding_frequencies = self._time_embedding_frequencies.to(
+                    device=device
+                )
         return self
 
     @property

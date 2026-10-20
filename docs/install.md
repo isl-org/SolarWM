@@ -142,3 +142,15 @@ files are missing, restore the matching `intel-sycl-rt` wheel; alternatively,
 install the matching oneAPI DPC++ component and initialize its environment.
 Do not set `ONEAPI_ROOT` to a nonexistent toolkit, since that overrides Triton's
 wheel-based discovery.
+# SVDQuant checkpoint layout
+
+Quantized weights are an overlay on the Stage2 `.pt` checkpoint, not a
+standalone model. Set `model.svdquant_weights_root` to the directory containing
+`sdpa_k1`, `sdpa_k2`, `sdpa_k4`, or the matching `sageattnv1` variants.
+Each variant accepts either `manifest.json` and manifest-declared shard names,
+or GitHub release filenames prefixed with the variant (for example
+`sdpa_k1_manifest.json` and `sdpa_k1_svdquant_weights.safetensors`).
+The installer and runtime validate every declared shard, tensor-to-shard mapping,
+and set inventory. Keep all k4 shards, including set2. Unquantized parameters
+still come from the release-selected EMA state in the original or processed
+EMA-only BF16 `.pt` transaction.

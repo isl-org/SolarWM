@@ -2,6 +2,36 @@
 
 Last updated: 2026-10-19.
 
+### 2026-10-20: ComfyUI lower-resolution video verified
+
+Long-run trials requested 60 and 120 latents at 576x320, full precision/SDPA.
+Both stopped at 21 completed latents (81 video frames, 5.0625 seconds at
+16 fps), failing during the next VAE decode with
+`UR_RESULT_ERROR_OUT_OF_HOST_MEMORY`. The captured stack ends in VAE
+`RMS_norm.forward -> F.normalize -> torch.linalg.vector_norm`.
+An opt-in `runtime.interactive_empty_cache` between chunks did not resolve it.
+The requested full lengths (237 frames/14.8125 seconds and
+477 frames/29.8125 seconds) were not achieved.
+Trial results and recording paths are in `outputs/long-session-results.json`.
+
+An isolated ComfyUI server successfully handled `POST /solarwm/sessions` with
+full-precision EMA BF16 weights, SDPA, three latents, and the UI's
+`360p (320x576)` resolution option. The output MP4 decoded as H.264,
+576x320, with nine frames:
+`outputs/solarwm_interactive/bcb666e5-7d2b-4cfc-be11-8834165fdf37.mp4`.
+
+The browser's connection failure was reproduced as a backend native crash
+during FP32 transformer initialization. Stage2 inference now constructs
+parameters with Accelerate's `init_empty_weights`, converts their dtype before
+allocating on the accelerator, and regenerates the plain timestep frequency
+table when materializing meta parameters. This avoids the smoke test's
+process-global BF16 default requirement. Two initialization regression tests
+passed. Session-creation exceptions are also logged with their traceback.
+
+The HTTP/recording path is verified; the authenticated AI Playground browser
+viewer and WebSocket presentation still need a live browser check. SVDQuant
+kernel resource/device-loss errors are separate and remain unresolved.
+
 **Status:** installation, custom kernel builds, and selected kernel tests work.
 The reduced EMA checkpoint loads in a real interactive session. End-to-end
 interactive video generation is not yet verified.
@@ -172,6 +202,53 @@ the text encoder and model were resident.
    installer, then test on a clean machine without the development venv.
 9. Acceptance target: a real interactive session produces finite decoded
    frames and a playable MP4, followed by authenticated ComfyUI viewer testing.
+
+## New Windows machine: install steps
+
+Assumes ComfyUI and PyTorch XPU are already installed.
+
+1. Install VS 2022 C++ Build Tools with the x64 MSVC toolset and Windows SDK.
+2. Clone this SolarWM checkout and open PowerShell in its root. Set the paths
+   below to the existing ComfyUI installation:
+
+   ```powershell
+   $comfy = "C:\path\to\ComfyUI"
+   $python = "$comfy\.venv\Scripts\python.exe"
+   ```
+
+3. Accept access to `junchaoh-cs/SolarWM` on Hugging Face and set `HF_TOKEN`
+   locally. Ensure `uv` or pip is available, then install:
+
+   ```powershell
+   & $python .\scripts\install_solarwm.py --comfyui $comfy
+   ```
+
+   This downloads Wan2.2-5B assets, creates the smaller EMA-only BF16
+   checkpoint, and installs the Level Zero SDK plus the venv-local Triton/MSVC
+   startup hook. SYCL headers come from `intel-sycl-rt` under `.venv\Library`.
+
+4. For **source-built custom SYCL kernels**, install matching oneAPI DPC++
+   and oneDNN development components, initialize oneAPI, then reactivate the
+   ComfyUI venv. Fetch the build prerequisites and build:
+
+   ```powershell
+   uv pip install --python $python kernelfoundry
+   git clone --depth 1 --branch v0.9.3 https://github.com/intel/sycl-tla.git .\packages\wan22_svdquant_dense_block\sycl-tla
+   & $python .\scripts\install_solarwm.py --skip-weights --build-kernels --gpu-arch bmg-g31
+   ```
+
+   Use the actual GPU target. With compatible prebuilt extensions, skip this
+   build step but supply their required runtime DLLs. SVDQuant inference also
+   needs separate quantized weights; building its kernel does not provide them.
+
+5. Restart ComfyUI using its venv. Run the standalone smoke test:
+
+   ```powershell
+   & $python -u .\scripts\debug\run_comfyui_interactive_smoke.py
+   ```
+
+   Installation success is not yet proof of successful generation: the memory
+   and native-crash blockers above remain open.
 
 ## Local commands
 

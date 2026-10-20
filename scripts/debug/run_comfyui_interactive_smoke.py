@@ -7,6 +7,8 @@ import faulthandler
 from pathlib import Path
 import queue
 import sys
+import traceback
+from unittest.mock import patch
 
 import os
 
@@ -25,6 +27,26 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from integrations.comfyui_solarwm.factory import build_provider_inputs, clear_cached_provider
 from integrations.comfyui_solarwm.manager import manager
+from solarwm.backends.wan22.runtime.interactive import Stage2InteractiveSession
+
+
+def traced_step(original, session, *args, **kwargs):
+    try:
+        if session.device.type == "xpu":
+            torch.xpu.synchronize(session.device)
+            torch.xpu.empty_cache()
+            free, total = torch.xpu.mem_get_info(session.device)
+            print(
+                f"Before latent {session.latent_index}: "
+                f"allocated={torch.xpu.memory_allocated(session.device) / 1024**3:.2f} GiB; "
+                f"free={free / 1024**3:.2f}/{total / 1024**3:.2f} GiB",
+                flush=True,
+            )
+        return original(session, *args, **kwargs)
+    except Exception:
+        print("Original interactive worker traceback:", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        raise
 
 
 def _default_config() -> Path:
@@ -93,6 +115,20 @@ def main() -> None:
     elif resolution_str == "480p":
         resolution_str = "480p (480x864)"
     try:
+        original_step = Stage2InteractiveSession.step
+        def step_with_trace(session, *step_args, **step_kwargs):
+            return traced_step(original_step, session, *step_args, **step_kwargs)
+        with patch.object(Stage2InteractiveSession, "step", step_with_trace):
+            _run_session(args, resolution_str)
+    finally:
+        clear_cached_provider()
+        torch.set_default_dtype(original_dtype)
+
+
+def _run_session(args, resolution_str):
+    session = None
+    frames = 0
+    try:
         session = manager.create({
             "config_path": str(args.config.resolve()),
             "initial_image": str(args.image.resolve()),
@@ -131,7 +167,6 @@ def main() -> None:
                 manager.delete(session.session_id)
         finally:
             clear_cached_provider()
-            torch.set_default_dtype(original_dtype)
 
 
 if __name__ == "__main__":

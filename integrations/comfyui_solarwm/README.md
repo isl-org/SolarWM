@@ -5,6 +5,13 @@ Copy or symlink `integrations/comfyui_solarwm` into ComfyUI's
 Camera` node opens a separate keyboard-controlled viewer and keeps model
 execution outside ComfyUI's prompt queue.
 
+Session requests use ComfyUI's configured API transport rather than the page
+origin, including when the viewer is embedded. After updating the extension,
+reload the ComfyUI page to replace cached JavaScript. In AI Playground, open
+ComfyUI through its authenticated launch flow; the stream still requires the
+backend's session authentication. A browser `Failed to fetch` can also indicate
+that the backend stopped or crashed; check server output before retrying.
+
 The default bootstrap expects:
 
 - `config_path`: an absolute or working-directory-relative path to

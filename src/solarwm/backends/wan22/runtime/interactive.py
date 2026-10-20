@@ -145,6 +145,10 @@ class Stage2InteractiveSession:
             raise BackendContractError("interactive Stage2 session is closed")
         if self.done:
             raise BackendContractError("interactive Stage2 session reached its horizon")
+        if self.device.type == "xpu" and self.provider.config.get("runtime", {}).get(
+            "interactive_empty_cache", False
+        ):
+            torch.xpu.empty_cache()
         frame = self._index
         started = time.perf_counter()
         self._fill_noise(self._noise)

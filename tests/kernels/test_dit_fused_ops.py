@@ -198,6 +198,23 @@ def test_causal_block_fused_parity():
     assert max_diff < 0.2, f"Block max diff {max_diff} too large"
 
 
+def test_causal_model_empty_initialization_preserves_time_frequencies():
+    from accelerate import init_empty_weights
+    from solarwm.backends.wan22.runtime.modeling.model import sinusoidal_embedding_frequencies
+
+    with init_empty_weights():
+        model = CausalWanModel(
+            num_layers=1, dim=256, ffn_dim=512, num_heads=4,
+            in_dim=16, out_dim=16, text_dim=256,
+        )
+    assert model.patch_embedding.weight.device.type == "meta"
+    model.to(dtype=torch.bfloat16)
+    model.to_empty(device="cpu")
+    assert model.patch_embedding.weight.dtype == torch.bfloat16
+    expected = sinusoidal_embedding_frequencies(model.freq_dim, device=torch.device("cpu"))
+    assert torch.equal(model._time_embedding_frequencies, expected)
+
+
 def test_causal_model_dit_fused_ops_propagation():
     m = CausalWanModel(
         num_layers=2,

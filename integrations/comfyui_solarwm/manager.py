@@ -333,6 +333,9 @@ class SessionState:
                 }
             )
         except Exception as exc:
+            import logging
+
+            logging.exception("SolarWM interactive generation failed")
             self._publish(
                 {"type": "error", "error": f"{type(exc).__name__}: {exc}"}
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from .manager import manager
@@ -32,6 +33,7 @@ def register_routes() -> None:
             payload = await request.json()
             session = await asyncio.to_thread(manager.create, payload)
         except Exception as exc:
+            logging.exception("SolarWM session creation failed")
             return web.json_response(
                 {"error": f"{type(exc).__name__}: {exc}"},
                 status=400,
