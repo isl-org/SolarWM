@@ -29,34 +29,33 @@ class SolarWMInteractive:
 
     @staticmethod
     def _image_options() -> tuple[list[str], dict[str, object]]:
-        """Expose ComfyUI's uploadable image combo with a safe local fallback."""
+        """Expose images currently available in ComfyUI's input directory."""
         default = "assets/eastshade.webp"
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-        repo_assets = []
-        assets_root = os.path.join(repo_root, "assets")
-        if os.path.isdir(assets_root):
-            for root, _, filenames in os.walk(assets_root):
-                for filename in filenames:
-                    if os.path.splitext(filename)[1].lower() in {
-                        ".png",
-                        ".jpg",
-                        ".jpeg",
-                        ".webp",
-                    }:
-                        repo_assets.append(
-                            os.path.relpath(
-                                os.path.join(root, filename), repo_root
-                            ).replace(os.sep, "/")
-                        )
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
         try:
             import folder_paths
 
-            files = folder_paths.filter_files_content_types(
-                os.listdir(folder_paths.get_input_directory()), ["image"]
+            input_root = os.path.abspath(folder_paths.get_input_directory())
+            options = sorted(
+                os.path.relpath(path, input_root).replace(os.sep, "/")
+                for root, _, filenames in os.walk(input_root, followlinks=False)
+                for filename in filenames
+                if os.path.splitext(filename)[1].lower() in image_suffixes
+                for path in [os.path.join(root, filename)]
             )
-            options = sorted(set(files + repo_assets))
         except (ImportError, OSError, AttributeError):
-            options = sorted(set(repo_assets))
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+            assets_root = os.path.join(repo_root, "assets")
+            options = sorted(
+                os.path.relpath(os.path.join(root, filename), repo_root).replace(
+                    os.sep, "/"
+                )
+                for root, _, filenames in os.walk(assets_root)
+                for filename in filenames
+                if os.path.splitext(filename)[1].lower() in image_suffixes
+            )
+        if default not in options:
+            default = options[0] if options else default
         if default not in options:
             options.insert(0, default)
         return options, {"default": default, "image_upload": True}
