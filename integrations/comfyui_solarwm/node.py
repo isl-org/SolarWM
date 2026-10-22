@@ -5,6 +5,54 @@ from __future__ import annotations
 import json
 import os
 
+from .camera_path import CAMERA_PATH_SCHEMA
+
+CAMERA_PATH_TYPE = "SOLARWM_CAMERA_PATH"
+
+
+def camera_path_from_widget(path_json: str, extent: float) -> dict:
+    """Scale the canvas path (``[-1, 1]``, W up, D right) to model-space units."""
+
+    try:
+        points = json.loads(path_json or "{}").get("points", [])
+    except (AttributeError, json.JSONDecodeError) as exc:
+        raise ValueError("camera path widget does not hold valid path JSON") from exc
+    scale = float(extent)
+    return {
+        "schema": CAMERA_PATH_SCHEMA,
+        "points": [[float(x) * scale, float(y) * scale] for x, y in points],
+    }
+
+
+class SolarWMCameraPath:
+    """Top-down canvas for drawing a planar W/A/S/D camera trajectory."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "extent": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.1,
+                        "max": 20.0,
+                        "step": 0.1,
+                        "tooltip": "Model-space units from the canvas centre to its edge",
+                    },
+                ),
+                "path_json": ("STRING", {"default": '{"points": []}'}),
+            }
+        }
+
+    RETURN_TYPES = (CAMERA_PATH_TYPE,)
+    RETURN_NAMES = ("camera_path",)
+    FUNCTION = "build_path"
+    CATEGORY = "SolarWM/Interactive"
+
+    def build_path(self, extent: float, path_json: str):
+        return (camera_path_from_widget(path_json, extent),)
+
 
 class SolarWMInteractive:
     """Create a viewer configuration without owning model/session state."""
@@ -142,7 +190,13 @@ class SolarWMInteractive:
                     "COMBO",
                     {"options": cls._RESOLUTIONS, "default": "480p (480x864)"},
                 ),
-            }
+            },
+            "optional": {
+                "camera_path": (
+                    CAMERA_PATH_TYPE,
+                    {"tooltip": "Drawn W/A/S/D path; replaces camera_motion when connected"},
+                ),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -169,6 +223,7 @@ class SolarWMInteractive:
         display_fps: int = 8,
         resolution: str = "480p (480x864)",
         control_after_generate: str = "fixed",
+        camera_path: dict | None = None,
         **kwargs,
     ):
         payload = {
@@ -191,8 +246,17 @@ class SolarWMInteractive:
             "resolution": str(resolution),
             "controls": "keyboard-free-fly-v1",
         }
+        if camera_path is not None:
+            payload["camera_motion"] = "dataset_trajectory"
+            payload["camera_path"] = camera_path
         return (json.dumps(payload, sort_keys=True),)
 
 
-NODE_CLASS_MAPPINGS = {"SolarWMInteractive": SolarWMInteractive}
-NODE_DISPLAY_NAME_MAPPINGS = {"SolarWMInteractive": "SolarWM Interactive Camera"}
+NODE_CLASS_MAPPINGS = {
+    "SolarWMInteractive": SolarWMInteractive,
+    "SolarWMCameraPath": SolarWMCameraPath,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SolarWMInteractive": "SolarWM Interactive Camera",
+    "SolarWMCameraPath": "SolarWM Camera Path",
+}

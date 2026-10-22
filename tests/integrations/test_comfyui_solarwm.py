@@ -9,6 +9,11 @@ import numpy as np
 import pytest
 import torch
 
+from integrations.comfyui_solarwm.camera_path import (
+    drawn_path_from_payload,
+    drawn_path_trajectory,
+    validate_drawn_path,
+)
 from integrations.comfyui_solarwm.factory import (
     _interactive_config,
     load_dataset_camera_metadata,
@@ -21,7 +26,11 @@ from integrations.comfyui_solarwm.manager import (
     _jpeg_bytes,
     _rgb_frame,
 )
-from integrations.comfyui_solarwm.node import SolarWMInteractive
+from integrations.comfyui_solarwm.node import (
+    NODE_CLASS_MAPPINGS,
+    SolarWMCameraPath,
+    SolarWMInteractive,
+)
 from solarwm.backends.wan22.runtime.interactive_camera import FreeFlyCamera
 
 
@@ -666,3 +675,69 @@ def test_checkpoint_file_prefers_ema_bf16_transaction(tmp_path: Path) -> None:
     resolved = _checkpoint_file(config)
     assert resolved == ema_dir / "model.pt"
 
+
+def test_drawn_path_trajectory_translates_along_wasd_plane_at_speed():
+    path = [[0.0, 0.0], [0.0, 0.5], [0.5, 0.5]]
+    poses = drawn_path_trajectory(path, speed=0.1, fps=16.0)
+
+    np.testing.assert_allclose(poses[0], np.eye(4))
+    np.testing.assert_allclose(poses[-1, [0, 2], 3], [0.5, 0.5], atol=1e-9)
+    np.testing.assert_allclose(poses[:, :3, :3], np.broadcast_to(np.eye(3), (len(poses), 3, 3)))
+    np.testing.assert_allclose(poses[:, 1, 3], 0.0)
+    step = np.linalg.norm(np.diff(poses[:, [0, 2], 3], axis=0), axis=1) * 16.0
+    assert step.max() <= 0.1 + 1e-6
+    assert np.isclose(np.median(step), 0.1, rtol=0.05)
+    assert 9.0 <= len(poses) / 16.0 <= 11.0
+    rounded = poses[:, [0, 2], 3]
+    assert np.min(np.linalg.norm(rounded - [0.0, 0.5], axis=1)) > 0.01
+
+
+def test_drawn_path_plays_through_dataset_trajectory_camera():
+    poses = drawn_path_trajectory([[0.0, 0.0], [0.0, 1.0]], speed=0.2, fps=16.0)
+    camera = FreeFlyCamera(
+        default_motion="dataset_trajectory", dataset_trajectory=poses, dataset_fps=16.0
+    )
+    for _ in range(40):
+        camera.update(set(), 0.25)
+    np.testing.assert_allclose(camera.pose[:3, 3], [0.0, 0.0, 1.0], atol=1e-9)
+
+
+def test_camera_path_node_scales_canvas_points_and_feeds_interactive_node():
+    assert NODE_CLASS_MAPPINGS["SolarWMCameraPath"] is SolarWMCameraPath
+    assert list(SolarWMCameraPath.INPUT_TYPES()["required"]) == ["extent", "path_json"]
+    (camera_path,) = SolarWMCameraPath().build_path(
+        2.0, json.dumps({"points": [[0, 0], [0, 0.5], [0.25, 0.5]]})
+    )
+    assert camera_path["points"] == [[0.0, 0.0], [0.0, 1.0], [0.5, 1.0]]
+
+    optional = SolarWMInteractive.INPUT_TYPES()["optional"]
+    assert optional["camera_path"][0] == SolarWMCameraPath.RETURN_TYPES[0]
+    (config,) = SolarWMInteractive().build_config(
+        "config.yaml",
+        "anchor.webp",
+        "prompt",
+        42,
+        120,
+        "sdpa",
+        "full_precision",
+        "/weights",
+        "full_precision",
+        camera_path=camera_path,
+    )
+    payload = json.loads(config)
+    assert payload["camera_motion"] == "dataset_trajectory"
+    np.testing.assert_allclose(drawn_path_from_payload(payload), camera_path["points"])
+
+
+def test_drawn_path_validation():
+    assert drawn_path_from_payload({"camera_motion": "straight_about_turn_10s"}) is None
+    np.testing.assert_allclose(
+        validate_drawn_path([[1.0, 1.0], [1.0, 1.0], [1.0, 2.0]]), [[0.0, 0.0], [0.0, 1.0]]
+    )
+    for bad in ([], [[0.0, 0.0]], [[0.0, 0.0, 1.0]], [[0.0, np.nan]]):
+        with pytest.raises(ValueError):
+            validate_drawn_path(bad)
+    with pytest.raises(ValueError):
+        drawn_path_from_payload({"camera_path": [[0, 0], [0, 1]]})
+    with pytest.raises(ValueError):
+        drawn_path_trajectory([[0, 0], [0, 1]], speed=0.0)
