@@ -69,12 +69,18 @@ def reference_dense_block(
     ffn_up_w, ffn_up_b, ffn_up_la, ffn_up_lb,
     ffn_down_w, ffn_down_b, ffn_down_la, ffn_down_lb,
 ):
-    """PyTorch BF16 runtime baseline for the 3 projections (with Q/K RMSNorm) + 2 FFN layers."""
-    q = bf16_linear(x, q_w, q_b, q_la, q_lb, norm_weight=q_norm_w)
-    k = bf16_linear(x, k_w, k_b, k_la, k_lb, norm_weight=k_norm_w)
-    v = bf16_linear(x, v_w, v_b, v_la, v_lb)
-    ffn_up = bf16_linear_activation(x, ffn_up_w, ffn_up_b, ffn_up_la, ffn_up_lb, activation="gelu_tanh")
-    ffn_down = bf16_linear(ffn_up, ffn_down_w, ffn_down_b, ffn_down_la, ffn_down_lb)
+    """PyTorch BF16 runtime baseline as used in SolarWM at HEAD:
+    - Q and K projections with fused Triton WanRMSNorm
+    - V projection with native oneDNN linear
+    - FFN Up projection with fused oneDNN linear + GELU(tanh)
+    - FFN Down projection with native oneDNN linear
+    - No LoRA branch (the baseline model has no LoRA)
+    """
+    q = bf16_linear(x, q_w, q_b, norm_weight=q_norm_w)
+    k = bf16_linear(x, k_w, k_b, norm_weight=k_norm_w)
+    v = bf16_linear(x, v_w, v_b)
+    ffn_up = bf16_linear_activation(x, ffn_up_w, ffn_up_b, activation="gelu_tanh")
+    ffn_down = bf16_linear(ffn_up, ffn_down_w, ffn_down_b)
     return q, k, v, ffn_down
 # [REFERENCE_END]
 
@@ -126,10 +132,13 @@ def execute_sycl_layer(
 
 
 def make_sycl_dense_block_fn(kernel_module):
-    """Build a callable for the full candidate SYCL dense block with fused FFN chaining."""
+    """Build a callable for the full candidate SYCL dense block with fused FFN chaining and fused QKV GEMM."""
     # Model-load preparation: Q/K/V/FFN-up share x, so their lora_a are concatenated once and
     # one prologue pass over x yields the INT4 activations and all four LoRA down projections.
     lora_a_cat_cache = {}
+    qkv_pack_cache = {}
+
+    has_qkv_fused = hasattr(kernel_module, "svdquant_w4a4_qkv_gemm")
 
     def sycl_dense_block(
         x,
@@ -144,11 +153,27 @@ def make_sycl_dense_block_fn(kernel_module):
             lora_a_cat_cache[key] = torch.cat((q_la, k_la, v_la, ffn_up_la)).contiguous()
         x_q, x_scales, x_lora = kernel_module.quantize_activation_int4(x, lora_a_cat_cache[key])
         r = q_la.shape[0]
-        x_lora_q, x_lora_k, x_lora_v, x_lora_up = (x_lora[:, i * r:(i + 1) * r] for i in range(4))
 
-        q = execute_sycl_layer(kernel_module, x_q, q_wq, q_ws, bias=q_b, lora_b=q_lb, norm_weight=q_norm_w, x_scales=x_scales, x_lora=x_lora_q)
-        k = execute_sycl_layer(kernel_module, x_q, k_wq, k_ws, bias=k_b, lora_b=k_lb, norm_weight=k_norm_w, x_scales=x_scales, x_lora=x_lora_k)
-        v = execute_sycl_layer(kernel_module, x_q, v_wq, v_ws, bias=v_b, lora_b=v_lb, x_scales=x_scales, x_lora=x_lora_v)
+        if has_qkv_fused:
+            pack_key = tuple(t.data_ptr() for t in (q_wq, k_wq, v_wq))
+            if pack_key not in qkv_pack_cache:
+                qkv_wq = torch.cat((q_wq, k_wq, v_wq), dim=0).contiguous()
+                qkv_ws = torch.cat((q_ws, k_ws, v_ws), dim=1).contiguous()
+                qkv_lb = torch.cat((q_lb, k_lb, v_lb), dim=0).contiguous()
+                qkv_b = torch.cat((q_b, k_b, v_b), dim=0).contiguous() if q_b is not None else None
+                qkv_pack_cache[pack_key] = (qkv_wq, qkv_ws, qkv_lb, qkv_b)
+            qkv_wq, qkv_ws, qkv_lb, qkv_b = qkv_pack_cache[pack_key]
+            x_lora_qkv = x_lora[:, :3 * r].contiguous()
+            q, k, v = kernel_module.svdquant_w4a4_qkv_gemm(
+                x_q, qkv_wq, qkv_ws, x_scales, qkv_lb, qkv_b, x_lora_qkv, q_norm_w, k_norm_w, 1e-5
+            )
+            x_lora_up = x_lora[:, 3 * r : 4 * r]
+        else:
+            x_lora_q, x_lora_k, x_lora_v, x_lora_up = (x_lora[:, i * r:(i + 1) * r] for i in range(4))
+            q = execute_sycl_layer(kernel_module, x_q, q_wq, q_ws, bias=q_b, lora_b=q_lb, norm_weight=q_norm_w, x_scales=x_scales, x_lora=x_lora_q)
+            k = execute_sycl_layer(kernel_module, x_q, k_wq, k_ws, bias=k_b, lora_b=k_lb, norm_weight=k_norm_w, x_scales=x_scales, x_lora=x_lora_k)
+            v = execute_sycl_layer(kernel_module, x_q, v_wq, v_ws, bias=v_b, lora_b=v_lb, x_scales=x_scales, x_lora=x_lora_v)
+
         ffn_up_res = execute_sycl_layer(
             kernel_module, x_q, ffn_up_wq, ffn_up_ws, bias=ffn_up_b, lora_b=ffn_up_lb,
             activation="gelu_tanh", x_scales=x_scales, x_lora=x_lora_up, fuse_quant_out=True
@@ -200,14 +225,16 @@ def load_reference_kernel():
 
 
 @pytest.fixture(scope="session")
-def kernel(use_reference):
+def kernel(use_reference, block_data):
     """Kernel fixture conforming to kernelfoundry interface:
 
-    When --ref is passed, returns the frozen current SYCL kernel baseline.
+    When --ref is passed, returns the SolarWM PyTorch BF16 fused dense block callable.
     Otherwise, returns the SYCL candidate dense block callable.
     """
     if use_reference:
-        return make_sycl_dense_block_fn(load_reference_kernel())
+        def ref_dense_block_fn(*sycl_args):
+            return reference_dense_block(*block_data["ref_args"])
+        return ref_dense_block_fn
     else:
         return make_sycl_dense_block_fn(importlib.import_module(extension_name(load_hparams())))
 
@@ -560,10 +587,13 @@ class TestWan22SvdquantDenseBlock(TestBase):
     def test_benchmark_dense_block_total(self, kernel, device, block_data, use_reference, measure_runtime_torch):
         """Target benchmark metric: Sum of 3 projections (Q/K RMSNorm, V) + 2 FFN layers (including gelu_tanh).
 
-        Reference: PyTorch native BF16 execution.
+        Reference: PyTorch native BF16 execution with SolarWM fused kernels (oneDNN + Triton RMSNorm).
         Kernel: Fused SVDQuant INT4 + BF16 LoRA execution with FFN chaining.
         """
-        measure_runtime_torch(kernel, device, args=block_data["sycl_args"])
+        if use_reference:
+            measure_runtime_torch(reference_dense_block, device, args=block_data["ref_args"])
+        else:
+            measure_runtime_torch(kernel, device, args=block_data["sycl_args"])
 
     @pytest.mark.performance
     def test_benchmark_projection_q(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
@@ -572,9 +602,9 @@ class TestWan22SvdquantDenseBlock(TestBase):
         p = block_data["q_p"]
         if use_reference:
             measure_runtime_torch(
-                reference_kernel.svdquant_w4a4_gemm, device,
-                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
-                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"], "norm_weight": p["norm_w"]}
+                bf16_linear, device,
+                args=(x, p["w_bf16"], p["bias"]),
+                kwargs={"norm_weight": p["norm_w"]}
             )
         else:
             q_fn = candidate_kernel.svdquant_w4a4_gemm
@@ -591,9 +621,8 @@ class TestWan22SvdquantDenseBlock(TestBase):
         p = block_data["v_p"]
         if use_reference:
             measure_runtime_torch(
-                reference_kernel.svdquant_w4a4_gemm, device,
-                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
-                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"]}
+                bf16_linear, device,
+                args=(x, p["w_bf16"], p["bias"]),
             )
         else:
             measure_runtime_torch(
@@ -609,9 +638,9 @@ class TestWan22SvdquantDenseBlock(TestBase):
         p = block_data["ffn_up_p"]
         if use_reference:
             measure_runtime_torch(
-                reference_kernel.svdquant_w4a4_gemm, device,
-                args=(x, p["w_dpas_b"], p["w_scale_dpas"]),
-                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"], "activation": "gelu_tanh"}
+                bf16_linear_activation, device,
+                args=(x, p["w_bf16"], p["bias"]),
+                kwargs={"activation": "gelu_tanh"}
             )
         else:
             up_fn = candidate_kernel.svdquant_w4a4_gemm
@@ -625,16 +654,14 @@ class TestWan22SvdquantDenseBlock(TestBase):
     def test_benchmark_ffn_down(self, kernel, device, block_data, use_reference, candidate_kernel, reference_kernel, measure_runtime_torch):
         """Benchmark FFN down-projection: M = 1215, K = 14336, N = 3072, rank 32."""
         h_bf16 = (torch.zeros((1215, 14336), dtype=torch.bfloat16, device=device)).contiguous()
-        h_q, h_scales = quantize_activation_int4(h_bf16, group_size=64)
         p = block_data["ffn_down_p"]
         if use_reference:
             measure_runtime_torch(
-                reference_kernel.svdquant_w4a4_gemm, device,
-                args=(h_q, p["w_dpas_b"], p["w_scale_dpas"]),
-                kwargs={"bias": p["bias"], "lora_a": p["lora_a"], "lora_b": p["lora_b"],
-                        "x_scales": h_scales, "x_bf16": h_bf16}
+                bf16_linear, device,
+                args=(h_bf16, p["w_bf16"], p["bias"]),
             )
         else:
+            h_q, h_scales = quantize_activation_int4(h_bf16, group_size=64)
             down_fn = candidate_kernel.svdquant_w4a4_gemm
             measure_runtime_torch(
                 down_fn, device,

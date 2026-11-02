@@ -13,13 +13,24 @@ import torch
 import torch.nn.functional as F
 
 try:
+    from solarwm.kernels.dit_fused import onednn_linear_gelu_tanh, triton_rmsnorm
+except ImportError:
+    triton_rmsnorm = None
+    onednn_linear_gelu_tanh = None
+
+try:
     from .qdq_utils import unpack_int4_signed, e8m0_to_f32, quantize_activation_int4
 except ImportError:
     from qdq_utils import unpack_int4_signed, e8m0_to_f32, quantize_activation_int4
 
 
 def wan_rmsnorm(x: torch.Tensor, weight: Optional[torch.Tensor] = None, eps: float = 1e-5) -> torch.Tensor:
-    """Wan2.2 RMSNorm: x * rsqrt(mean(x^2, dim=-1) + eps) * weight."""
+    """Wan2.2 RMSNorm: x * rsqrt(mean(x^2, dim=-1) + eps) * weight.
+
+    Uses Triton RMSNorm on XPU if available (matching SolarWM at HEAD).
+    """
+    if x.is_xpu and x.dtype == torch.bfloat16 and weight is not None and triton_rmsnorm is not None:
+        return triton_rmsnorm(x, weight, eps=eps)
     x_f32 = x.to(torch.float32)
     variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
     normed = x_f32 * torch.rsqrt(variance + eps)
@@ -55,7 +66,12 @@ def bf16_linear_activation(
     lora_b: Optional[torch.Tensor] = None,
     activation: str = "none",
 ) -> torch.Tensor:
-    """Reference BF16 Linear layer with fused activation epilogue."""
+    """Reference BF16 Linear layer with fused activation epilogue.
+
+    Uses oneDNN pointwise linear+GELU(tanh) on XPU if available (matching SolarWM at HEAD).
+    """
+    if activation == "gelu_tanh" and lora_a is None and lora_b is None and onednn_linear_gelu_tanh is not None and x.is_xpu:
+        return onednn_linear_gelu_tanh(x, weight, bias)
     out = bf16_linear(x, weight, bias, lora_a, lora_b)
     if activation == "gelu_tanh":
         return F.gelu(out, approximate="tanh")
@@ -73,13 +89,23 @@ def bf16_dense_block(
     v_w: torch.Tensor, v_b: Optional[torch.Tensor], v_la: Optional[torch.Tensor], v_lb: Optional[torch.Tensor],
     ffn_up_w: torch.Tensor, ffn_up_b: Optional[torch.Tensor], ffn_up_la: Optional[torch.Tensor], ffn_up_lb: Optional[torch.Tensor],
     ffn_down_w: torch.Tensor, ffn_down_b: Optional[torch.Tensor], ffn_down_la: Optional[torch.Tensor], ffn_down_lb: Optional[torch.Tensor],
+    include_lora: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Execute the full BF16 dense block: 3 projections (Q/K with RMSNorm, V) + 2 FFN layers."""
-    q = bf16_linear(x, q_w, q_b, q_la, q_lb, norm_weight=q_norm_w)
-    k = bf16_linear(x, k_w, k_b, k_la, k_lb, norm_weight=k_norm_w)
-    v = bf16_linear(x, v_w, v_b, v_la, v_lb)
-    ffn_up = bf16_linear_activation(x, ffn_up_w, ffn_up_b, ffn_up_la, ffn_up_lb, activation="gelu_tanh")
-    ffn_down = bf16_linear(ffn_up, ffn_down_w, ffn_down_b, ffn_down_la, ffn_down_lb)
+    """Execute the full BF16 dense block with SolarWM fused kernels:
+    3 projections (Q/K with Triton RMSNorm, V) + 2 FFN layers (FFN Up with oneDNN GELU tanh).
+    By default (include_lora=False), runs without LoRA, matching the SolarWM baseline.
+    """
+    la_q, lb_q = (q_la, q_lb) if include_lora else (None, None)
+    la_k, lb_k = (k_la, k_lb) if include_lora else (None, None)
+    la_v, lb_v = (v_la, v_lb) if include_lora else (None, None)
+    la_up, lb_up = (ffn_up_la, ffn_up_lb) if include_lora else (None, None)
+    la_down, lb_down = (ffn_down_la, ffn_down_lb) if include_lora else (None, None)
+
+    q = bf16_linear(x, q_w, q_b, la_q, lb_q, norm_weight=q_norm_w)
+    k = bf16_linear(x, k_w, k_b, la_k, lb_k, norm_weight=k_norm_w)
+    v = bf16_linear(x, v_w, v_b, la_v, lb_v)
+    ffn_up = bf16_linear_activation(x, ffn_up_w, ffn_up_b, la_up, lb_up, activation="gelu_tanh")
+    ffn_down = bf16_linear(ffn_up, ffn_down_w, ffn_down_b, la_down, lb_down)
     return q, k, v, ffn_down
 
 

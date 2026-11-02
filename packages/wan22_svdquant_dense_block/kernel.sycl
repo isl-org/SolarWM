@@ -394,7 +394,9 @@ struct GemmArgs {
     const float* q_smooth_inv;  // [N] multiplier applied before output quantization, or null
     float q_rho;                // output quantization clipping ratio
     float* row_sq;              // [M, N/64] or null
+    int row_sq_ld;              // row stride for row_sq
     int M, N, K, act;
+    bool is_qkv;
 };
 
 template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
@@ -402,14 +404,19 @@ class SVDQ_GEMM_int4;
 
 inline float quantize_tile8x64_bf16(sycl::sub_group sg, int lane, const u16x8 (&y16)[kTilesN],
                                     const float* sinv_col, int8_t* dst, size_t ld, int rows, float rho) {
+    float si[kTilesN];
+    #pragma unroll
+    for (int t = 0; t < kTilesN; ++t) {
+        si[t] = sinv_col ? sinv_col[16 * t + lane] : 1.0f;
+    }
+
     float amax[kTileM];
     #pragma unroll
     for (int m = 0; m < kTileM; ++m) {
         float mx = 0.0f;
         #pragma unroll
         for (int t = 0; t < kTilesN; ++t) {
-            const float si = sinv_col ? sinv_col[16 * t + lane] : 1.0f;
-            mx = sycl::fmax(mx, sycl::fabs(bf16_to_f32(y16[t][m]) * si));
+            mx = sycl::fmax(mx, sycl::fabs(bf16_to_f32(y16[t][m]) * si[t]));
         }
         amax[m] = mx;
     }
@@ -433,12 +440,13 @@ inline float quantize_tile8x64_bf16(sycl::sub_group sg, int lane, const u16x8 (&
             const float inv = inv_row[m];
             #pragma unroll
             for (int t = 0; t < kTilesN; ++t) {
-                const float si = sinv_col ? sinv_col[16 * t + lane] : 1.0f;
-                const uint32_t q = quant_nibble(bf16_to_f32(y16[t][m]) * si, inv);
+                const uint32_t q = quant_nibble(bf16_to_f32(y16[t][m]) * si[t], inv);
                 uint32_t w = q | (sycl::shift_group_left(sg, q, 1) << 4);
                 w |= sycl::shift_group_left(sg, w, 2) << 8;
                 w |= sycl::shift_group_left(sg, w, 4) << 16;
-                const uint32_t pick = sycl::select_from_group(sg, w, 8 * (lane & 1));
+                const uint32_t w0 = sycl::select_from_group(sg, w, 0);
+                const uint32_t w8 = sycl::select_from_group(sg, w, 8);
+                const uint32_t pick = (lane & 1) ? w8 : w0;
                 if ((lane >> 3) == half && ((lane & 7) >> 1) == t) d = pick;
             }
         }
@@ -457,10 +465,12 @@ inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8
         #pragma unroll
         for (int t = 0; t < kTilesN; ++t) {
             f32x8 up = {};
-            const uint16_t* b_row = p.lora_b + size_t(n0 + 16 * t + lane) * p.R;
+            const int col = n0 + 16 * t + lane;
+            const int kb_offset = p.is_qkv ? ((col / (p.N / 3)) * (p.R / 16)) : 0;
+            const uint16_t* b_row = p.lora_b + uint32_t(col) * uint32_t(p.R);
             for (int kb = 0; kb < p.R / 16; ++kb) {
                 const auto la = __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
-                    intptr_t(p.lora_act), p.R * 4 - 1, M - 1, p.lora_ld * 4 - 1, coord2{kb * 16, m0});
+                    intptr_t(p.lora_act), p.lora_ld * 4 - 1, M - 1, p.lora_ld * 4 - 1, coord2{(kb_offset + kb) * 16, m0});
                 u16x8 a;
                 #pragma unroll
                 for (int m = 0; m < kTileM; ++m) a[m] = f32_to_bf16(sycl::bit_cast<float>(la[m]));
@@ -510,7 +520,7 @@ inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8
         float total_row[kTileM];
         #pragma unroll
         for (int m = 0; m < kTileM; ++m) total_row[m] = sycl::reduce_over_group(sg, sq[m], sycl::plus<float>());
-        if (owner) p.row_sq[size_t(m0 + (lane >> 1)) * (N / kGroup) + ng] = total_row[lane >> 1];
+        if (owner) p.row_sq[size_t(m0 + (lane >> 1)) * p.row_sq_ld + ng] = total_row[lane >> 1];
     }
 }
 
@@ -537,8 +547,25 @@ void launch_gemm_impl(sycl::queue& q, const GemmArgs& p) {
             auto sg = item.get_sub_group();
             const int lane = item.get_local_id(1);
             const int sg_id = item.get_local_id(0);
-            const int wg_m = item.get_group(1) * sg_m + sg_id % sg_m;
-            const int wg_n = item.get_group(0) * sg_n + sg_id / sg_m;
+            // Work-group swizzling to improve L2/L3 cache locality for A and B.
+            const int num_groups_m = (grid_m + sg_m - 1) / sg_m;
+            const int num_groups_n = grid_n / sg_n;
+            const int raw_group_m = item.get_group(1);
+            const int raw_group_n = item.get_group(0);
+            
+            // Panel-based swizzle along M
+            constexpr int kSwizzleGroupM = 4;
+            const int linear_wg = raw_group_m * num_groups_n + raw_group_n;
+            const int pids_per_panel = kSwizzleGroupM * num_groups_n;
+            const int panel_id = linear_wg / pids_per_panel;
+            const int first_m = panel_id * kSwizzleGroupM;
+            const int panel_m_dim = sycl::min(num_groups_m - first_m, kSwizzleGroupM);
+            const int in_panel = linear_wg % pids_per_panel;
+            const int group_m = first_m + (in_panel % panel_m_dim);
+            const int group_n = in_panel / panel_m_dim;
+
+            const int wg_m = group_m * sg_m + sg_id % sg_m;
+            const int wg_n = group_n * sg_n + sg_id / sg_m;
             const int M = p.M, N = p.N, G = p.K / kGroup;
             const int m0 = wg_m * kTileM;
             const int n0 = wg_n * KF_N_TILE;
@@ -558,7 +585,8 @@ void launch_gemm_impl(sycl::queue& q, const GemmArgs& p) {
             const uint32_t b_stride = uint32_t(G) * 128u;
             const uint32_t* b_src = p.w_dpas_b + uint32_t(n0 / 16) * b_stride;
             const float* sw_ptr = p.w_scales_t + n0;
-            const float* xs_ptr = p.x_scales + size_t(sycl::min(m0 + (lane & (kTileM - 1)), M - 1)) * p.xs_row;
+            const uint32_t m_row = sycl::min(m0 + (lane & (kTileM - 1)), M - 1);
+            const float* xs_ptr = p.x_scales + uint32_t(m_row) * uint32_t(p.xs_row);
             auto s_w0 = block_load<float, kNT>(sg, sw_ptr);
             float s_x0 = *xs_ptr;
 
@@ -698,6 +726,45 @@ void launch_rmsnorm(sycl::queue& q, uint16_t* out, const float* row_sq, const ui
             using u16x16v = sycl::vec<uint16_t, 16>;
             for (int c = lane * 16; c < N; c += kSG * 16) {
                 auto* o = reinterpret_cast<u16x16v*>(out + size_t(row) * N + c);
+                const u16x16v y = *o;
+                const u16x16v nw = *reinterpret_cast<const u16x16v*>(w + c);
+                u16x16v r;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) r[i] = f32_to_bf16(bf16_to_f32(y[i]) * inv_rms * bf16_to_f32(nw[i]));
+                *o = r;
+            }
+        });
+}
+
+// Fused dual RMSNorm for Q and K slices of the fused QKV GEMM in a single kernel launch
+class RmsNormQkKernel;
+
+void launch_rmsnorm_qk(sycl::queue& q, uint16_t* out, int out_stride, const float* row_sq, int row_sq_stride, const uint16_t* w_q, const uint16_t* w_k, int M, int N_per, float eps) {
+    constexpr int kRowsPerWG = 16;
+    const int parts = N_per / kGroup;
+    const int total_rows = 2 * M;
+    q.parallel_for<RmsNormQkKernel>(
+        sycl::nd_range<1>(size_t((total_rows + kRowsPerWG - 1) / kRowsPerWG) * kRowsPerWG * kSG, kRowsPerWG * kSG),
+        syclex::properties{syclex::sub_group_size<kSG>},
+        [=](sycl::nd_item<1> item) {
+            auto sg = item.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int global_row = int(item.get_global_id(0) / kSG);
+            if (global_row >= total_rows) return;
+
+            const bool is_k = (global_row >= M);
+            const int row = is_k ? (global_row - M) : global_row;
+            uint16_t* out_slice = is_k ? (out + N_per) : out;
+            const float* row_sq_slice = is_k ? (row_sq + parts) : row_sq;
+            const uint16_t* w = is_k ? w_k : w_q;
+
+            float sq = 0.0f;
+            for (int j = lane; j < parts; j += kSG) sq += row_sq_slice[size_t(row) * row_sq_stride + j];
+            sq = sycl::reduce_over_group(sg, sq, sycl::plus<float>());
+            const float inv_rms = sycl::rsqrt(sq / float(N_per) + eps);
+            using u16x16v = sycl::vec<uint16_t, 16>;
+            for (int c = lane * 16; c < N_per; c += kSG * 16) {
+                auto* o = reinterpret_cast<u16x16v*>(out_slice + size_t(row) * out_stride + c);
                 const u16x16v y = *o;
                 const u16x16v nw = *reinterpret_cast<const u16x16v*>(w + c);
                 u16x16v r;
@@ -872,6 +939,7 @@ py::object torch_svdquant_w4a4_gemm(
         check_bf16(*norm_w_opt, "norm_weight");
         row_sq = torch::empty({M, N / kGroup}, opts.dtype(torch::kFloat32));
         p.row_sq = row_sq.data_ptr<float>();
+        p.row_sq_ld = N / kGroup;
     }
     if (bias_opt.has_value()) {
         check_bf16(*bias_opt, "bias");
@@ -888,12 +956,74 @@ py::object torch_svdquant_w4a4_gemm(
     p.N = N;
     p.K = K;
     p.act = parse_act(activation);
+    p.is_qkv = false;
     launch_gemm(q, p);
 
     if (norm_w_opt.has_value()) launch_rmsnorm(q, p.out, p.row_sq, bf16_ptr(*norm_w_opt), M, N, norm_eps);
 
     if (fuse_quant_out) return py::make_tuple(out, qout, oscales);
     return py::cast(out);
+}
+
+py::tuple torch_svdquant_w4a4_qkv_gemm(
+    torch::Tensor x,
+    torch::Tensor w_dpas_b,
+    torch::Tensor w_scales,
+    torch::Tensor x_scales,
+    torch::Tensor lora_b,
+    c10::optional<torch::Tensor> bias_opt,
+    torch::Tensor x_lora,
+    torch::Tensor norm_q_w,
+    torch::Tensor norm_k_w,
+    float norm_eps
+) {
+    sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+    const int M = x.size(0);
+    const int K = x.size(1) * 2;  // x is packed int8
+    const int N = w_dpas_b.size(0) * 16;  // e.g. 9216 (3072 * 3)
+    const int N_per = N / 3;             // 3072
+    const auto opts = x.options();
+
+    GemmArgs p{};
+    check_bf16(lora_b, "lora_b");
+    p.R = lora_b.size(1);
+    p.lora_act = x_lora.data_ptr<float>();
+    p.lora_ld = x_lora.stride(0);
+    p.lora_b = bf16_ptr(lora_b);
+
+    auto out = torch::empty({M, N}, opts.dtype(torch::kBFloat16));
+    auto row_sq = torch::empty({M, N / kGroup}, opts.dtype(torch::kFloat32));
+    p.row_sq = row_sq.data_ptr<float>();
+    p.row_sq_ld = N / kGroup;
+
+    if (bias_opt.has_value()) {
+        check_bf16(*bias_opt, "bias");
+        p.bias = bf16_ptr(*bias_opt);
+    }
+    p.x_q = x.data_ptr<int8_t>();
+    p.x_scales = x_scales.data_ptr<float>();
+    p.xs_row = x_scales.stride(0);
+    p.xs_group = x_scales.stride(1);
+    p.w_dpas_b = reinterpret_cast<const uint32_t*>(w_dpas_b.data_ptr<int32_t>());
+    p.w_scales_t = w_scales.data_ptr<float>();
+    p.out = reinterpret_cast<uint16_t*>(out.data_ptr<c10::BFloat16>());
+    p.M = M;
+    p.N = N;
+    p.K = K;
+    p.act = kActNone;
+    p.is_qkv = true;
+    launch_gemm(q, p);
+
+    // Apply fused RMSNorm to Q and K in a single kernel launch
+    check_bf16(norm_q_w, "norm_q_w");
+    check_bf16(norm_k_w, "norm_k_w");
+    const int row_sq_parts = N / kGroup;
+    launch_rmsnorm_qk(q, p.out, N, p.row_sq, row_sq_parts, bf16_ptr(norm_q_w), bf16_ptr(norm_k_w), M, N_per, norm_eps);
+
+    auto out_q = out.narrow(1, 0, N_per);
+    auto out_k = out.narrow(1, N_per, N_per);
+    auto out_v = out.narrow(1, 2 * N_per, N_per);
+    return py::make_tuple(out_q, out_k, out_v);
 }
 
 py::tuple torch_quantize_activation_int4(torch::Tensor x, c10::optional<torch::Tensor> lora_a,
@@ -927,6 +1057,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "amax * x_rho / 7 and LoRA-down projected on the fly) or packed INT4 with x_scales; "
           "x_lora = x @ lora_a^T (f32) may be supplied precomputed. The fused INT4 output "
           "quantizes out * out_smooth_inv with group scale amax * out_rho / 7.");
+    m.def("svdquant_w4a4_qkv_gemm", &torch_svdquant_w4a4_qkv_gemm,
+          py::arg("x"),
+          py::arg("w_dpas_b"),
+          py::arg("w_scales"),
+          py::arg("x_scales"),
+          py::arg("lora_b"),
+          py::arg("bias") = py::none(),
+          py::arg("x_lora") = py::none(),
+          py::arg("norm_q_w") = py::none(),
+          py::arg("norm_k_w") = py::none(),
+          py::arg("norm_eps") = 1e-5,
+          "Fused Q+K+V SVDQuant GEMM (N=9216): single launch with piecewise RMSNorm on Q and K.");
     m.def("quantize_activation_int4", &torch_quantize_activation_int4,
           py::arg("x"),
           py::arg("lora_a") = py::none(),

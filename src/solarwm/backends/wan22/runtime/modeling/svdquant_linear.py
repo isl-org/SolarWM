@@ -194,6 +194,9 @@ class SYCLSVDQuantLinear(nn.Module):
 
         if self.use_kernel(x):
             if self.shared_input is not None:
+                if getattr(self.shared_input, "fused_qkv_available", False):
+                    out = self.shared_input.get_member_out(x, x_2d, self)
+                    return out.view(*orig_shape[:-1], -1)
                 x_q, x_scales, x_lora = self.shared_input.get(x, x_2d, self)
                 out = self.kernel_module.svdquant_w4a4_gemm(
                     x_q, s.w_dpas_b, s.w_scales_dpas, x_scales=x_scales,
@@ -256,6 +259,55 @@ class SharedInputQuant:
         self._lora: torch.Tensor | None = None
         self._quant: dict[float, tuple[torch.Tensor, torch.Tensor]] = {}
         self._served: set[int] = set()
+
+        kern = members[0].kernel_module
+        self.fused_qkv_available = (
+            len(members) == 3
+            and kern is not None
+            and hasattr(kern, "svdquant_w4a4_qkv_gemm")
+            and members[0].norm is not None
+            and members[1].norm is not None
+            and members[2].norm is None
+        )
+        self._qkv_packed: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        self._qkv_outs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        if self.fused_qkv_available:
+            for set_name in members[0].sets.keys():
+                q_s, k_s, v_s = members[0].sets[set_name], members[1].sets[set_name], members[2].sets[set_name]
+                w_dpas_b = torch.cat([q_s.w_dpas_b, k_s.w_dpas_b, v_s.w_dpas_b], dim=0).contiguous()
+                w_scales_dpas = torch.cat([q_s.w_scales_dpas, k_s.w_scales_dpas, v_s.w_scales_dpas], dim=1).contiguous()
+                lora_b = torch.cat([q_s.lora_b, k_s.lora_b, v_s.lora_b], dim=0).contiguous()
+                bias = torch.cat([q_s.bias, k_s.bias, v_s.bias], dim=0).contiguous() if q_s.bias is not None else None
+                self._qkv_packed[set_name] = (w_dpas_b, w_scales_dpas, lora_b, bias)
+
+    def get_member_out(
+        self, x: torch.Tensor, x_2d: torch.Tensor, member: SYCLSVDQuantLinear
+    ) -> torch.Tensor:
+        set_name = member.set_mapping.get(member.current_bin, "set0")
+        if set_name not in member.sets:
+            set_name = next(iter(member.sets.keys()))
+        key = (x._version, member.current_bin, set_name)
+        if self._x is not x or self._key != key or member.shared_index in self._served:
+            self._x, self._key, self._quant, self._served = x, key, {}, set()
+            kern = member.kernel_module
+            smooth_inv = member.sets[set_name].smooth_inv
+            x_q, x_scales, self._lora = kern.quantize_activation_int4(
+                x_2d, self.lora_a_cat[set_name], smooth_inv=smooth_inv, rho=member.rho
+            )
+            w_dpas_b, w_scales_dpas, lora_b, bias = self._qkv_packed[set_name]
+            x_lora = self._lora[:, : 3 * self.rank].contiguous()
+            norm_q = self.members[0].norm.weight.to(torch.bfloat16).contiguous()
+            norm_k = self.members[1].norm.weight.to(torch.bfloat16).contiguous()
+            eps = float(self.members[0].norm.eps)
+            self._qkv_outs = kern.svdquant_w4a4_qkv_gemm(
+                x_q, w_dpas_b, w_scales_dpas, x_scales, lora_b, bias, x_lora, norm_q, norm_k, eps
+            )
+        idx = member.shared_index
+        out = self._qkv_outs[idx]
+        self._served.add(idx)
+        if len(self._served) == len(self.members):
+            self._x, self._key, self._lora, self._quant, self._qkv_outs, self._served = None, None, None, {}, None, set()
+        return out
 
     def get(
         self, x: torch.Tensor, x_2d: torch.Tensor, member: SYCLSVDQuantLinear
@@ -453,6 +505,11 @@ class SVDQuantModelManager:
                 continue
 
             qkv = [lin["self_attn.q"], lin["self_attn.k"], lin["self_attn.v"]]
+            for m, norm_attr in ((attn.q, "norm_q"), (attn.k, "norm_k")):
+                norm = getattr(attn, norm_attr)
+                if isinstance(norm, WanRMSNorm):
+                    m.norm = norm
+                    setattr(attn, norm_attr, nn.Identity())
             if all(
                 torch.equal(m.sets[name].smooth_inv, qkv[0].sets[name].smooth_inv)
                 for m in qkv[1:]
@@ -461,11 +518,6 @@ class SVDQuantModelManager:
                 shared = SharedInputQuant(qkv)
                 for i, m in enumerate(qkv):
                     m.shared_input, m.shared_index = shared, i
-            for m, norm_attr in ((attn.q, "norm_q"), (attn.k, "norm_k")):
-                norm = getattr(attn, norm_attr)
-                if isinstance(norm, WanRMSNorm):
-                    m.norm = norm
-                    setattr(attn, norm_attr, nn.Identity())
             block.ffn = SVDQuantFFN(lin["ffn.0"], lin["ffn.2"])
 
         del parsed
