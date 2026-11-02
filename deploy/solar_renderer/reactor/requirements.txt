@@ -2,12 +2,12 @@
 # `build.runtime_version` in reactor.yaml selects the Runtime release.
 
 # Native H3 encoder, transformer and causal LoRA loader.
-torch==2.8.0
+torch==2.13.0
 torchvision==0.23.0
 diffusers==0.40.0
 transformers==5.14.1
 peft==0.20.0
-accelerate>=1.14
+accelerate>=1.15.0
 safetensors>=0.8
 huggingface-hub>=1.25
 fsspec>=2024.6
@@ -23,7 +23,7 @@ quack-kernels==0.6.5
 # CPU media validation and configuration; Runtime shares these dependencies.
 numpy>=2
 PyYAML>=6
-Pillow>=11
+Pillow>=13.0.0
 av>=18
 
 # Flash Attention builds after torch is available.
