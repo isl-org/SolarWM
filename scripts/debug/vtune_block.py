@@ -17,8 +17,13 @@ import task  # noqa: E402
 
 km = importlib.import_module(task.extension_name(task.load_hparams()))
 data = task.block_data.__wrapped__(torch.device("xpu"))
-block = task.make_sycl_dense_block_fn(km)
-args = data["sycl_args"]
+mode = os.environ.get("MODE", "sycl")
+if mode == "ref":
+    block = lambda *_: task.reference_dense_block(*data["ref_args"])
+    args = ()
+else:
+    block = task.make_sycl_dense_block_fn(km)
+    args = data["sycl_args"]
 iters = int(os.environ.get("ITERS", "20"))
 
 if os.environ.get("LAYER") == "down":
