@@ -106,6 +106,24 @@ def pack_k(
     return res[0], res[1]
 
 
+def pack_k_into(
+    k: torch.Tensor,
+    k_mean: torch.Tensor,
+    k4: torch.Tensor,
+    k_scale: torch.Tensor,
+    row_offset: int,
+) -> None:
+    """``pack_k`` written into preallocated ``k4`` / ``k_scale`` window buffers at token ``row_offset``.
+
+    ``k_scale`` is ``[B, H, kv_pad]`` and ``k4`` ``[B, H, kv_pad / 16, D / 64, 8, 16]`` int32, with
+    ``kv_pad`` the padded length of the whole window; ``row_offset`` must be a multiple of 64.
+    """
+    mod = _get_module()
+    if mod is None:
+        raise RuntimeError("SageAttention v2 SYCL extension is not available.")
+    mod.pack_k_into(k, k_mean, k4, k_scale, row_offset)
+
+
 def compute_delta_s(
     k: torch.Tensor,
     k_mean: torch.Tensor,

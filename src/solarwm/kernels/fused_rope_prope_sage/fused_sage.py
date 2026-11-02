@@ -540,8 +540,9 @@ def _attend_int8(
     out = torch.empty_like(q)
     sparse = block_indices is not None and block_counts is not None
     max_blocks = int(block_indices.shape[-1]) if sparse else 1
-    indices = block_indices if sparse else torch.zeros((1,), dtype=torch.int32, device=q.device)
-    counts = block_counts if sparse else torch.zeros((1,), dtype=torch.int32, device=q.device)
+    # unread unless SPARSE; any device pointer will do
+    indices = block_indices if sparse else k_scale
+    counts = block_counts if sparse else k_scale
     _sage_attn_kernel[(triton.cdiv(qo_len, block_m), heads, batch)](
         q, k_int8, v, k_scale, out, indices, counts,
         q.stride(0), q.stride(1), q.stride(2),
@@ -640,15 +641,24 @@ def quantise_k(
     k: torch.Tensor,
     km: Optional[torch.Tensor] = None,
     block_n: int = SAGE_BLOCK_N,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Centre and quantise ``[B, H, L, D]`` K to int8 with one scale per block."""
+    """Centre and quantise ``[B, H, L, D]`` K to int8 with one scale per block.
+
+    ``out`` is an optional ``(k_int8, k_scale)`` pair of views to write into,
+    e.g. the tail of a persistent window buffer; ``k`` may be any view whose
+    last dimension is contiguous.
+    """
     batch, heads, kv_len, d = k.shape
     if km is None:
         km = k_window_mean(k)
     km = km.contiguous()
     blocks = triton.cdiv(kv_len, block_n)
-    k_scale = torch.empty((batch, heads, blocks), dtype=torch.float32, device=k.device)
-    k_int8 = torch.empty((batch, heads, kv_len, d), dtype=torch.int8, device=k.device)
+    if out is None:
+        k_scale = torch.empty((batch, heads, blocks), dtype=torch.float32, device=k.device)
+        k_int8 = torch.empty((batch, heads, kv_len, d), dtype=torch.int8, device=k.device)
+    else:
+        k_int8, k_scale = out
     _quantise_k_kernel[(blocks, heads, batch)](
         k, km, k_int8, k_scale,
         k.stride(0), k.stride(1), k.stride(2),

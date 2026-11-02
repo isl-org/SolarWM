@@ -357,9 +357,10 @@ void launch_quantize_k(sycl::queue &queue, const Element *k, const float *k_mean
 }
 
 template <typename Element, int HeadDim>
+// k4 / k_scale hold dst_pad tokens per head; the kv_pad packed rows land at token row_offset.
 void launch_pack_k(sycl::queue &queue, const Element *k, const float *k_mean,
                    uint32_t *k4, float *k_scale,
-                   int batch, int kv_len, int heads, int kv_pad) {
+                   int batch, int kv_len, int heads, int kv_pad, int dst_pad, int row_offset) {
   constexpr int CH = HeadDim / 16, G = HeadDim / 64, SGS = 8;
   const int blocks = (kv_pad / 16 + SGS - 1) / SGS;
   queue.submit([&](sycl::handler &h) {
@@ -389,8 +390,8 @@ void launch_pack_k(sycl::queue &queue, const Element *k, const float *k_mean,
           if ((int(it.get_group(1)) * SGS + sg_id) * 16 >= kv_pad) return;
           uint32_t w[16];
           const float amax = quantize_rows16(sg, x, w);
-          k_scale[int64_t(bh) * kv_pad + row0 + lane] = amax / 7.0f;
-          uint32_t *dst = k4 + (int64_t(bh) * (kv_pad / 16) + tile) * (G * 128);
+          k_scale[int64_t(bh) * dst_pad + row_offset + row0 + lane] = amax / 7.0f;
+          uint32_t *dst = k4 + (int64_t(bh) * (dst_pad / 16) + row_offset / 16 + tile) * (G * 128);
           if constexpr (CH == 8) {
             CUTLASS_PRAGMA_UNROLL
             for (int r = 0; r < 16; r += 4)
@@ -782,8 +783,26 @@ std::vector<torch::Tensor> pack_k(torch::Tensor k, torch::Tensor k_mean) {
                                   k_mean.data_ptr<float>(),
                                   reinterpret_cast<uint32_t *>(out[0].data_ptr()),
                                   out[1].data_ptr<float>(), batch,
-                                  kv_len, heads, kv_pad);
+                                  kv_len, heads, kv_pad, kv_pad, 0);
   return out;
+}
+// pack_k into existing k4 [B, H, dst_pad / 16, G, 8, 16] and k_scale [B, H, dst_pad] at row_offset.
+template <typename Element, int HeadDim>
+void pack_k_into(torch::Tensor k, torch::Tensor k_mean, torch::Tensor k4, torch::Tensor k_scale,
+                 int row_offset) {
+  const int batch = k.size(0), kv_len = k.size(1), heads = k.size(2);
+  const int kv_pad = round_up(kv_len, kKvAlign), dst_pad = k_scale.size(2);
+  TORCH_CHECK(k4.is_contiguous() && k_scale.is_contiguous(), "k4 and k_scale must be contiguous");
+  TORCH_CHECK(k4.size(0) == batch && k4.size(1) == heads && k4.size(2) * 16 == dst_pad,
+              "k4 must be [B, H, dst_pad / 16, G, 8, 16]");
+  TORCH_CHECK(row_offset % kKvAlign == 0 && row_offset + kv_pad <= dst_pad,
+              "row_offset must be aligned and the packed rows must fit");
+  launch_pack_k<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                  reinterpret_cast<const Element *>(k.data_ptr()),
+                                  k_mean.data_ptr<float>(),
+                                  reinterpret_cast<uint32_t *>(k4.data_ptr()),
+                                  k_scale.data_ptr<float>(), batch,
+                                  kv_len, heads, kv_pad, dst_pad, row_offset);
 }
 template <typename Element, int HeadDim>
 torch::Tensor compute_delta_s(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
@@ -897,6 +916,17 @@ std::vector<torch::Tensor> pack_k_entry(torch::Tensor k, torch::Tensor k_mean) {
   });
 }
 
+void pack_k_into_entry(torch::Tensor k, torch::Tensor k_mean, torch::Tensor k4, torch::Tensor k_scale,
+                       int64_t row_offset) {
+  TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
+  sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    sage::pack_k_into<E, D>(k, k_mean, k4, k_scale, static_cast<int>(row_offset));
+    return 0;
+  });
+}
+
 torch::Tensor compute_delta_s_entry(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
   TORCH_CHECK(k.is_xpu() && k.is_contiguous() && k.dim() == 4, "k must be contiguous [B,S,H,D] on XPU");
   return sage::dispatch(k.scalar_type(), k.size(3), [&](auto element, auto head_dim) {
@@ -926,6 +956,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("k_centre", &k_centre_entry, "Compute K centre [B, H, D]");
   module.def("quantize_k", &quantize_k_entry, "Quantize K to INT4, k_scale, and compute delta_s");
   module.def("pack_k", &pack_k_entry, "Quantize K to INT4 DPAS-B layout and compute k_scale");
+  module.def("pack_k_into", &pack_k_into_entry,
+             "pack_k into preallocated k4 / k_scale buffers at a token row offset");
   module.def("compute_delta_s", &compute_delta_s_entry, "Compute delta_s from k, k_mean, and q_mean");
   module.def("attention", &attention_entry, "Execute INT4 DPAS attention core given quantized inputs and BF16 V");
 }
