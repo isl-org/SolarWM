@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from importlib.machinery import EXTENSION_SUFFIXES
 import importlib.util
+import logging
 import os
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Sequence
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _MOD_NAME = "qconv_onednn_ops"
 _MODULE = None
@@ -138,6 +141,7 @@ def _get_module():
     if not module_path.exists():
         built = _build_extension(module_path)
         if not built or not module_path.exists():
+            logger.warning("qconv_onednn build failed (is icpx on PATH?); QuaRot falls back to the slower native oneDNN qconv.")
             return None
 
     try:
@@ -152,7 +156,8 @@ def _get_module():
         spec.loader.exec_module(mod)
         _MODULE = mod
         return _MODULE
-    except Exception:
+    except Exception as e:
+        logger.warning("qconv_onednn failed to load (%s); QuaRot falls back to the slower native oneDNN qconv.", e)
         return None
 
 
