@@ -23,8 +23,8 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.5'
       - run: python -m pip install -e '.[dev]'
-      - run: ruff check src tests tools
-      - run: ruff format --check src tests tools
+      - run: ruff check solar deploy tests tools skills eval/solar_renderer
+      - run: ruff format --check solar deploy tests tools skills eval/solar_renderer
       - run: pytest -q
       - name: Validate every example config
         run: |
@@ -33,11 +33,11 @@ jobs:
           import subprocess
           import sys
 
-          configs = sorted(Path("configs/examples").rglob("*.yaml"))
+          configs = sorted(Path("configs/solar_wm").rglob("*.yaml"))
           assert configs
           for config in configs:
               subprocess.run(
-                  [sys.executable, "-m", "solarwm", "config", "resolve", "--config", str(config)],
+                  [sys.executable, "-m", "solar", "config", "resolve", "--config", str(config)],
                   check=True,
                   stdout=subprocess.DEVNULL,
               )
@@ -48,8 +48,28 @@ jobs:
         run: |
           python - <<'PY'
           import glob
+          from pathlib import Path
           import tarfile
           import zipfile
+
+          # The realtime deployment needs its web, native RGB, and VAE
+          # assets in addition to Python modules, including in a source archive.
+          realtime_files = {
+              path.as_posix()
+              for path in Path("deploy/solar_wm").rglob("*")
+              if path.is_file() and path.suffix in {
+                  ".py", ".md", ".txt", ".json", ".sh", ".png",
+                  ".html", ".js", ".c", ".pt",
+              }
+          }
+          assert realtime_files
+          source_modules = {path.as_posix() for path in Path("solar").rglob("*.py")}
+          example_root = Path("examples/solar_wm")
+          example_files = {
+              path for path in example_root.rglob("*")
+              if path.is_file() and path.name in {"first.png", "prompt.txt"}
+          }
+          assert example_files
 
           wheels = glob.glob("dist/*.whl")
           sdists = glob.glob("dist/*.tar.gz")
@@ -59,25 +79,137 @@ jobs:
           with zipfile.ZipFile(wheels[0]) as archive:
               names = set(archive.namelist())
           required_wheel = {
-              "solarwm/backends/wan22/runtime/architectures/i2v_a14b.json",
-              "solarwm/backends/wan22/runtime/architectures/ti2v_5b.json",
-              "solarwm/backends/wan22/runtime/modeling/NOTICE.md",
+              "deploy/solar_wm/__init__.py",
+              "solar/examples/__init__.py",
+              "solar/backends/minimax_h3/segmented_attention.py",
+              "solar/renderer/render.py",
+              "solar/renderer/assets/encoder_contract.json",
+              "solar/renderer/assets/h3_silence_153_158_170.safetensors",
+              "solar/backends/wan22/runtime/architectures/i2v_a14b.json",
+              "solar/backends/wan22/runtime/architectures/ti2v_5b.json",
+              "solar/backends/wan22/runtime/modeling/NOTICE.md",
           }
+          required_wheel.update(realtime_files)
+          required_wheel.update(source_modules)
+          required_wheel.update(
+              "solar/examples/" + path.relative_to(example_root).as_posix()
+              for path in example_files
+          )
           assert required_wheel <= names, sorted(required_wheel - names)
+          assert not any(name.startswith("deploy/solar_wm/cases/") for name in names)
           assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
           assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
 
           with tarfile.open(sdists[0], "r:gz") as archive:
               names = {name.split("/", 1)[-1] for name in archive.getnames()}
           required_sdist = {
+              "assets/solar-logo.svg",
+              "assets/solar-logo-transparent.png",
+              "assets/solar-logo-dark.png",
+              "assets/solarwm-demo-poster.png",
+              "assets/solarwm-demo.gif",
+              "assets/solarrenderer-demo.gif",
+              "skills/solarrenderer-caption/SKILL.md",
+              "skills/solarrenderer-caption/scripts/conditions.py",
+              "skills/solarrenderer-caption/scripts/check.py",
+              "skills/solarrenderer-caption/scripts/first_frame.py",
+              "docs/solar_wm/environments.md",
+              "docs/solar_renderer/README.md",
+              "docs/solar_renderer/inference.md",
+              "docs/solar_renderer/prompts.md",
+              "docs/solar_renderer/training.md",
+              "deploy/solar_renderer/comfyui/__init__.py",
+              "deploy/solar_renderer/comfyui/web/index.html",
+              "deploy/solar_renderer/comfyui/web/wordmark.png",
+              "deploy/solar_renderer/comfyui/workflows/solarrenderer_full.json",
+              "deploy/solar_renderer/reactor/reactor.yaml",
+              "deploy/solar_renderer/reactor/solarrenderer_backend.py",
+              "deploy/solar_renderer/reactor/stage_source.py",
+              "deploy/solar_renderer/reactor/.dockerignore",
+              "deploy/solar_renderer/reactor/demo/package-lock.json",
+              "deploy/solar_renderer/reactor/demo/src/main.tsx",
+              "deploy/solar_renderer/reactor/demo/public/examples/highway/LICENSE",
+              "eval/solar_renderer/render_benchmark.py",
+              "eval/solar_renderer/setup.sh",
+              "configs/solar_renderer/control_lora.yaml",
+              "examples/solar_renderer/sem-highway_synthwave/prompt.txt",
               "CONTRIBUTING.md",
               "SECURITY.md",
-              "configs/examples/wan22_ti2v_5b/train_stage0p5_fm_81f.yaml",
+              "configs/solar_wm/wan22_ti2v_5b/train_stage0p5_fm_81f.yaml",
           }
+          required_sdist.update(realtime_files)
+          required_sdist.update(source_modules)
+          required_sdist.update(path.as_posix() for path in example_files)
+          required_sdist.add("examples/solar_wm/README.md")
+          required_sdist.add("deploy/solar_wm/.ruff.toml")
           assert required_sdist <= names, sorted(required_sdist - names)
+          assert not any(name.startswith("deploy/solar_wm/cases/") for name in names)
+          assert not any("/node_modules/" in name or "/.solarwm-source/" in name for name in names)
           PY
           python -m pip install --force-reinstall --no-deps dist/*.whl
           pushd /tmp
-          python -m solarwm --version
-          python -m solarwm config routes
+          python -m solar --version
+          solar --version
+          solarwm --version
+          python -m solar config routes
+          solar-renderer --help
+          python -m solar.renderer.training --help
+          python -m deploy.solar_wm.solarwm_web.configure --help
+          python - <<'PY'
+          from pathlib import Path
+          from deploy.solar_wm.solarwm_web.examples import bundled_cases
+
+          cases = bundled_cases()
+          assert cases
+          for case in cases.values():
+              image = Path(case["first"])
+              assert image.is_file()
+              assert image.parent.parent.name == "examples"
+              assert image.parent.parent.parent.name == "solar"
+          PY
           popd
+
+  renderer:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install -e '.[renderer]' pytest
+      - run: pytest -q tests/renderer
+
+  renderer-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: deploy/solar_renderer/reactor/demo/package-lock.json
+      - run: npm ci
+        working-directory: deploy/solar_renderer/reactor/demo
+      - run: npm run build
+        working-directory: deploy/solar_renderer/reactor/demo
+
+  reactor-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install 'reactor-runtime==3.8.3' 'numpy>=2.1' PyYAML Pillow 'av>=18' pytest
+      - run: PYTHONPATH=. python -m pytest tests/ -q
+        working-directory: deploy/solar_renderer/reactor
+      - run: python -m reactor_runtime.schema --path . --out /tmp/solar-renderer-schema.json
+        working-directory: deploy/solar_renderer/reactor

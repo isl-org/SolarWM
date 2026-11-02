@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from solarwm.backends.wan22.runtime.components import Wan5BVAE
-from solarwm.backends.wan22.runtime.modeling.vae import WanVAE_
+from solar.backends.wan22.runtime.components import Wan5BVAE
+from solar.backends.wan22.runtime.modeling.vae import WanVAE_
 
 
 def test_wanvae_clear_cache_before_preallocate() -> None:

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from solarwm.backends.minimax_h3.artifacts import (
+from solar.backends.minimax_h3.artifacts import (
     H3ArtifactBatch,
     H3CameraFilterError,
     H3PlanMultiplexer,
@@ -18,22 +18,22 @@ from solarwm.backends.minimax_h3.artifacts import (
     read_encoder_contract,
     validate_fixed_validation_rows,
 )
-from solarwm.backends.minimax_h3.distributed import (
+from solar.backends.minimax_h3.distributed import (
     contiguous_packed_bounds,
     logical_node_data_world_size,
 )
-from solarwm.backends.minimax_h3.fsdp import finite_clip_norm
-from solarwm.backends.minimax_h3.inference import _finite_generation_metrics
-from solarwm.backends.minimax_h3.lora import H3LoRARuntime
-from solarwm.backends.minimax_h3.preencode_runner import (
+from solar.backends.minimax_h3.fsdp import finite_clip_norm
+from solar.backends.minimax_h3.inference import _finite_generation_metrics
+from solar.backends.minimax_h3.lora import H3LoRARuntime
+from solar.backends.minimax_h3.preencode_runner import (
     H3_COMPLETE_PATH,
     H3_ENCODER_CONTRACT_PATH,
     H3_INDEX_PATH,
     H3_SILENCE_PATH,
     _published_rows,
 )
-from solarwm.backends.minimax_h3.raw_data import normalize_raw_source_windows
-from solarwm.backends.minimax_h3.runtime import (
+from solar.backends.minimax_h3.raw_data import normalize_raw_source_windows
+from solar.backends.minimax_h3.runtime import (
     _assert_encoder_silence_identity,
     _base_model_load_receipt,
     _base_model_profile,
@@ -42,10 +42,10 @@ from solarwm.backends.minimax_h3.runtime import (
     _publish_h3_validation_complete,
     _validation_schedule,
 )
-from solarwm.data import IndexRow, SamplingConfig
-from solarwm.data.sampling import SamplePlan
-from solarwm.errors import BackendContractError, DataContractError
-from solarwm.runtime import Topology
+from solar.data import IndexRow, SamplingConfig
+from solar.data.sampling import SamplePlan
+from solar.errors import BackendContractError, DataContractError
+from solar.runtime import Topology
 
 
 def test_h3_finite_generation_metrics_are_explicit() -> None:
@@ -160,7 +160,7 @@ def test_h3_loader_requires_explicit_weight_source(tmp_path) -> None:
 @pytest.mark.parametrize("stage", ["stage0p5", "stage1"])
 def test_h3_stage0p5_inference_loads_published_ema_and_checks_stage(tmp_path, stage) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.checkpoint import CheckpointTransaction
+    from solar.checkpoint import CheckpointTransaction
 
     values = {"block.lora_A.weight": torch.full((2, 2), 1.2345)}
     parameter = torch.zeros(2, 2, dtype=torch.bfloat16)
@@ -589,7 +589,11 @@ def test_worker_plan_multiplexer_is_round_robin_and_exactly_resumable() -> None:
     assert [plan.worker_id for plan in prefix] == [0, 1, 2, 3, 0]
     profile = {"schema": "test.h3-encoder.v1", "format": "h3.158f.v1"}
     state = first.state_dict(encoder_profile=profile)
+    preview = first.peek_plans(6)
+    assert len(preview) == 6
+    assert first.state_dict(encoder_profile=profile) == state
     expected = [first.next_plan().sample_id for _ in range(12)]
+    assert [plan.sample_id for plan in preview] == expected[:6]
     resumed = build()
     resumed.load_state_dict(state, encoder_profile=profile)
     assert [resumed.next_plan().sample_id for _ in range(12)] == expected
@@ -854,8 +858,8 @@ def test_h3_reader_treats_tensor_digest_as_offline_metadata(
 
     class Prefetcher:
         @staticmethod
-        def prepare(value: SamplePlan) -> None:
-            prepared.append(value)
+        def schedule_plans(values: tuple[SamplePlan, ...]) -> None:
+            prepared.extend(values)
 
     stream = object.__new__(H3PreencodedStream)
     stream.rows = (row,)
@@ -864,8 +868,11 @@ def test_h3_reader_treats_tensor_digest_as_offline_metadata(
     stream.plan = SimpleNamespace(
         next_plan=lambda: plan,
         current_plan_fingerprint="plan-fingerprint",
+        peek_plans=lambda count: (),
+        num_workers=1,
     )
     stream._shard_prefetcher = Prefetcher()
+    stream._prefetch_depth = 2
     stream.fixed_validation = False
     stream.camera_audit_latents = 47
 

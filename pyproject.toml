@@ -3,7 +3,7 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "solarwm"
+name = "solar"
 version = "0.1.0"
 description = "A reproducible multi-backbone framework for interactive video world models."
 readme = "README.md"
@@ -53,6 +53,23 @@ h3 = [
   "imageio==2.37.4",
   "imageio-ffmpeg==0.6.0",
 ]
+renderer = [
+  "torch>=2.8,<2.9",
+  "torchvision>=0.23,<0.24",
+  "diffusers==0.40.0",
+  "transformers==5.14.1",
+  "peft==0.20.0",
+  "accelerate>=1.14",
+  "safetensors>=0.8",
+  "huggingface_hub>=1.25",
+  "fsspec>=2024.6",
+  "einops>=0.8",
+  "numpy>=1.26,<2",
+  "av>=13.1",
+  "pillow>=11",
+  "imageio==2.37.4",
+  "imageio-ffmpeg==0.6.0",
+]
 ltx = [
   # The official ltx_core and ltx_pipelines modules are installed from LTX-2.
   "peft",
@@ -74,17 +91,27 @@ dev = [
 ]
 
 [project.scripts]
-solarwm = "solarwm.cli:main"
+solar = "solar.cli:main"
+solarwm = "solar.cli:main"
+solar-renderer = "solar.renderer.render:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# Keep example assets in one source location; wheels install them as resources.
+package-dir = {"solar" = "solar", "solar.examples" = "examples/solar_wm", "deploy.solar_wm" = "deploy/solar_wm"}
+include-package-data = false
 
 [tool.setuptools.package-data]
-"solarwm.backends.wan22.runtime.architectures" = ["*.json"]
-"solarwm.backends.wan22.runtime.modeling" = ["NOTICE.md"]
+"solar.renderer" = ["assets/*.json", "assets/*.safetensors"]
+"solar.examples" = ["*/first.png", "*/prompt.txt"]
+"deploy.solar_wm" = [
+  "README.md", "requirements.txt", "*.example.json", "launch.sh",
+]
+"deploy.solar_wm.solarwm_web" = [
+  "static/*.html", "static/*.js", "static/*.png",
+  "acceleration/*.json", "media/*.c", "vae/tables/*.json", "vae/tables/*.pt",
+]
+"solar.backends.wan22.runtime.architectures" = ["*.json"]
+"solar.backends.wan22.runtime.modeling" = ["NOTICE.md"]
 
 # flash-attn imports torch from setup.py.  Keep build isolation, but augment the
 # isolated build environment with the exact torch selected for the runtime.
@@ -102,3 +129,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve upstream evaluation prompts, metric descriptions, and math notation.
+"eval/solar_renderer/*.py" = ["E501", "E741"]

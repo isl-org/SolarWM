@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from solarwm.backends.wan22.generation import GenerationPass
-from solarwm.backends.wan22.runtime.stage2 import (
+from solar.backends.wan22.generation import GenerationPass
+from solar.backends.wan22.runtime.stage2 import (
     RoleCheckpointReceipt,
     Wan5BStage2Runtime,
     _Stage2InferenceMeasurements,
@@ -28,9 +28,9 @@ from solarwm.backends.wan22.runtime.stage2 import (
     stage2_camera_rollout,
     verify_role_checkpoint,
 )
-from solarwm.backends.wan22.sgf import RoleInitialization
-from solarwm.checkpoint import CheckpointTransaction
-from solarwm.errors import BackendContractError
+from solar.backends.wan22.sgf import RoleInitialization
+from solar.checkpoint import CheckpointTransaction
+from solar.errors import BackendContractError
 
 
 class _FakeScheduler:
@@ -725,7 +725,7 @@ def test_stage2_generated_sample_preserves_configured_denoising_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime import inference, stage2
+    from solar.backends.wan22.runtime import inference, stage2
 
     sentinel = [1000, 625, 250, 125]
     monkeypatch.setattr(
@@ -778,7 +778,7 @@ def test_stage2_long_generation_uses_streaming_vae_tiles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime import inference, stage2
+    from solar.backends.wan22.runtime import inference, stage2
 
     calls: list[int] = []
 
@@ -856,7 +856,7 @@ def test_stage2_camera_publication_adjusts_to_source_and_serializes_original_c2w
     expected_pad: int,
 ) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime import inference, stage2
+    from solar.backends.wan22.runtime import inference, stage2
 
     decoded = torch.arange(957, dtype=torch.float32).reshape(1, 957, 1, 1, 1)
     decoded = decoded.expand(-1, -1, 3, -1, -1).contiguous()
@@ -949,7 +949,7 @@ def test_stage2_hour_publication_selects_bounded_file_streaming(
     tmp_path: Path,
 ) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime import inference, stage2
+    from solar.backends.wan22.runtime import inference, stage2
 
     latent_frames = 1026
     model_frames = 1 + 4 * (latent_frames - 1)
@@ -1188,7 +1188,7 @@ def test_stage2_cuda_adapter_admits_multiple_logical_dp_groups(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime import stage2
+    from solar.backends.wan22.runtime import stage2
 
     class _Movable:
         def eval(self) -> _Movable:
@@ -1381,7 +1381,7 @@ def test_stage2_checkpoint_rejects_scheduler_progress_drift(tmp_path: Path) -> N
 
 def test_stage2_checkpoint_state_quiesces_reader_before_rng_capture() -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime.stage2 import _local_rng_state
+    from solar.backends.wan22.runtime.stage2 import _local_rng_state
 
     class Reader:
         quiesced = False
@@ -1403,7 +1403,7 @@ def test_stage2_checkpoint_state_quiesces_reader_before_rng_capture() -> None:
 
 def test_stage2_resume_rejects_runtime_state_without_reader_schema() -> None:
     torch = pytest.importorskip("torch")
-    from solarwm.backends.wan22.runtime.stage2 import _local_rng_state, _restore_rng_state
+    from solar.backends.wan22.runtime.stage2 import _local_rng_state, _restore_rng_state
 
     reader = _CheckpointReader()
     state = _local_rng_state(0, torch.device("cpu"), reader)
@@ -1421,7 +1421,7 @@ def test_stage2_resume_rejects_runtime_state_without_reader_schema() -> None:
 def test_stage2_inference_verifies_the_complete_pair_before_allocation(
     tmp_path: Path,
 ) -> None:
-    from solarwm.backends.wan22.runtime.stage2 import stage2_checkpoint_contract
+    from solar.backends.wan22.runtime.stage2 import stage2_checkpoint_contract
 
     config = _checkpoint_config(tmp_path)
     target = tmp_path / "checkpoint-000196"
@@ -1559,7 +1559,7 @@ def test_stage2_checkpoint_is_atomic_pair_and_exactly_resumable(
 
 
 def test_stage2_unified_runner_receives_the_runtime_provider(tmp_path: Path) -> None:
-    from solarwm.backends.wan22.runtime.stage2 import Wan5BStage2Runtime
+    from solar.backends.wan22.runtime.stage2 import Wan5BStage2Runtime
 
     seen: dict[str, object] = {}
 

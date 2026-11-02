@@ -8,15 +8,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from solarwm.backends import load_backend
-from solarwm.backends.minimax_h3.config import validate_h3_config
-from solarwm.config import load_config
-from solarwm.errors import ConfigurationError
+from solar.backends import load_backend
+from solar.backends.minimax_h3.config import validate_h3_config
+from solar.config import load_config
+from solar.errors import ConfigurationError
 
 ROOT = Path(__file__).resolve().parents[3]
-EXAMPLE = ROOT / "configs/examples/minimax_h3/stage0p5-158f-lora384-sp2.yaml"
-PREENCODE = ROOT / "configs/examples/minimax_h3/preencode-158f.yaml"
-INFER = ROOT / "configs/examples/minimax_h3/infer-158f-lora384-sp2.yaml"
+EXAMPLE = ROOT / "configs/solar_wm/minimax_h3/stage0p5-158f-lora384-sp2.yaml"
+PREENCODE = ROOT / "configs/solar_wm/minimax_h3/preencode-158f.yaml"
+INFER = ROOT / "configs/solar_wm/minimax_h3/infer-158f-lora384-sp2.yaml"
 
 
 def _config() -> dict[str, object]:
@@ -33,6 +33,19 @@ def test_example_resolves_to_exact_stable_contract() -> None:
     assert contract.adapter_rank == 384
     assert contract.camera_translation_transform == "logd4"
     assert resolved.values["data"]["gcs_prefetch_shards"] == 32
+
+
+@pytest.mark.parametrize(
+    "example",
+    (
+        "stage0p5-158f-lora384-sp2.yaml",
+        "stage1-158f-lora384-w6-sp2.yaml",
+        "stage2-158f-lora384-w6-sp4.yaml",
+    ),
+)
+def test_h3_training_examples_set_shuffle_buffer(example: str) -> None:
+    config = load_config(EXAMPLE.parent / example)
+    assert config.values["data"]["shuffle_buffer"] == 32768
 
 
 def test_h3_rejects_an_invalid_shard_prefetch_depth() -> None:
@@ -142,7 +155,7 @@ def test_backend_runtime_entries_delegate_lazily(monkeypatch: pytest.MonkeyPatch
     config = _config()
     backend = load_backend("minimax_h3")
     backend.validate_config(config)
-    from solarwm.backends.minimax_h3 import preencode_runner, runtime
+    from solar.backends.minimax_h3 import preencode_runner, runtime
 
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -213,7 +226,7 @@ def guarded(name, *args, **kwargs):
         raise AssertionError('H3 contract plugin imported torch')
     return real_import(name, *args, **kwargs)
 builtins.__import__ = guarded
-from solarwm.backends import load_backend
+from solar.backends import load_backend
 backend = load_backend('minimax_h3')
 assert backend.family == 'minimax_h3'
 """

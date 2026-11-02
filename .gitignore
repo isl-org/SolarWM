@@ -8,6 +8,7 @@ htmlcov/
 build/
 dist/
 .venv/
+.venv-*/
 .venv
 venv/
 # Backend images intentionally use incompatible torch/CUDA stacks; a single
@@ -18,9 +19,12 @@ runs/
 checkpoints/
 models/
 configs/**/*.local.yaml
+/demo/
+/tests/demo/
 *.pt
 *.pth
 *.safetensors
+!solar/renderer/assets/h3_silence_153_158_170.safetensors
 *.tar
 *.tar.gz
 *.part
@@ -30,3 +34,6 @@ hf_token.ps1
 packages/wan22_svdquant_dense_block/sycl-tla/
 src/solarwm/kernels/qconv_onednn/*.exp
 src/solarwm/kernels/qconv_onednn/*.lib
+solar/kernels/qconv_onednn/*.exp
+solar/kernels/qconv_onednn/*.lib
+/eval_models/
