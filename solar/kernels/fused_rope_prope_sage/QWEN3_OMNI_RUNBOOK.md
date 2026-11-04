@@ -183,9 +183,4 @@ Otherwise fall back to `sdpa_attention_forward`. The causal flag comes from `mod
    - Since the loop is vector-bound, look for instructions to remove from the always-executed path; moving work from XMX to vector units, or adding vector work per tile, makes it slower.
 3. **Remaining lengths** 2K–32K with the same harness.
 4. **Video-MME** long split with audio (101 GB download; needs a video loader).
-5. **Dense Qwen3-VL-8B-Instruct:**
-   - Same backend and harness, with a new loader and RULER data regenerated with its tokenizer.
-   - 32 Q heads / 8 KV heads, D=128, native 256K context.
-   - **128K** needs INT4 weights plus chunked prefill.
-   - **256K** additionally needs an INT8 KV cache (bf16 KV alone is 38.7 GB) and chunked prefill to bound Sage's dS buffer.
-   - Estimated 256K TTFT is about 4.7 min (SDPA) vs 2.8 min (Sage).
+5. **Dense Qwen3-VL-8B-Instruct up to 256K:** see `QWEN3_VL_256K_RUNBOOK.md`. It runs at the full 262,144-token context with INT4 weights, an INT8 KV cache and chunked prefill (TTFT 3.4 min with Sage, 4.2 min with the bf16 flash baseline).

@@ -1,0 +1,141 @@
+// bf16/fp16 flash attention (sycl-tla v0.8 XeFMHAFwdKernel, XeDefault mainloop) with a
+// bottom-right aligned causal mask and native GQA: the baseline for chunked prefill, where a
+// query chunk of length Sq attends to Skv >= Sq keys (query i sees keys j <= i + Skv - Sq).
+// Same work-group tiling as sage_causal.sycl, so the two differ only in the Q*K^T precision.
+// Causal calls need (Skv - Sq) to be a multiple of the key tile (see the check in forward_entry).
+//
+//   forward(q, k, v, is_causal=False) -> o      q [B,Sq,Hq,D], k/v [B,Skv,Hkv,D], contiguous
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
+#include <cute/tensor.hpp>
+#include <cutlass/kernel_hardware_info.hpp>
+#include <cutlass/util/packed_stride.hpp>
+#include <flash_attention_v2/collective/fmha_fusion.hpp>
+#include <flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp>
+#include <flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp>
+#include <flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp>
+#include <flash_attention_v2/kernel/xe_tile_scheduler.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#include <cmath>
+
+using namespace cute;
+
+// Build-unique outer namespace (see sage_causal.sycl).
+#define FLASH_NS_CAT2(a, b) a##_##b
+#define FLASH_NS_CAT(a, b) FLASH_NS_CAT2(a, b)
+#define FLASH_NS FLASH_NS_CAT(flash_ns, TORCH_EXTENSION_NAME)
+namespace FLASH_NS {
+namespace {
+
+template <int HeadDim> struct Tiles;
+template <> struct Tiles<128> {
+  using QK = Shape<_256, _32, _32>; using PV = Shape<_256, _32, _32>; using O = Shape<_256, _128>;
+  using SG = Layout<Shape<_16, _1, _1>>; static constexpr int VTiles = 4;
+};
+template <> struct Tiles<64> {
+  using QK = Shape<_128, _64, _32>; using PV = Shape<_128, _32, _64>; using O = Shape<_128, _64>;
+  using SG = Layout<Shape<_8, _1, _1>>; static constexpr int VTiles = 2;
+};
+
+template <typename Element, int HeadDim, bool Causal>
+void launch_fmha(sycl::queue &queue, const Element *q, const Element *k, const Element *v, Element *o,
+            int batch, int q_len, int kv_len, int heads_q, int heads_kv) {
+  using T = Tiles<HeadDim>;
+  using StrideQ = Stride<int, _1, int, int>;   // (seq, d, head, batch)
+  using StrideK = Stride<int, _1, int, int>;
+  using StrideV = Stride<_1, int, int, int>;   // (d, seq, head, batch)
+  using StrideO = Stride<int, _1, int, int>;
+  using MMAOperation = XE_DPAS_TT<8, float, Element>;
+  using TiledMMAQK = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<typename T::QK>, typename T::SG>::TiledMMA;
+  using SGLayoutPV = decltype(cutlass::fmha::collective::get_sg_layout_pv(typename T::SG{}));
+  using TiledMMAPV = typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<typename T::PV>, SGLayoutPV>::TiledMMA;
+
+  auto dummy = [](auto value, auto stride) {
+    return make_tensor(make_gmem_ptr(&value), make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+  };
+  using TensorQ = decltype(dummy(Element{}, StrideQ{}));
+  using TensorK = decltype(dummy(Element{}, StrideK{}));
+  using TensorV = decltype(dummy(Element{}, StrideV{}));
+  using TensorO = decltype(dummy(Element{}, StrideO{}));
+
+  using Mainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+      cutlass::fmha::XeDefault<2>, Causal, /*CachedKV=*/false, /*PagedKV=*/false,
+      TiledMMAQK, TiledMMAPV, T::VTiles, TensorQ, TensorK, TensorV, TensorK, TensorV>;
+  using Epilogue = cutlass::fmha::collective::FMHAFwdEpilogue<Mainloop, typename T::O, TensorO>;
+  using ProblemShape = cutlass::fmha::kernel::FMHAProblemShape<false>;
+  using Kernel = cutlass::fmha::kernel::XeFMHAFwdKernel<ProblemShape, Mainloop, Epilogue,
+                                                         cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
+
+  ProblemShape shape{batch, heads_q, heads_kv, q_len, kv_len, 0, HeadDim, HeadDim};
+  const int q_seq = heads_q * HeadDim, kv_seq = heads_kv * HeadDim;
+  cutlass::KernelHardwareInfo hw_info{0, cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0)};
+  typename Kernel::Arguments args{
+      {shape,
+       q, {q_seq, _1{}, HeadDim, q_len * q_seq},
+       k, {kv_seq, _1{}, HeadDim, kv_len * kv_seq},
+       v, {_1{}, kv_seq, HeadDim, kv_len * kv_seq},
+       o, {q_seq, _1{}, HeadDim, q_len * q_seq},
+       nullptr, {}, nullptr, {}},
+      {1.0f / std::sqrt(static_cast<float>(HeadDim))},
+      {},
+      hw_info};
+  auto params = Kernel::to_underlying_arguments(args, nullptr);
+  const auto grid = Kernel::get_grid_shape(params);
+  const auto block = Kernel::get_block_shape();
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  compat::experimental::launch_properties launch_props{syclex::work_group_scratch_size(Kernel::SharedStorageSize)};
+  compat::experimental::kernel_properties kernel_props{syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
+  compat::experimental::launch_policy policy{compat::dim3(grid.x, grid.y, grid.z), compat::dim3(block.x, block.y, block.z),
+                                            launch_props, kernel_props};
+  compat::experimental::launch<cutlass::device_kernel<Kernel>, Kernel>(policy, queue, params);
+}
+
+template <typename Element, int HeadDim>
+void dispatch_causal(bool causal, sycl::queue &queue, const Element *q, const Element *k, const Element *v, Element *o,
+                     int b, int sq, int skv, int hq, int hkv) {
+  if (causal) launch_fmha<Element, HeadDim, true>(queue, q, k, v, o, b, sq, skv, hq, hkv);
+  else launch_fmha<Element, HeadDim, false>(queue, q, k, v, o, b, sq, skv, hq, hkv);
+}
+
+torch::Tensor forward_entry(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool is_causal) {
+  TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu(), "inputs must be XPU tensors");
+  TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "inputs must be contiguous [B,S,H,D]");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.sizes() == k.sizes(), "expected q [B,Sq,Hq,D] and k, v [B,Skv,Hkv,D]");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(), "input dtypes must match");
+  TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16, "supports FP16 and BF16");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3) && q.size(2) % k.size(2) == 0,
+              "incompatible shapes (Q heads must be a multiple of KV heads)");
+  TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128, "head dimension must be 64 or 128");
+  TORCH_CHECK(!is_causal || k.size(1) >= q.size(1), "causal attention needs kv_len >= q_len (bottom-right aligned)");
+  // sycl-tla v0.8 applies the causal mask only on each sub-group's last KV tile, which is exact
+  // only when the diagonal offset is a multiple of the key tile (32 at D=128, 64 at D=64).
+  // Chunked prefill satisfies this when every chunk but the last is a multiple of the tile.
+  TORCH_CHECK(!is_causal || (k.size(1) - q.size(1)) % (q.size(3) == 64 ? 64 : 32) == 0,
+              "causal: kv_len - q_len must be a multiple of the key tile (32 for D=128, 64 for D=64)");
+  const int b = q.size(0), sq = q.size(1), hq = q.size(2), d = q.size(3), skv = k.size(1), hkv = k.size(2);
+  auto o = torch::empty_like(q);
+  auto &queue = c10::xpu::getCurrentXPUStream().queue();
+  auto run = [&](auto element) {
+    using E = decltype(element);
+    auto *qp = reinterpret_cast<const E *>(q.data_ptr()); auto *kp = reinterpret_cast<const E *>(k.data_ptr());
+    auto *vp = reinterpret_cast<const E *>(v.data_ptr()); auto *op = reinterpret_cast<E *>(o.data_ptr());
+    if (d == 128) dispatch_causal<E, 128>(is_causal, queue, qp, kp, vp, op, b, sq, skv, hq, hkv);
+    else dispatch_causal<E, 64>(is_causal, queue, qp, kp, vp, op, b, sq, skv, hq, hkv);
+  };
+  if (q.scalar_type() == torch::kHalf) run(cutlass::half_t{}); else run(cutlass::bfloat16_t{});
+  return o;
+}
+
+}  // namespace
+}  // namespace FLASH_NS
+using FLASH_NS::forward_entry;
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("forward", &forward_entry,
+             "bf16/fp16 flash attention, inputs [B,S,H,D]; is_causal is bottom-right aligned "
+             "(query i sees keys <= i + Skv - Sq); native GQA.",
+             pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("is_causal") = false);
+}
