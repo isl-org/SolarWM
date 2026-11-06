@@ -13,7 +13,7 @@ Last updated 2026-11-04. Companion runbook for the Qwen3-Omni work: `QWEN3_OMNI_
 - chunked prefill (4,096-token chunks), so attention buffers stay bounded;
 - two attention arms for prefill: **Sage** (`sage_causal.sycl`, smoothed INT4 Q·Kᵀ) and a **bf16 flash** baseline (`flash_causal.sycl`). Both use the same sycl-tla work-group tiling.
 
-Measured on one needle-in-a-haystack prompt per run (essay haystack, needle at 10% depth):
+Measured on one needle-in-a-haystack prompt per run (essay haystack, needle at 10% depth). The Sage rows used the **INT4 Q·Kᵀ** version of `sage_causal.sycl`; the current kernel is INT8 (see `QWEN3_OMNI_RUNBOOK.md` section 3: INT4 loses accuracy on long-context aggregation tasks, INT8 does not) and has not been re-measured here yet:
 
 | context | arm | TTFT | prefill attention | peak VRAM allocated / reserved | decode / token | needle |
 |---|---|---|---|---|---|---|
@@ -64,7 +64,7 @@ A prefill chunk of Sq queries attends to Skv ≥ Sq keys with a bottom-right ali
 
 | file | purpose |
 |---|---|
-| `sage_causal.sycl` | Sage kernel: smoothed INT4 Q·Kᵀ, bf16 P·V, bottom-right causal, native GQA (`QWEN3_OMNI_RUNBOOK.md` section 4) |
+| `sage_causal.sycl` | Sage kernel: smoothed INT8 Q·Kᵀ, bf16 P·V, bottom-right causal, native GQA (`QWEN3_OMNI_RUNBOOK.md` section 4) |
 | `flash_causal.sycl` | bf16 flash baseline, same API: `forward(q, k, v, is_causal=False)` on contiguous `[B,S,H,D]` |
 | `qwen3_vl/vl_attention.py` | transformers attention backend `vl_xpu` with arms `sage` / `flash` (`set_arm`), XPU-event timing of prefill attention, mask-free registration |
 | `qwen3_vl/vl_model.py` | INT4 loader, `Int8KVCache`, `prefill()` (chunked, last-position logits only), `greedy_decode()` |
@@ -121,11 +121,12 @@ Environment variables read by the scripts:
 
 ## 7. Next steps
 
-1. **Sage accuracy at 256K.**
+1. **Re-measure the Sage arm with the INT8 kernel** (64K / 128K / 256K ramp, then several needles and depths). The INT4 miss at 256K is consistent with the INT4 accuracy loss measured on Qwen3-Omni; the steps below apply if INT8 still misses.
+2. **Sage accuracy at 256K.**
    - Prefill with the flash arm. On the final chunk, also run Sage and compare its attention output with flash per layer (cosine / relative L2).
    - If one or two layers break down at 256K (on Qwen3-Omni, thinker layer 3 degraded with length: cosine 0.94 at 8K to 0.81 at 32K), keep those layers on flash. This costs little speed.
    - Then repeat the needle test at several depths and lengths.
-2. **Sage memory at 256K:** call `torch.xpu.empty_cache()` once per chunk (or per layer) in the Sage arm. Reserved memory then stays near the 27.9 GiB actually allocated instead of reaching the 30 GiB cap. Alternatively, preallocate Sage's per-call buffers at their 256K size.
-3. **RULER at 131,072 and 262,144 tokens:** regenerate the data with the Qwen3-VL tokenizer and chat template, using the same generator as the Omni harness (`QWEN3_OMNI_RUNBOOK.md` section 6.5). Budget 2–8 min per prompt and arm.
-4. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
-5. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.
+3. **Sage memory at 256K:** call `torch.xpu.empty_cache()` once per chunk (or per layer) in the Sage arm. Reserved memory then stays near the 27.9 GiB actually allocated instead of reaching the 30 GiB cap. Alternatively, preallocate Sage's per-call buffers at their 256K size.
+4. **RULER at 131,072 and 262,144 tokens:** regenerate the data with the Qwen3-VL tokenizer and chat template, using the same generator as the Omni harness (`QWEN3_OMNI_RUNBOOK.md` section 6.5). Budget 2–8 min per prompt and arm.
+5. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
+6. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.
