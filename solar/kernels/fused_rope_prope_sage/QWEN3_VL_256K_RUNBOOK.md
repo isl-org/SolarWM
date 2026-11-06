@@ -126,7 +126,7 @@ Environment variables read by the scripts:
    - Prefill with the flash arm. On the final chunk, also run Sage and compare its attention output with flash per layer (cosine / relative L2).
    - If one or two layers break down at 256K (on Qwen3-Omni, thinker layer 3 degraded with length: cosine 0.94 at 8K to 0.81 at 32K), keep those layers on flash. This costs little speed.
    - Then repeat the needle test at several depths and lengths.
-3. **Sage memory at 256K:** call `torch.xpu.empty_cache()` once per chunk (or per layer) in the Sage arm. Reserved memory then stays near the 27.9 GiB actually allocated instead of reaching the 30 GiB cap. Alternatively, preallocate Sage's per-call buffers at their 256K size.
+3. **Sage memory at 256K:** the current kernel no longer allocates the per-call dS buffer that grew with the key count (its per-call memory is Q8, K8, scales and output), which should remove most of the fragmentation; if reserved memory still approaches the cap, call `torch.xpu.empty_cache()` once per chunk (or per layer) in the Sage arm. Reserved memory then stays near the 27.9 GiB actually allocated instead of reaching the 30 GiB cap. Alternatively, preallocate Sage's per-call buffers at their 256K size.
 4. **RULER at 131,072 and 262,144 tokens:** regenerate the data with the Qwen3-VL tokenizer and chat template, using the same generator as the Omni harness (`QWEN3_OMNI_RUNBOOK.md` section 6.5). Budget 2–8 min per prompt and arm.
 5. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
 6. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.

@@ -48,13 +48,21 @@ Last updated 2026-11-04.
 | arm | TTFT | thinker attention | E2E | peak prefill VRAM | RULER |
 |---|---|---|---|---|---|
 | SDPA | 29.9 s | 19.5 s (79 TFLOPS) | 33.0 s | 26.9 GiB | 68.8 |
-| **Sage, INT8 Q·Kᵀ (current kernel)** | **23.5 s (1.27×)** | **12.9 s (1.51×)** | **26.6 s (1.24×)** | 27.9 GiB | **68.9** |
+| Sage, INT8 Q·Kᵀ with Q+K smoothing | 23.5 s (1.27×) | 12.9 s (1.51×) | 26.6 s (1.24×) | 27.9 GiB | 68.9 |
 | Sage, INT4 Q·Kᵀ (SageAttention2-4b recipe) | 20.7 s (1.45×) | 9.95 s (1.96×) | 24.0 s (1.38×) | 27.7 GiB | 61.4 |
 
 - Paired over 180 prompts: INT8 is +0.1 ± 2.4 RULER points vs SDPA (no measurable loss); INT4 is −7.4 ± 4.5.
 - INT4 loses most on tasks that aggregate across the whole context (cwe 42.7 → 16.7, qa_2 46.7 → 20.0, niah_multivalue 80 → 67); single-needle retrieval is unaffected. INT8 scores 39.3 / 46.7 / 83.3 on those three.
 - Decode runs on SDPA in both arms, so the E2E gain comes from prefill. Attention is 65% of SDPA's TTFT at 64K; below about 16K the INT4 MoE layers dominate and the end-to-end gain is small.
-- **Current kernel (register-pressure fix, output bit-identical to the swept kernel), 12 prompts, one per task:** TTFT 29.8 → 22.6 s (**1.32×**), thinker attention 19.4 → 11.9 s (**1.62×**), E2E 32.3 → 25.2 s (**1.28×**).
+
+**Current kernel: INT8 Q·Kᵀ with K smoothing only** (the SageAttention2 8-bit recipe; one 16-key block per Q·Kᵀ step). 12 prompts, one per RULER task (`omni_bench/logs/ruler_e2e_final.jsonl`):
+
+| arm | TTFT | thinker attention | E2E | peak prefill VRAM |
+|---|---|---|---|---|
+| SDPA | 29.8 s | 19.4 s | 32.3 s | 26.9 GiB |
+| **Sage (current)** | **21.8 s (1.37×)** | **11.3 s (1.72×)** | **24.4 s (1.32×)** | **26.9 GiB** |
+
+RULER for the current kernel was checked on the four tasks most sensitive to Q·Kᵀ error (cwe, qa_2, niah_multivalue, niah_multiquery; 60 prompts, `ruler_sweep64k_noqsm.jsonl`): 64.2 vs SDPA 64.8 (−0.7 ± 5.4) and vs INT8 with Q smoothing 65.7. Dropping Q smoothing removes the dS GEMM and a [Hq, S/256, S] fp32 buffer (1.9 GiB at 63K), so Sage needs no more VRAM than SDPA. A full 12-task sweep of the current kernel has not been run. Generation is not bit-reproducible run to run even on SDPA, so compare arms with paired statistics.
 
 **Why INT8:** on real post-RoPE activations captured at 64K (`omni_bench/scripts/capture_qkv.py`, `emulate_qk_quant.py`), attention-output cosine vs exact fp32:
 
@@ -62,8 +70,9 @@ Last updated 2026-11-04.
 |---|---|---|
 | INT4, per-token, Q+K smoothing (paper's 4-bit recipe) | 0.61 | 0.977–0.994 (worst heads 0.92–0.96) |
 | INT4, K smoothing only | 0.42–0.44 | 0.79–0.97 |
-| **INT8, per-token, Q+K smoothing (current kernel)** | **0.997** | **≥ 0.9998** |
+| INT8, per-token, Q+K smoothing | 0.997 | ≥ 0.9998 |
 | INT8, upstream recipe (Q per 32 rows, K per 64 tokens, K smoothing only) | 0.991 | ≥ 0.999 |
+| **INT8, per-token, K smoothing only (current kernel, measured on the real kernel)** | **0.992–0.994** | **≥ 0.9992** |
 
 The upstream SageAttention release ships only INT8 Q·Kᵀ kernels, and the paper's 8-bit variant matches full precision while the 4-bit one loses accuracy on several models; this matches what Qwen3-Omni shows at 64K.
 
@@ -71,14 +80,14 @@ The upstream SageAttention release ships only INT8 Q·Kᵀ kernels, and the pape
 
 | tokens | 8K | 16K | 32K | 63K |
 |---|---|---|---|---|
-| SDPA → Sage (INT8) | 6.37 → 4.61 ms | 27.4 → 18.2 ms | 108.9 → 72.7 ms | 417 → 268 ms |
-| speedup | 1.38× | 1.51× | 1.50× | 1.56× |
-| extra VRAM, SDPA → Sage | 64 → 134 MiB | 128 → 331 MiB | 256 → 918 MiB | 0.5 → 2.65 GiB |
+| SDPA → Sage (current) | 6.37 → 4.61 ms | 27.5 → 17.6 ms | 108.7 → 68.9 ms | 412 → 254 ms |
+| speedup | 1.38× | 1.56× | 1.58× | 1.62× |
+| extra VRAM, SDPA → Sage | 64 → 101 MiB | 128 → 202 MiB | 256 → 405 MiB | 0.48 → 0.78 GiB |
 
 **Accuracy on real activations** (`omni_bench/logs/accuracy_probe.json`, 3 OmniBench prompts + 8K/16K/32K text):
 
-- The top-1 next token matched SDPA on all 6 prompts; KL divergence ≤ 0.007.
-- Thinker attention cosine vs SDPA: mean 0.9999 over the 48 layers; the weakest layer (3) is 0.998 at 32K.
+- The top-1 next token matched SDPA on all 6 prompts; KL divergence ≤ 0.004.
+- Thinker attention cosine vs SDPA: mean ≥ 0.999 over the 48 layers; the weakest layer is ≥ 0.993.
 
 **Device peaks measured** (B70): bf16 GEMM 154 TFLOPS, int8 GEMM 291 TOPS, read 594 GB/s, add (2r+w) 812 GB/s. Memory benchmarks need random data; zero buffers get compressed and read about 2× too fast.
 
@@ -86,12 +95,12 @@ The upstream SageAttention release ships only INT8 Q·Kᵀ kernels, and the pape
 
 API: `forward(q, k, v, is_causal=False)`. Inputs are contiguous `[B,S,H,D]` tensors, fp16 or bf16, D = 64 or 128. Differences from the base kernel:
 
-0. **INT8 Q·Kᵀ instead of INT4:** Q and K are smoothed (K minus its mean, Q minus its 256-row block mean, with the exact dS correction), quantised per token to INT8 (absmax / 127, round half to even) and multiplied with `dpas.s8.s8.8.8`. Q8/K8 are stored as DPAS register images (G = D/32 channel groups); INT8 runs Q·Kᵀ at 2× the bf16 rate.
+0. **INT8 Q·Kᵀ instead of INT4:** K is smoothed (minus its sampled mean; exact, since q·k̄ is constant along a score row), Q and K are quantised per token to INT8 (absmax / 127, round half to even) and multiplied with `dpas.s8.s8.8.8`. Q8/K8 are stored as DPAS register images (G = D/32 channel groups); INT8 runs Q·Kᵀ at 2× the bf16 rate. No Q smoothing (see section 3).
 
 1. **Causal mask, bottom-right aligned:** query i sees keys j ≤ i + Skv − Sq. Each work-group stops at its diagonal KV tile, and the loop bound is per work-group because of the barrier-synced loop. Heavy Q blocks are launched first. Key 0 is always visible, so the online softmax never sees an all −inf row.
    - The −inf select is a separate, sub-group-uniform branch taken only on tiles that cross the sub-group's diagonal. Folded into the score expression, the compiler predicates it and issues 2 cmp + 1 sel per element on every tile.
-2. **dS by GEMM:** `quantize_k` only centres and quantises K (K8, k_scale). The correction term dS[qb, j] = q_mean[qb] · (K_j − k_mean) is one fp32 `at::bmm` per KV head, written straight into the dS layout; padded keys get −inf.
-3. **Native GQA:** K8/k_scale are per KV head and dS is per Q head; the attention kernel indexes KV head = h / (Hq/Hkv). There is no `repeat_kv`. In HF prefill, Q/K/V are already physically `[B,S,H,D]`, so the transposes are free views.
+2. **KV-tail mask:** keys beyond kv_len (the K8 tiles are padded to 64) get a shared per-key bias of −inf (0 for real keys), added to the score in the same FMA as the dequantisation.
+3. **Native GQA:** K8/k_scale are per KV head; the attention kernel indexes KV head = h / (Hq/Hkv). There is no `repeat_kv`. In HF prefill, Q/K/V are already physically `[B,S,H,D]`, so the transposes are free views.
 4. **Row sums of P** stay on DPAS (P × ones), fed from the P fragment in place.
 5. **Build-unique namespace:** the outer namespace is derived from the extension name, so two builds can be loaded in one process (KernelFoundry loads candidate and reference together) without sharing SYCL kernel names.
 6. **Numerics:** closer to fp32 SDPA than the original INT4 kernel on every test case (see section 3).
@@ -99,7 +108,7 @@ API: `forward(q, k, v, is_causal=False)`. Inputs are contiguous `[B,S,H,D]` tens
 **Performance character:** the KV loop is limited by vector (XVE) instruction issue, not by XMX or memory: about 510 always-executed instructions per 16×32 tile per sub-group, against 52 DPAS (16 INT8 Q·Kᵀ, 4 row-sum, 32 P·V). The main items are dequantisation, softmax, the P conversion to bf16, and the K8 loads.
 - **Register pressure:** Q8 stays in registers (32 GRF) next to the 128-GRF output accumulator, so Q·Kᵀ runs one 16-key block per step. Two blocks per step put all K8 operands (64 GRF) live and spill 2.2 KB (5% slower). Loading K8 group by group removes most of the remaining spill but exposes load latency (7% slower); deeper K8 prefetch has no effect. Check `//.spill size` in the IGC assembly dump: the build only warns above a threshold. `omni_bench/kernel/isa_hotpath.py` prints this mix from an IGC assembly dump (see `RUNBOOK_64K.md`); `unitrace` does not see this PyTorch build's kernels.
 
-**Still open:** the dS buffer is fp32 `[B, Hq, ceil(Sq/256), Skv_pad]`, about 1.9 GiB at 63K, and it grows as S². At 256K it would be about 34 GB. Sharing one Q mean across larger blocks shrinks it, but coarser smoothing lowers real-activation accuracy at thinker layer 3 (a 1024-row block failed the gate).
+**Memory:** per call the kernel needs Q8 (S × Hq × D bytes), K8, the per-token scales and the output; at 63K that is 0.78 GiB including the 0.48 GiB output. Nothing grows as S², so memory for chunked long-context prefill (Qwen3-VL at 256K) stays bounded.
 
 ## 5. Machine constraints
 
@@ -192,7 +201,8 @@ Otherwise fall back to `sdpa_attention_forward`. The causal flag comes from `mod
 
 0. **Reconcile with the upstream kernel.** Branch `xpu` updated `./sycl_tla_opt.sycl` (`23b7cac`: SageAttention v2 optimisations with in-place KV-cache packing, a staged `quantize_q` / `pack_k` / `attention` API). Our causal + GQA changes were made on the older version. Either port them (including INT8 Q·Kᵀ) onto the new kernel, or benchmark the two against each other.
 
-1. **INT8 kernel speed** (268 ms vs INT4's 224 ms at 63K). The remaining lever with a measurable gain is the upstream INT8 recipe without Q smoothing: it removes the dS GEMM (8 ms) and the 1.9 GiB dS buffer (which also matters for 256K chunked prefill), at a small accuracy cost on real activations (thinker layer 3 cosine 0.993 vs 0.997). Validate with the four weak RULER tasks (cwe, qa_2, niah_multivalue, niah_multiquery) before adopting.
+1. **Full 12-task 64K sweep of the current kernel** (about 1.3 h, Sage arm only; pair with the SDPA rows in `ruler_sweep64k_final.jsonl`) to narrow the RULER confidence interval to about ±2.5 points.
+   - **Research direction, INT4 accuracy:** learned orthogonal rotations of Q and K applied after RoPE (exact for Q·Kᵀ, absorbable into the quantise stage) could make INT4 Q·Kᵀ accurate enough; test offline on captured activations (`capture_qkv.py`, `emulate_qk_quant.py`) before any kernel work. Per-head mixed INT4/INT8 by sensitivity is the cheaper alternative.
 2. **Further kernel work**, only behind the gates in `RUNBOOK_64K.md` ("Working on the kernel"): local tests, KernelFoundry task gates, interleaved A/B (≥ 3% at 63K), real-activation accuracy probe.
    - KernelFoundry (`/home/gta/kf_sage_omni`) times its reference once per job or reuses a cached result, so its reported speedups can be inflated. Confirm every result with the local A/B before using it.
    - Since the loop is vector-bound, look for instructions to remove from the always-executed path; moving work from XMX to vector units, or adding vector work per tile, makes it slower.
