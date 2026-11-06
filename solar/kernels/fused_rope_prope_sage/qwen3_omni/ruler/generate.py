@@ -252,13 +252,29 @@ def cwe_words():
     return _cache["cwe_words"]
 
 
+def cwe_words_large():
+    """RULER's english_words.json (git-lfs object), used when a sample needs more distinct words than the
+    wonderwords lists hold (very long contexts)."""
+    if "cwe_words_large" not in _cache:
+        d = json.load(open(os.path.join(JSON_DIR, "english_words.json")))
+        if not isinstance(d, dict):
+            raise RuntimeError("english_words.json is a git-lfs pointer; fetch the object first")
+        w = sorted(set(d.values()))
+        random.Random(BASE_SEED).shuffle(w)
+        _cache["cwe_words_large"] = w
+    return _cache["cwe_words_large"]
+
+
 def cwe_gen(cfg, h, rng, L):
     a = cfg["args"]
     words = cwe_words()
 
     def example(num_words, rep_c, rep_u, num_c):
+        nonlocal words
         if num_words > len(words):
-            raise RuntimeError("cwe needs RULER english_words.json (git-lfs) for this size")
+            words = cwe_words_large()
+        if num_words > len(words):
+            raise RuntimeError(f"cwe needs {num_words} distinct words")
         full = rng.sample(words, num_words)
         common, uncommon = full[:num_c], full[num_c:]
         wl = common * int(rep_c) + uncommon * int(rep_u)
@@ -519,13 +535,18 @@ def generate_task(task, L, num_samples, counter):
 
 
 def main():
+    global TOKENIZER_ID
     ap = argparse.ArgumentParser()
     ap.add_argument("--lengths", type=int, nargs="+", default=ALL_LENGTHS)
     ap.add_argument("--tasks", nargs="+", default=ALL_TASKS)
     ap.add_argument("--num_samples", type=int, default=20)
     ap.add_argument("--out_dir", default=os.path.join(HERE, "data"))
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--tokenizer", default=TOKENIZER_ID,
+                    help="HF id or local dir whose tokenizer + chat template define the length fit "
+                         "(default: Qwen3-Omni; Qwen3-VL: the quantised checkpoint dir)")
     args = ap.parse_args()
+    TOKENIZER_ID = args.tokenizer
 
     parts = os.path.join(args.out_dir, "parts")
     os.makedirs(parts, exist_ok=True)
@@ -552,12 +573,13 @@ def main():
     # Merge per length, in canonical task order
     for L in args.lengths:
         out = os.path.join(args.out_dir, f"ruler_{L}.jsonl")
-        missing = [t for t in ALL_TASKS if not os.path.exists(os.path.join(parts, f"{t}_{L}.jsonl"))]
-        if missing:
-            print(f"not merging L={L}; missing parts: {missing}")
+        present = [t for t in ALL_TASKS if os.path.exists(os.path.join(parts, f"{t}_{L}.jsonl"))]
+        if not present:
             continue
+        if len(present) < len(ALL_TASKS):
+            print(f"L={L}: merging the {len(present)} generated tasks only: {present}")
         with open(out, "w") as fo:
-            for t in ALL_TASKS:
+            for t in present:
                 with open(os.path.join(parts, f"{t}_{L}.jsonl")) as fi:
                     fo.write(fi.read())
         print(f"wrote {out}")

@@ -168,6 +168,10 @@ def prefill(model, input_ids, cache, chunk=4096):
         ids = input_ids[:, p:p + chunk]
         cp = torch.arange(p, p + ids.shape[1], device=input_ids.device)
         out = model.model(input_ids=ids, past_key_values=cache, cache_position=cp, use_cache=True)
+        # Per-call attention buffers (Sage's K8 / scales) grow with the key count every chunk; the
+        # caching allocator cannot reuse the previous chunk's smaller blocks, and at 256K reserved
+        # memory reaches the VRAM cap. Returning them once per chunk costs one sync per 4K tokens.
+        torch.xpu.empty_cache()
     return model.lm_head(out.last_hidden_state[:, -1:])
 
 

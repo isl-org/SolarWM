@@ -2,7 +2,7 @@
 
 Use this to run, reproduce or extend the long-context Qwen3-VL work. Start a new session in this directory with:
 *"Read QWEN3_VL_256K_RUNBOOK.md and continue the Qwen3-VL 256K work."*
-Last updated 2026-11-04. Companion runbook for the Qwen3-Omni work: `QWEN3_OMNI_RUNBOOK.md`.
+Last updated 2026-11-06. Companion runbook for the Qwen3-Omni work: `QWEN3_OMNI_RUNBOOK.md`.
 
 ## 1. Summary
 
@@ -10,24 +10,25 @@ Last updated 2026-11-04. Companion runbook for the Qwen3-Omni work: `QWEN3_OMNI_
 
 - INT4 weights (W4A16, group 128) for the text decoder; the vision tower and `lm_head` stay bf16;
 - an INT8 KV cache with one scale per (token, KV head);
-- chunked prefill (4,096-token chunks), so attention buffers stay bounded;
-- two attention arms for prefill: **Sage** (`sage_causal.sycl`, smoothed INT4 Q·Kᵀ) and a **bf16 flash** baseline (`flash_causal.sycl`). Both use the same sycl-tla work-group tiling.
+- chunked prefill (4,096-token chunks) with `torch.xpu.empty_cache()` after each chunk;
+- two attention arms for prefill: **Sage** (`sage_causal.sycl`, smoothed INT8 Q·Kᵀ) and a **bf16 flash** baseline (`flash_causal.sycl`). Both use the same sycl-tla work-group tiling.
 
-Measured on one needle-in-a-haystack prompt per run (essay haystack, needle at 10% depth). The Sage rows used the **INT4 Q·Kᵀ** version of `sage_causal.sycl`; the current kernel is INT8 (see `QWEN3_OMNI_RUNBOOK.md` section 3: INT4 loses accuracy on long-context aggregation tasks, INT8 does not) and has not been re-measured here yet:
+Needle-in-a-haystack ramp, one prompt per length and arm (essay haystack, needle at 10% depth; `qwen3_vl/results/vl_ramp_int8.jsonl`, 256K rows with the per-chunk `empty_cache` in `vl_ramp_memfix.jsonl`):
 
 | context | arm | TTFT | prefill attention | peak VRAM allocated / reserved | decode / token | needle |
 |---|---|---|---|---|---|---|
-| 64K | Sage | 21.3 s | 9.1 s | 12.2 / 14.1 GiB | 185 ms | found |
-| 64K | flash | 24.6 s | 12.1 s | 12.1 / 12.3 GiB | 186 ms | found |
-| 128K | Sage | 62.3 s | 36.3 s | 17.4 / 25.1 GiB | 303 ms | found |
-| 128K | flash | 74.9 s | 48.1 s | 16.9 / 17.2 GiB | 303 ms | found |
-| 256K | Sage | **203.8 s** | 145.7 s (139 TFLOPS) | 27.9 / **30.0 GiB** | – | **missed** (first token was end-of-text) |
-| 256K | flash | **252.9 s** | 192.7 s (105 TFLOPS) | 26.5 / 26.8 GiB | 539 ms | found |
+| 64K | Sage | 21.9 s | 9.9 s | 12.1 / 12.3 GiB | 186 ms | found |
+| 64K | flash | 24.2 s | 11.9 s | 12.1 / 12.3 GiB | 185 ms | found |
+| 128K | Sage | 65.4 s | 39.7 s | 16.9 / 18.1 GiB | 302 ms | found |
+| 128K | flash | 74.4 s | 47.7 s | 16.9 / 17.2 GiB | 302 ms | found |
+| 256K | **Sage** | **216.4 s (1.16×)** | **158.9 s (1.20×)** | 26.5 / 27.0 GiB | 537 ms | found |
+| 256K | flash | 250.4 s | 190.5 s | 26.5 / 26.9 GiB | 534 ms | found |
 
-- 256K is feasible: with the flash arm the model retrieves the needle at the full context, with about 3.5 GiB of VRAM headroom.
-- Sage is 1.24–1.33× faster on prefill attention and 1.16–1.24× on TTFT. The INT4 linear layers take about 60 s of TTFT at 256K for both arms.
-- **Two open issues with Sage at 256K** (section 7): it missed the needle (one sample, so not yet a measured accuracy loss), and reserved VRAM reached the 30 GiB cap because of allocator fragmentation.
-- Throughput planning: one 256K prompt through both arms takes about 8 minutes. A RULER run with 12 tasks × 1 sample at 256K is about 1.6 h; 12 × 2 is about 3.2 h.
+- 256K fits with about 3 GiB of VRAM headroom in both arms.
+- Sage is about 1.20× faster on prefill attention at every length and 1.11–1.16× on TTFT. The bf16 flash baseline is strong here (about 107 TFLOPS on a 4K × 256K chunk), so the gain is smaller than on Qwen3-Omni, where the baseline was torch SDPA (about 80 TFLOPS).
+- The INT4 linear layers take about 58 s of TTFT at 256K in both arms.
+- Throughput planning: one 256K prompt through both arms takes about 8–9 minutes including decode; one 128K prompt about 3 minutes.
+- **RULER at 128K and 256K** (cwe, qa_2, niah_multivalue, niah_multiquery): see section 5.3. On the first 10 paired 128K prompts the two arms score identically (47.5 vs 47.5), with a median TTFT speedup of 1.13× and E2E 1.11×.
 
 ## 2. Model facts and memory budget
 
@@ -40,10 +41,12 @@ KV cache per token: 36 layers × 2 × 8 heads × 128 × 2 bytes = 144 KiB in bf1
 | weights: INT4 text decoder + bf16 embeddings, `lm_head`, vision | 6.75 GiB |
 | INT8 KV cache + per-(token, head) bf16 scales | 18.3 GiB |
 | bf16 dequant buffers for one layer's K and V (shared by all layers) | 1.0 GiB |
-| per-call transients: flash / Sage (Sage's dS buffer and centred-K GEMM temporaries grow with the key count) | 0.5 / 1.8 GiB |
-| **peak allocated: flash / Sage** | **26.5 / 27.9 GiB** |
+| per-call attention transients (Q8 / K8 / scales for Sage, workspace for flash) and activations | about 0.5 GiB |
+| **peak allocated (both arms)** | **26.5 GiB** |
 
 Combinations that do not fit: bf16 weights + INT8 KV (about 37 GiB), INT4 weights + bf16 KV (about 46 GiB).
+
+Sage's per-call buffers grow with the key count every chunk; without the per-chunk `empty_cache` the caching allocator strands the previous chunk's blocks and reserved memory reaches the 30 GiB cap at 256K (29.9 GiB reserved for 26.5 GiB allocated). With it, reserved stays at 27.0 GiB and TTFT is unchanged.
 
 ## 3. Attention for chunked prefill on XPU
 
@@ -56,19 +59,42 @@ A prefill chunk of Sq queries attends to Skv ≥ Sq keys with a bottom-right ali
 - **`flash_causal.sycl` is the bf16 baseline.** It wraps sycl-tla v0.8's `XeFMHAFwdKernel` (XeDefault mainloop, `CausalMask=true`), which has native GQA and the bottom-right mask, with the same tiling as `sage_causal.sycl`.
   - One 4,096-token chunk against 262,144 keys: 164 ms, 107 TFLOPS. Torch's fast kernel without a mask takes 200 ms.
   - **Constraint:** causal calls need (Skv − Sq) to be a multiple of the key tile (32 at D=128, 64 at D=64). sycl-tla applies the causal mask only on each sub-group's last KV tile, so a misaligned diagonal leaks future keys. The wrapper rejects misaligned calls. Chunked prefill always satisfies the constraint when every chunk except the last is a multiple of the tile.
-- **`sage_causal.sycl` handles chunks natively:** one 4,096-token chunk against 262,144 keys takes 121 ms (144 TFLOPS) with 1.7 GiB of transients.
+- **`sage_causal.sycl` handles chunks natively** (bottom-right mask, native GQA); see `QWEN3_OMNI_RUNBOOK.md` section 4 for its design.
 - **Decode** (q_len = 1) uses `F.scaled_dot_product_attention(..., enable_gqa=True)` for both arms. The default transformers SDPA path would expand K/V 4× for GQA (2 GiB per layer at 256K).
 - **No mask is ever materialised:** the backend registers a mask builder that returns `None`, and the kernels apply the causal mask themselves.
 
-## 4. Code in this folder
+## 4. INT4 Q·Kᵀ on Qwen3-VL (offline analysis)
+
+INT4 Q·Kᵀ would be about 9% faster on prefill attention than INT8 at 256K (the INT4 kernel measured 145.7 s vs INT8's 158.9 s), but on Qwen3-Omni it lost 7.4 RULER points at 64K. Real activations of all 36 layers were captured at 64K (`qwen3_vl/capture_vl_qkv.py`) and every scheme compared with exact fp32 attention (`emulate_vl_sensitivity.py`; `results/vl_sensitivity_64k.json`). Attention-output cosine, per layer mean / worst head:
+
+| scheme | range over the 36 layers | worst layer |
+|---|---|---|
+| INT8 (current kernel) | 0.998–0.9999 / ≥ 0.994 | L10 0.9982 |
+| INT4, K smoothing only | 0.71–0.98 / down to 0.33 | L10 0.712 |
+| INT4 + Q smoothing | 0.80–0.99 / down to 0.54 | L0 0.801 |
+| INT4 + Hadamard rotation of Q and K | 0.95–0.99 / down to 0.82 | L0 0.946 |
+| INT4 + Hadamard + Q smoothing (best INT4) | 0.983–0.997 / down to 0.86 | L0 0.963 |
+
+- No layer gets INT4 to INT8 level, so per-layer mixed precision only changes how much accuracy is traded. On Qwen3-Omni, INT4 at about 0.98–0.99 per layer already cost 7.4 RULER points.
+- **Learned rotations do not beat Hadamard.** Per-KV-head orthogonal rotations R = H·exp(A − Aᵀ), trained with straight-through rounding to maximise INT4 attention cosine (`learn_rotation.py`; `results/vl_rotation_qs.json`), scored 0.956 / 0.982 / 0.986 / 0.988 / 0.996 on held-out rows of layers 0 / 5 / 10 / 34 / 17, against Hadamard's 0.962 / 0.984 / 0.989 / 0.990 / 0.997.
+- The rotation is exact for Q·Kᵀ when applied after RoPE ((qR)(kR)ᵀ = qkᵀ), so a Hadamard-rotated INT4 kernel is possible; it would need a long-context accuracy check (RULER, section 5.3) before use.
+
+## 5. Code and reproduction
+
+### 5.1 Code in this folder
 
 | file | purpose |
 |---|---|
-| `sage_causal.sycl` | Sage kernel: smoothed INT8 Q·Kᵀ, bf16 P·V, bottom-right causal, native GQA (`QWEN3_OMNI_RUNBOOK.md` section 4) |
+| `sage_causal.sycl` | Sage kernel: smoothed INT8 Q·Kᵀ, bf16 P·V, bottom-right causal, native GQA |
 | `flash_causal.sycl` | bf16 flash baseline, same API: `forward(q, k, v, is_causal=False)` on contiguous `[B,S,H,D]` |
 | `qwen3_vl/vl_attention.py` | transformers attention backend `vl_xpu` with arms `sage` / `flash` (`set_arm`), XPU-event timing of prefill attention, mask-free registration |
-| `qwen3_vl/vl_model.py` | INT4 loader, `Int8KVCache`, `prefill()` (chunked, last-position logits only), `greedy_decode()` |
-| `qwen3_vl/mem_ramp.py` | needle-in-a-haystack ramp: TTFT, attention time, peak VRAM, decode time and needle retrieval for each length and arm; writes JSONL |
+| `qwen3_vl/vl_model.py` | INT4 loader, `Int8KVCache`, `prefill()` (chunked, per-chunk `empty_cache`, last-position logits only), `greedy_decode()` |
+| `qwen3_vl/mem_ramp.py` | needle-in-a-haystack ramp: TTFT, attention time, peak VRAM, decode time and needle retrieval per length and arm |
+| `qwen3_vl/bench_ruler_vl.py`, `summarize_ruler_vl.py` | RULER at 128K / 256K, flash vs Sage per prompt (resumable by tag), and its summary |
+| `qwen3_vl/capture_vl_qkv.py` | captures post-RoPE Q rows, Q block means and full K/V of every layer during a chunked prefill |
+| `qwen3_vl/qk_quant_lib.py`, `emulate_vl_sensitivity.py`, `learn_rotation.py` | Q·Kᵀ quantisation schemes (INT4/INT8, Q smoothing, rotations) on captured activations; learned rotations |
+| `qwen3_vl/results/` | ramp, sensitivity and rotation results |
+| `qwen3_omni/ruler/generate.py` | RULER generator; `--tokenizer` selects the tokenizer and chat template used for the length fit |
 
 Design notes:
 
@@ -78,9 +104,9 @@ Design notes:
 - **Prefill** calls `model.model(...)` per chunk with `cache_position`. The model computes its MRoPE position deltas on the first chunk and reuses them for later chunks. `lm_head` runs on the last position only.
 - **INT4 linears** use auto-round's `auto_round:tritonv2_zp` backend, pinned because `auto_round_kernel_xpu` uses AVX-512 host code and SIGILLs on this CPU. Small INT4 scale tensors are packed per layer to avoid allocator slack.
 
-## 5. Reproduce
+### 5.2 Setup and ramp
 
-Environment: `~/omni_env` (torch 2.14.1+xpu, transformers 5.22.1, auto-round 0.16.1); sycl-tla v0.8 headers in `/home/gta/sycl_tla_opt/third_party/sycl-tla-v0.8`. Machine safety rules are in `QWEN3_OMNI_RUNBOOK.md` section 5: run GPU jobs through `rss_guard.sh`, one GPU job at a time, and do not use `expandable_segments`.
+Environment: `~/omni_env` (torch 2.14.1+xpu, transformers 5.22.1, auto-round 0.16.1); sycl-tla v0.8 headers in `/home/gta/sycl_tla_opt/third_party/sycl-tla-v0.8`. The scripts expect the `omni_bench` workspace at `/home/gta/omni_bench` (restore steps in `qwen3_omni/README.md`; the Qwen3-VL scripts go to `omni_bench/vl8b/`). Machine safety rules are in `QWEN3_OMNI_RUNBOOK.md` section 5: run GPU jobs through `rss_guard.sh`, one GPU job at a time, and do not use `expandable_segments`.
 
 ```bash
 # 1. Weights: download the bf16 model (16.3 GiB), then quantise the text decoder (about 4 min on the B70)
@@ -98,35 +124,43 @@ bash $B/build.sh $B/build_flash $PWD/flash_causal.sycl flash_causal
 
 # 3. Ramp (about 20 min for 64K + 128K + 256K, both arms)
 cd /home/gta/omni_bench
-scripts/rss_guard.sh 24 logs/vl_ramp.log -- ./env.sh python \
-    /home/gta/SolarWM/solar/kernels/fused_rope_prope_sage/qwen3_vl/mem_ramp.py \
+scripts/rss_guard.sh 24 logs/vl_ramp.log -- ./env.sh python vl8b/mem_ramp.py \
     --lengths 65536 131072 262144 --arms sage flash --json logs/vl_ramp.jsonl
 grep -E "^ROW|OOM|rss_guard" logs/vl_ramp.log
 ```
 
-Environment variables read by the scripts:
+Environment variables read by the scripts: `QWEN3VL_INT4_DIR` (quantised checkpoint), `SAGE_BUILD_DIR` / `FLASH_BUILD_DIR` (kernel builds, default `omni_bench/kernel/build{,_flash}`), `HAYSTACK_JSONL` (RULER jsonl with `niah_single_2` rows, the essay source for the ramp).
 
-- `QWEN3VL_INT4_DIR`: quantised checkpoint.
-- `SAGE_BUILD_DIR`, `FLASH_BUILD_DIR`: kernel builds (default `omni_bench/kernel/build{,_flash}`).
-- `HAYSTACK_JSONL`: RULER jsonl with `niah_single_2` rows, used as the essay source.
+### 5.3 RULER at 128K and 256K
 
-`mem_ramp.py` options: `--chunk` (default 4096; keep it a multiple of 256), `--max-new` (decode tokens, default 16). Each length/arm run appends one JSON row (`ttft_s`, `attn_s`, `kv_cache_gib`, `peak_prefill_gib`, `peak_reserved_gib`, `tpot_ms`, `answer`, `correct`). An OOM is recorded as a row instead of aborting the ramp.
+Data: the four tasks most sensitive to Q·Kᵀ error on Qwen3-Omni (cwe, qa_2, niah_multivalue, niah_multiquery), fitted with the Qwen3-VL tokenizer and chat template. Buckets leave 2,048 tokens for generation: 129,024 (10 samples per task, 127–129K tokens) and 260,096 (3 samples per task, 256–259K tokens). cwe at 256K needs RULER's `english_words.json`, a git-lfs object (fetch it into `third_party/RULER/scripts/data/synthetic/json/` and check its SHA-256 against the pointer).
+
+```bash
+cd /home/gta/omni_bench/ruler; T=/home/gta/models/qwen3vl8b-w4a16/Qwen3-VL-8B-Instruct-w4g128
+../env.sh python generate.py --tokenizer $T --out_dir $PWD/data_vl --lengths 129024 \
+    --tasks cwe qa_2 niah_multivalue niah_multiquery --num_samples 10
+../env.sh python generate.py --tokenizer $T --out_dir $PWD/data_vl --lengths 260096 \
+    --tasks cwe qa_2 niah_multivalue niah_multiquery --num_samples 3
+cd ..
+# about 2 h (128K, 40 prompts x 2 arms) and 1.8 h (256K, 12 prompts x 2 arms); resumable by --tag
+nohup scripts/rss_guard.sh 24 logs/ruler_vl_128k.log -- ./env.sh python vl8b/bench_ruler_vl.py \
+    --lengths 129024 --per-task 10 --tag rvl128k > /dev/null 2>&1 &
+# then: --lengths 260096 --per-task 3 --tag rvl256k  (log ruler_vl_256k.log)
+python3 vl8b/summarize_ruler_vl.py rvl128k rvl256k     # per-task scores, paired diff + CI, speedups, VRAM
+```
+
+Each prompt runs through both arms (order alternating per sample; samples interleaved across tasks); rows go to `logs/ruler_vl_<tag>.jsonl` with TTFT, prefill attention time, E2E, decode time, peak VRAM, prediction and RULER score.
 
 ## 6. Known limitations
 
 - **Text only, batch 1.** The `vl_xpu` backend asserts batch 1 and no attention mask. Image/video inputs would also need the vision tower to run with its own attention (it is configured as `sdpa`), and MRoPE positions for the mixed sequence.
-- **Decode is slow at long context:** 539 ms/token at 256K, because every layer dequantises the whole INT8 cache on every token. This is acceptable for short answers (RULER); an attention kernel that reads INT8 K/V directly would remove the dequantisation.
+- **Decode is slow at long context:** about 535 ms/token at 256K, because every layer dequantises the whole INT8 cache on every token. This is acceptable for short answers (RULER); an attention kernel that reads INT8 K/V directly would remove the dequantisation.
 - **The flash baseline needs a tile-aligned diagonal offset** (section 3).
-- **Evidence so far is one needle prompt per length and arm**, not a benchmark.
+- **Generation is not bit-reproducible run to run** (seen on Qwen3-Omni even for the SDPA arm), so compare arms with paired statistics.
 
 ## 7. Next steps
 
-1. **Re-measure the Sage arm with the INT8 kernel** (64K / 128K / 256K ramp, then several needles and depths). The INT4 miss at 256K is consistent with the INT4 accuracy loss measured on Qwen3-Omni; the steps below apply if INT8 still misses.
-2. **Sage accuracy at 256K.**
-   - Prefill with the flash arm. On the final chunk, also run Sage and compare its attention output with flash per layer (cosine / relative L2).
-   - If one or two layers break down at 256K (on Qwen3-Omni, thinker layer 3 degraded with length: cosine 0.94 at 8K to 0.81 at 32K), keep those layers on flash. This costs little speed.
-   - Then repeat the needle test at several depths and lengths.
-3. **Sage memory at 256K:** the current kernel no longer allocates the per-call dS buffer that grew with the key count (its per-call memory is Q8, K8, scales and output), which should remove most of the fragmentation; if reserved memory still approaches the cap, call `torch.xpu.empty_cache()` once per chunk (or per layer) in the Sage arm. Reserved memory then stays near the 27.9 GiB actually allocated instead of reaching the 30 GiB cap. Alternatively, preallocate Sage's per-call buffers at their 256K size.
-4. **RULER at 131,072 and 262,144 tokens:** regenerate the data with the Qwen3-VL tokenizer and chat template, using the same generator as the Omni harness (`QWEN3_OMNI_RUNBOOK.md` section 6.5). Budget 2–8 min per prompt and arm.
-5. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
-6. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.
+1. **Finish and summarise the RULER runs** (section 5.3): per-task flash vs Sage at 128K and 256K, paired difference, and the end-to-end speedup.
+2. **INT4 + Hadamard + Q smoothing kernel**, only if RULER shows headroom worth chasing: the rotation is exact and can be fused into the quantise stage. Expected gain over INT8 is about 9% of prefill attention (about 5% of TTFT at 256K), and it needs the RULER check above to rule out the accuracy loss INT4 showed on Qwen3-Omni.
+3. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
+4. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.

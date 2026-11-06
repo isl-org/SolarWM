@@ -1,0 +1,62 @@
+[
+ {
+  "layer": 0,
+  "q_smooth": true,
+  "int8_mean": 0.99836,
+  "int4_mean": 0.7929,
+  "int4_had_mean": 0.96201,
+  "int4_learned_mean": 0.95555,
+  "int8_min": 0.9948,
+  "int4_min": 0.4967,
+  "int4_had_min": 0.8376,
+  "int4_learned_min": 0.8487
+ },
+ {
+  "layer": 5,
+  "q_smooth": true,
+  "int8_mean": 0.99902,
+  "int4_mean": 0.9619,
+  "int4_had_mean": 0.98381,
+  "int4_learned_mean": 0.9824,
+  "int8_min": 0.9956,
+  "int4_min": 0.811,
+  "int4_had_min": 0.9541,
+  "int4_learned_min": 0.9435
+ },
+ {
+  "layer": 10,
+  "q_smooth": true,
+  "int8_mean": 0.99822,
+  "int4_mean": 0.97243,
+  "int4_had_mean": 0.98886,
+  "int4_learned_mean": 0.98576,
+  "int8_min": 0.9947,
+  "int4_min": 0.9475,
+  "int4_had_min": 0.9742,
+  "int4_learned_min": 0.9646
+ },
+ {
+  "layer": 34,
+  "q_smooth": true,
+  "int8_mean": 0.99948,
+  "int4_mean": 0.97117,
+  "int4_had_mean": 0.98951,
+  "int4_learned_mean": 0.9876,
+  "int8_min": 0.9973,
+  "int4_min": 0.8687,
+  "int4_had_min": 0.9631,
+  "int4_learned_min": 0.9453
+ },
+ {
+  "layer": 17,
+  "q_smooth": true,
+  "int8_mean": 0.99993,
+  "int4_mean": 0.99215,
+  "int4_had_mean": 0.99674,
+  "int4_learned_mean": 0.99638,
+  "int8_min": 0.9998,
+  "int4_min": 0.9825,
+  "int4_had_min": 0.9925,
+  "int4_learned_min": 0.9921
+ }
+]

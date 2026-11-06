@@ -1,0 +1,2 @@
+{"length": 262144, "tokens": 262144, "arm": "sage", "chunk": 4096, "ttft_s": 216.35, "attn_s": 158.85, "kv_cache_gib": 19.31, "peak_prefill_gib": 26.52, "peak_reserved_gib": 26.96, "peak_total_gib": 26.52, "tpot_ms": 536.5, "answer": "7381946", "correct": true}
+{"length": 262144, "tokens": 262144, "arm": "flash", "chunk": 4096, "ttft_s": 250.44, "attn_s": 190.45, "kv_cache_gib": 19.31, "peak_prefill_gib": 26.52, "peak_reserved_gib": 26.87, "peak_total_gib": 26.52, "tpot_ms": 534.3, "answer": "7381946", "correct": true}
