@@ -467,9 +467,10 @@ struct Mainloop {
     const u32x8 ones(std::is_same_v<Element, cutlass::half_t> ? 0x3C003C00u : 0x3F803F80u);
     for (int kb = 0; kb < k_blocks; kb++) {
       barrier_arrive(ScopeWorkgroup);
-      /* GEMM 1: S = Q'_int8 K'_int8^T, then S = qs ks S + dS (log2 domain), in steps
-         of up to 32 keys so the K8 operands and INT32 results of a step die early */
-      constexpr int NBStep = NB < 2 ? NB : 2;
+      /* GEMM 1: S = Q'_int8 K'_int8^T, then S = qs ks S + dS (log2 domain), one 16-key block
+         per step: with two blocks per step the K8 operands (8 GRF per channel group) push the
+         loop past 256 GRF and it spills (2.2 KB, about 5% slower at 63K) */
+      constexpr int NBStep = 1;
       // Causal: only KV tiles that cross this sub-group's diagonal need the per-element mask.
       // The condition is uniform over the sub-group. Key 0 is visible to every row, so the
       // first tile always has a finite row max and fully masked later rows give P = 0.
