@@ -1,0 +1,728 @@
+// [EVOLVE_START]
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <cute/tensor.hpp>
+#include <flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp>
+#include <flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
+#include <cmath>
+using namespace cute;
+namespace {
+// ---------------------------------------------------------------------------
+// SageAttention2 smoothed INT4 Q*K^T inside the CUTLASS XeDefault flash
+// attention mainloop (P*V stays FP16/BF16 with FP32 accumulation).
+//
+//   K' = K - km                 km = per-(b, h) K centre (a sampled sequence mean);
+//                               q_i . km is constant along a score row, so
+//                               dropping it is exact.
+//   Q' = Q - qm[blk]            qm = mean over the QTile rows of the work-group.
+//   S  = qs_i ks_j (Q'_int4[i] . K'_int4[j]) + dS[blk, j],  dS = qm[blk] . K'_j
+//
+// Q' and K' are quantized per token to symmetric INT4 (absmax / 7, round half
+// to even). dS is exact FP32. log2(e) / sqrt(D) is folded into qs and dS, and
+// dS is -inf on padded keys, which masks the KV tail. On Xe2 one dpas.8.8 takes
+// the same time at any precision, so INT4 runs Q*K^T at 4x the FP16 rate.
+//
+// Q4 and K4 are stored as DPAS register images so one sub-group block read
+// fills an operand (G = HeadDim / 64 channel groups):
+//   Q4 [B, H, q_pad / 8,  G, 8 rows,   16 lanes] u16: lane l holds channels
+//      64 g + 4 l .. + 3 of each row (the INT4 A operand).
+//   K4 [B, H, kv_pad / 16, G, 8 dwords, 16 lanes] u32: lane n = key n of the
+//      16-key tile, dword d holds channels 64 g + 8 d .. + 7 (the B operand).
+// Nibbles are packed low channel first.
+// ---------------------------------------------------------------------------
+namespace sage {
+namespace syclex = sycl::ext::oneapi::experimental;
+namespace intelex = sycl::ext::intel::experimental;
+template <typename T, int N>
+using vec_t = T __attribute__((ext_vector_type(N)));
+using u16x8 = vec_t<uint16_t, 8>;
+using u32x8 = vec_t<uint32_t, 8>;
+using s32x8 = vec_t<int32_t, 8>;
+using f32x8 = vec_t<float, 8>;
+// d = a * b and d += a * b on 8 rows x 16 columns x 64 INT4 channels.
+inline void dpas_s4_first(s32x8 &d, u16x8 const &a, u32x8 const &b) {
+#ifdef __SYCL_DEVICE_ONLY__
+  asm("{\n"
+      ".decl DST v_type=G type=d num_elts=128 alias=<%0,0>\n"
+      ".decl SRC1 v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+      ".decl SRC2 v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+      "dpas.s4.s4.8.8 (M1, 16) DST.0 %%null.0 SRC1.0 SRC2(0,0)\n"
+      "}\n"
+      : "=rw"(d) : "rw"(a), "rw"(b));
+#endif
+}
+inline void dpas_s4(s32x8 &d, u16x8 const &a, u32x8 const &b) {
+#ifdef __SYCL_DEVICE_ONLY__
+  asm("{\n"
+      ".decl DST v_type=G type=d num_elts=128 alias=<%0,0>\n"
+      ".decl SRC1 v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+      ".decl SRC2 v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+      "dpas.s4.s4.8.8 (M1, 16) DST.0 DST.0 SRC1.0 SRC2(0,0)\n"
+      "}\n"
+      : "+rw"(d) : "rw"(a), "rw"(b));
+#endif
+}
+// d += a * b on 8 rows x 16 columns x 16 FP16 / BF16 channels.
+template <typename Element>
+inline void dpas_f16(f32x8 &d, u16x8 const &a, u32x8 const &b) {
+#ifdef __SYCL_DEVICE_ONLY__
+  if constexpr (std::is_same_v<Element, cutlass::half_t>)
+    asm("{\n"
+        ".decl DST v_type=G type=f num_elts=128 alias=<%0,0>\n"
+        ".decl SRC1 v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+        ".decl SRC2 v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+        "dpas.hf.hf.8.8 (M1, 16) DST.0 DST.0 SRC1.0 SRC2(0,0)\n"
+        "}\n"
+        : "+rw"(d) : "rw"(a), "rw"(b));
+  else
+    asm("{\n"
+        ".decl DST v_type=G type=f num_elts=128 alias=<%0,0>\n"
+        ".decl SRC1 v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+        ".decl SRC2 v_type=G type=UD num_elts=64 alias=<%1,0>\n"
+        "dpas.bf.bf.8.8 (M1, 16) DST.0 DST.0 SRC1.0 SRC2(0,0)\n"
+        "}\n"
+        : "+rw"(d) : "rw"(a), "rw"(b));
+#endif
+}
+// Lane l receives src[16 i + l] as element i.
+template <typename T, int N>
+inline vec_t<T, N> block_load(sycl::sub_group sg, const T *src) {
+  sycl::vec<T, N> v;
+  syclex::group_load(
+      sg, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                   sycl::access::decorated::no>(src),
+      v, syclex::properties{syclex::data_placement_striped, syclex::contiguous_memory,
+                            syclex::full_group});
+  vec_t<T, N> r;
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < N; i++) r[i] = v[i];
+  return r;
+}
+template <typename Element, int N>
+struct alignas(sizeof(Element) * N) Pack { Element v[N]; };
+// Work-group tiling of the CUTLASS FMHA XeDefault configuration.
+template <int HeadDim> struct Config;
+template <> struct Config<128> {
+  using QTile = _256; using KTile = _32; using SGs = _16;
+  using ShapePV = Shape<_256, _32, _32>; static constexpr int VTiles = 4;
+  using ShapeO = Shape<_256, _128>;
+};
+template <> struct Config<64> {
+  using QTile = _128; using KTile = _64; using SGs = _8;
+  using ShapePV = Shape<_128, _32, _64>; static constexpr int VTiles = 2;
+  using ShapeO = Shape<_128, _64>;
+};
+constexpr int kKvAlign = 64;     // kv_pad multiple: covers KTile and the 16-key K4 tiles
+constexpr int kStages = 2;       // K4 prefetch distance, in KV tiles
+inline int round_up(int x, int m) { return (x + m - 1) / m * m; }
+// round(x inv) + 8 for |x inv| <= 7: adding 1.5 * 2^23 + 8 rounds half to even
+// and leaves the result in the low mantissa bits. XOR with 8 turns it into the
+// two's complement nibble.
+inline uint32_t biased_nibble(float x, float inv) {
+  return sycl::bit_cast<uint32_t>(x * inv + 12582920.0f) & 0xFu;
+}
+// Lane t of the result holds op over all lanes of v[t] (a 16 x 16 transpose-reduce
+// in 15 shuffles).
+template <typename Op>
+inline float transpose_reduce16(sycl::sub_group const &sg, float (&v)[16], Op op) {
+  const int lane = sg.get_local_id()[0];
+  CUTLASS_PRAGMA_UNROLL
+  for (int s = 8; s >= 1; s /= 2) {
+    const bool upper = lane & s;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < s; i++) {
+      const float keep = upper ? v[i + s] : v[i];
+      const float send = upper ? v[i] : v[i + s];
+      v[i] = op(keep, sycl::permute_group_by_xor(sg, send, s));
+    }
+  }
+  return v[0];
+}
+// Quantize 16 rows x CH channels per lane (lane l owns channels CH l .. CH l + CH - 1)
+// per row: returns row (lane)'s absmax and leaves the packed nibbles of each row in w.
+template <int CH>
+inline float quantize_rows16(sycl::sub_group const &sg, float (&x)[16][CH], uint32_t (&w)[16]) {
+  float m[16];
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < 16; r++) {
+    m[r] = 0.0f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < CH; c++) m[r] = sycl::fmax(m[r], sycl::fabs(x[r][c]));
+  }
+  const float amax = transpose_reduce16(sg, m, [](float a, float b) { return sycl::fmax(a, b); });
+  const float inv_lane = amax > 0.0f ? 7.0f / amax : 0.0f;
+  CUTLASS_PRAGMA_UNROLL
+  for (int r = 0; r < 16; r++) {
+    const float inv = sycl::group_broadcast(sg, inv_lane, r);
+    w[r] = 0;
+    CUTLASS_PRAGMA_UNROLL
+    for (int c = 0; c < CH; c++) w[r] |= biased_nibble(x[r][c], inv) << (4 * c);
+    w[r] ^= CH == 8 ? 0x88888888u : 0x8888u;
+  }
+  return amax;
+}
+// Smooth a QTile-row block of Q with its mean, quantize per token, and store
+// the block mean for dS. Sub-group s owns rows 16 s .. 16 s + 15 of the block.
+template <typename Element, int HeadDim>
+void launch_quantize_q(sycl::queue &queue, const Element *q, uint16_t *q4, float *q_scale,
+                       float *q_mean, int batch, int q_len, int heads, int q_pad,
+                       float scale_log2) {
+  constexpr int CH = HeadDim / 16, G = HeadDim / 64;
+  constexpr int BQ = Config<HeadDim>::QTile::value, SGS = BQ / 16;
+  const int q_blocks = q_pad / BQ;
+  queue.submit([&](sycl::handler &h) {
+    sycl::local_accessor<float, 1> red(sycl::range<1>(SGS * HeadDim), h);
+    h.parallel_for(
+        sycl::nd_range<3>({size_t(batch) * heads, size_t(q_blocks), size_t(SGS * 16)},
+                          {1, 1, SGS * 16}),
+        syclex::properties{syclex::sub_group_size<16>, intelex::grf_size<256>},
+        [=](sycl::nd_item<3> it) {
+          const int bh = it.get_group(0), qb = it.get_group(1);
+          const int b = bh / heads, hd = bh % heads;
+          const int lid = it.get_local_id(2), sg_id = lid / 16, lane = lid % 16;
+          const auto sg = it.get_sub_group();
+          const int row0 = qb * BQ + sg_id * 16;
+          const int blk_rows = sycl::min(BQ, q_len - qb * BQ);
+          float x[16][CH];
+          float acc[CH] = {};
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++) {
+            // Clamped, branch-free loads keep all 16 rows in flight.
+            const bool valid = row0 + r < q_len;
+            const auto p = *reinterpret_cast<const Pack<Element, CH> *>(
+                q + ((int64_t(b) * q_len + sycl::min(row0 + r, q_len - 1)) * heads + hd) * HeadDim +
+                CH * lane);
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) {
+              x[r][c] = valid ? static_cast<float>(p.v[c]) : 0.0f;
+              acc[c] += x[r][c];
+            }
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) red[sg_id * HeadDim + CH * lane + c] = acc[c];
+          sycl::group_barrier(it.get_group());
+          float mean[CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) {
+            float s = 0.0f;
+            for (int i = 0; i < SGS; i++) s += red[i * HeadDim + CH * lane + c];
+            mean[c] = s / static_cast<float>(blk_rows);
+            if (sg_id == 0) q_mean[(int64_t(bh) * q_blocks + qb) * HeadDim + CH * lane + c] = mean[c];
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++)
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) x[r][c] = row0 + r < q_len ? x[r][c] - mean[c] : 0.0f;
+          uint32_t w[16];
+          const float amax = quantize_rows16(sg, x, w);
+          q_scale[int64_t(bh) * q_pad + row0 + lane] = amax / 7.0f * scale_log2;
+          // A operand word (g, lane a) holds channels 64 g + 4 a .. + 3, so with CH = 8
+          // this lane's word is the (g, a) = (l / 8, 2 (l % 8)) pair of u16 words.
+          uint16_t *dst = q4 + (int64_t(bh) * (q_pad / 8) + row0 / 8) * (G * 128);
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++) {
+            uint16_t *row = dst + (r / 8) * (G * 128) + (r % 8) * 16;
+            if constexpr (CH == 8)
+              *reinterpret_cast<uint32_t *>(row + (lane / 8) * 128 + 2 * (lane % 8)) = w[r];
+            else
+              row[lane] = uint16_t(w[r]);
+          }
+        });
+  });
+}
+// K centre: mean of one kMeanTile-row tile every kMeanStride rows (all rows when
+// kv_len < kMeanFull), the same estimate as the Triton Sage path. Any vector that
+// is constant across keys is an exact centre, since softmax ignores the shift.
+constexpr int kMeanStride = 512, kMeanTile = 64, kMeanFull = 2048;
+inline int k_centre_rows(int kv_len) {
+  return kv_len < kMeanFull ? kv_len
+                            : kv_len / kMeanStride * kMeanTile + sycl::min(kv_len % kMeanStride, kMeanTile);
+}
+template <typename Element, int HeadDim>
+void launch_k_centre(sycl::queue &queue, const Element *k, float *k_mean, int batch,
+                     int kv_len, int heads) {
+  constexpr int CH = HeadDim / 16, SGS = 16;
+  queue.submit([&](sycl::handler &h) {
+    sycl::local_accessor<float, 1> red(sycl::range<1>(SGS * HeadDim), h);
+    h.parallel_for(
+        sycl::nd_range<1>({size_t(batch) * heads * SGS * 16}, {SGS * 16}),
+        syclex::properties{syclex::sub_group_size<16>, intelex::grf_size<256>},
+        [=](sycl::nd_item<1> it) {
+          const int bh = it.get_group(0), b = bh / heads, hd = bh % heads;
+          const int lid = it.get_local_id(0), sg_id = lid / 16, lane = lid % 16;
+          const int n = k_centre_rows(kv_len);
+          const bool full = kv_len < kMeanFull;
+          float acc[CH] = {};
+          _Pragma("unroll 4")
+          for (int j = sg_id; j < n; j += SGS) {
+            const int row = full ? j : j / kMeanTile * kMeanStride + j % kMeanTile;
+            auto p = *reinterpret_cast<const Pack<Element, CH> *>(
+                k + ((int64_t(b) * kv_len + row) * heads + hd) * HeadDim + CH * lane);
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) acc[c] += static_cast<float>(p.v[c]);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) red[sg_id * HeadDim + CH * lane + c] = acc[c];
+          sycl::group_barrier(it.get_group());
+          if (lid < HeadDim) {
+            float s = 0.0f;
+            for (int i = 0; i < SGS; i++) s += red[i * HeadDim + lid];
+            k_mean[int64_t(bh) * HeadDim + lid] = s / static_cast<float>(n);
+          }
+        });
+  });
+}
+// Smooth K with its centre, quantize per token into K4, and compute
+// dS[qb, j] = q_mean[qb] . K'_j. Sub-group s owns the 16 keys of K4 tile
+// SGS blk + s; lane l owns channels CH l .. CH l + CH - 1 of each key.
+template <typename Element, int HeadDim>
+void launch_quantize_k(sycl::queue &queue, const Element *k, const float *k_mean,
+                       const float *q_mean, uint32_t *k4, float *k_scale, float *delta_s,
+                       int batch, int kv_len, int heads, int kv_pad, int q_blocks,
+                       float scale_log2) {
+  constexpr int CH = HeadDim / 16, G = HeadDim / 64, SGS = 8;
+  const int blocks = (kv_pad / 16 + SGS - 1) / SGS;
+  queue.submit([&](sycl::handler &h) {
+    sycl::local_accessor<float, 1> qm_slm(sycl::range<1>(q_blocks * HeadDim), h);
+    h.parallel_for(
+        sycl::nd_range<3>({size_t(batch) * heads, size_t(blocks), size_t(SGS * 16)},
+                          {1, 1, SGS * 16}),
+        syclex::properties{syclex::sub_group_size<16>, intelex::grf_size<256>},
+        [=](sycl::nd_item<3> it) {
+          const int bh = it.get_group(0), b = bh / heads, hd = bh % heads;
+          const int lid = it.get_local_id(2), sg_id = lid / 16, lane = lid % 16;
+          const auto sg = it.get_sub_group();
+          const int tile = sycl::min(int(it.get_group(1)) * SGS + sg_id, kv_pad / 16 - 1);
+          const int row0 = tile * 16;
+          float mean[CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int c = 0; c < CH; c++) mean[c] = k_mean[int64_t(bh) * HeadDim + CH * lane + c];
+          float x[16][CH];
+          CUTLASS_PRAGMA_UNROLL
+          for (int r = 0; r < 16; r++) {
+            // Clamped, branch-free loads keep all 16 rows in flight.
+            const bool valid = row0 + r < kv_len;
+            const auto p = *reinterpret_cast<const Pack<Element, CH> *>(
+                k + ((int64_t(b) * kv_len + sycl::min(row0 + r, kv_len - 1)) * heads + hd) * HeadDim +
+                CH * lane);
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) x[r][c] = valid ? static_cast<float>(p.v[c]) - mean[c] : 0.0f;
+          }
+          for (int i = lid; i < q_blocks * HeadDim; i += SGS * 16)
+            qm_slm[i] = q_mean[int64_t(bh) * q_blocks * HeadDim + i];
+          sycl::group_barrier(it.get_group());
+          // Sub-groups past the last tile recompute it but store nothing.
+          if ((int(it.get_group(1)) * SGS + sg_id) * 16 >= kv_pad) return;
+          uint32_t w[16];
+          const float amax = quantize_rows16(sg, x, w);
+          const bool lane_valid = row0 + lane < kv_len;
+          k_scale[int64_t(bh) * kv_pad + row0 + lane] = amax / 7.0f;
+          // B operand dword (g, d) of key n holds channels 64 g + 8 d .. + 7, so with
+          // CH = 8 this lane's words are dword l of every key: 16 consecutive u32.
+          uint32_t *dst = k4 + (int64_t(bh) * (kv_pad / 16) + tile) * (G * 128);
+          if constexpr (CH == 8) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r += 4)
+              *reinterpret_cast<sycl::vec<uint32_t, 4> *>(dst + lane * 16 + r) =
+                  sycl::vec<uint32_t, 4>(w[r], w[r + 1], w[r + 2], w[r + 3]);
+          } else {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r++) {
+              const uint32_t pair = w[r] | (sycl::shift_group_left(sg, w[r], 1) << 16);
+              if (lane % 2 == 0) dst[(lane / 2) * 16 + r] = pair;
+            }
+          }
+          for (int qb = 0; qb < q_blocks; qb++) {
+            float part[16];
+            float qm[CH];
+            CUTLASS_PRAGMA_UNROLL
+            for (int c = 0; c < CH; c++) qm[c] = qm_slm[qb * HeadDim + CH * lane + c];
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 16; r++) {
+              part[r] = 0.0f;
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < CH; c++) part[r] = sycl::fma(qm[c], x[r][c], part[r]);
+            }
+            const float ds = transpose_reduce16(sg, part, sycl::plus<float>{});
+            delta_s[(int64_t(bh) * q_blocks + qb) * kv_pad + row0 + lane] =
+                lane_valid ? ds * scale_log2 : -INFINITY;
+          }
+        });
+  });
+}
+// The CUTLASS XeDefault FMHA mainloop with GEMM 1 on INT4 DPAS. TiledMMAQK is
+// only used for the layout of the S fragment; P*V and the epilogue are the
+// CUTLASS FP16 / BF16 ones.
+template <typename Element, int HeadDim>
+struct Mainloop {
+  using Cfg = Config<HeadDim>;
+  using MMAOperation = XE_DPAS_TT<8, float, Element>;
+  using SubgroupLayoutQK = Layout<Shape<typename Cfg::SGs, _1, _1>>;
+  using TiledMMAQK = typename TiledMMAHelper<
+      MMA_Atom<MMAOperation>, Layout<Shape<typename Cfg::QTile, typename Cfg::KTile, _32>>,
+      SubgroupLayoutQK>::TiledMMA;
+  using SubgroupLayoutPV = decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
+  using TiledMMAPV = typename TiledMMAHelper<
+      MMA_Atom<MMAOperation>, Layout<typename Cfg::ShapePV>, SubgroupLayoutPV>::TiledMMA;
+  using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
+  using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
+  static constexpr int VTiles = Cfg::VTiles;
+  static constexpr int QTile = get<0>(TileShapeQK{});
+  static constexpr int KTile = get<1>(TileShapeQK{});
+  static constexpr int SGPerWG = Cfg::SGs::value;
+  static constexpr int G = HeadDim / 64;   // INT4 DPAS steps per head
+  static constexpr int NB = KTile / 16;    // 16-key DPAS column blocks per KV tile
+  using TensorV2D = decltype(make_tensor(make_gmem_ptr(static_cast<Element *>(nullptr)),
+                                         make_layout(make_shape(0, 0), make_stride(_1{}, 0))));
+  using TensorO2D = decltype(make_tensor(make_gmem_ptr(static_cast<Element *>(nullptr)),
+                                         make_layout(make_shape(0, 0), make_stride(0, _1{}))));
+  using TiledCopyV = decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV2D{}));
+  template <typename TiledMMA>
+  using FragC = decltype(TiledMMA{}.get_slice(0).partition_sg_fragment_C(
+      make_identity_tensor(select<0, 1>(TiledMMA{}.tile_mnk()))));
+  using FragS = FragC<TiledMMAQK>;
+  using FragP = decltype(TiledMMAPV{}.get_slice(0).partition_sg_fragment_A(
+      make_identity_tensor(take<0, 2>(TileShapeQK{}))));
+  using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
+  using SingleFragA = FragC<TiledMMAPV>;
+  using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;
+  using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
+  using ElementA = typename TiledMMAPV::ValTypeD;
+  // S (and P) element nb * 16 + mb * 8 + r of lane l is (row 8 mb + r, key
+  // 16 nb + l), i.e. row r of the (mb, nb) DPAS result / A operand.
+  static_assert(std::is_same_v<decltype(FragS{}.layout()), decltype(FragP{}.layout())> &&
+                    std::is_same_v<decltype(FragS{}.layout()),
+                               Layout<Shape<_8, _2, Int<NB>>, Stride<_1, _8, _16>>>,
+                "unexpected S fragment layout");
+  static_assert(std::is_same_v<decltype(SingleFragA{}.layout()), Layout<Shape<_8, _2, _2>, Stride<_1, _8, _16>>> &&
+                    get<1>(TileShapePV{}) == 32,
+                "O element nb * 16 + mb * 8 + r of VTile VV is (row 8 mb + r, column 32 VV + 16 nb + l)");
+  CUTLASS_DEVICE
+  void operator()(TensorV2D const &V,          // (v,k)
+                  const uint16_t *q4,          // this sub-group's 16 rows of Q4
+                  FragSRow const &tq_scale,    // qs of SG row r in lane r
+                  const uint32_t *k4,          // K4 of this (b, h)
+                  const float *k_scale,        // ks of this (b, h)
+                  const float *delta_s,        // dS of this (b, h, Q block)
+                  FragA &tArA, FragARow &tA_max, FragARow &tA_sum,
+                  int k_blocks, int thr_id) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = sg.get_local_id()[0];
+    const int sg_id = thr_id / intel::sg_size;
+    auto tile_shape_v = make_shape(get<1>(TileShapePV{}) * C<VTiles>{}, get<2>(TileShapePV{}));
+    Tensor cV = make_identity_tensor(V.shape());
+    Tensor cP = make_identity_tensor(take<0, 2>(TileShapeQK{}));
+    Tensor gV = local_tile(cV, tile_shape_v, make_coord(0, _));                               // (v,k,K)
+    Tensor gV_split = local_tile(gV, TileShapePV{}, make_coord(_, _, 0), Step<X, _1, _1>{});  // (v,k,VV,K)
+    TiledCopyV copy_v{V};
+    TiledMMAQK mma_qk{};
+    TiledMMAPV mma_pv{};
+    auto thr_copy_v = copy_v.get_slice(thr_id);
+    auto thr_mma_qk = mma_qk.get_slice(thr_id);
+    auto thr_mma_pv = mma_pv.get_slice(thr_id);
+    auto tVgV = thr_copy_v.partition_S(gV_split);
+    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
+    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+    auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_, _, 0, 0));
+    auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_, _, 0, 0));
+    auto prefetch_v = make_block_2d_prefetch(copy_v);
+    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
+    // Each sub-group prefetches its share of a KV tile of K4.
+    constexpr int TileDwords = NB * G * 128;
+    constexpr int LinesPerSG = (TileDwords * 4 / 64 + SGPerWG - 1) / SGPerWG;
+    auto prefetch_k4 = [&](int kb) {
+      if (lane < LinesPerSG && kb < k_blocks)
+        syclex::prefetch(k4 + kb * TileDwords + (sg_id * LinesPerSG + lane) * 16,
+                         syclex::properties{syclex::prefetch_hint_L1});
+    };
+    CUTLASS_PRAGMA_UNROLL
+    for (int kb = 0; kb < kStages; kb++) prefetch_k4(kb);
+    /* Q4 stays in registers for the whole KV loop: 16 rows x HeadDim nibbles */
+    u16x8 qa[2][G];
+    CUTLASS_PRAGMA_UNROLL
+    for (int mb = 0; mb < 2; mb++)
+      CUTLASS_PRAGMA_UNROLL
+      for (int g = 0; g < G; g++) qa[mb][g] = block_load<uint16_t, 8>(sg, q4 + (mb * G + g) * 128);
+    clear(tArA);
+    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+    // row_sum[mb][r] holds the sum of row 8 mb + r in every lane.
+    f32x8 row_sum[2] = {};
+    const u32x8 ones(std::is_same_v<Element, cutlass::half_t> ? 0x3C003C00u : 0x3F803F80u);
+    for (int kb = 0; kb < k_blocks; kb++) {
+      barrier_arrive(ScopeWorkgroup);
+      /* GEMM 1: S = Q'_int4 K'_int4^T, then S = qs ks S + dS (log2 domain), in steps
+         of up to 32 keys so the K4 operands and INT32 results of a step die early */
+      constexpr int NBStep = NB < 2 ? NB : 2;
+      CUTLASS_PRAGMA_UNROLL
+      for (int nb0 = 0; nb0 < NB; nb0 += NBStep) {
+        u32x8 kbv[NBStep][G];
+        float ks[NBStep], ds[NBStep];
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < NBStep; n++) {
+          const int nb = nb0 + n;
+          CUTLASS_PRAGMA_UNROLL
+          for (int g = 0; g < G; g++)
+            kbv[n][g] = block_load<uint32_t, 8>(sg, k4 + ((kb * NB + nb) * G + g) * 128);
+          ks[n] = block_load<float, 1>(sg, k_scale + kb * KTile + nb * 16)[0];
+          ds[n] = block_load<float, 1>(sg, delta_s + kb * KTile + nb * 16)[0];
+        }
+        s32x8 acc[NBStep][2];
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < NBStep; n++)
+          CUTLASS_PRAGMA_UNROLL
+          for (int mb = 0; mb < 2; mb++) {
+            dpas_s4_first(acc[n][mb], qa[mb][0], kbv[n][0]);
+            CUTLASS_PRAGMA_UNROLL
+            for (int g = 1; g < G; g++) dpas_s4(acc[n][mb], qa[mb][g], kbv[n][g]);
+          }
+        CUTLASS_PRAGMA_UNROLL
+        for (int n = 0; n < NBStep; n++)
+          CUTLASS_PRAGMA_UNROLL
+          for (int mb = 0; mb < 2; mb++)
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 8; r++) {
+              const int i = (nb0 + n) * 16 + mb * 8 + r;
+              tSrS(i) = sycl::fma(static_cast<float>(acc[n][mb][r]) * ks[n],
+                                  broadcast<0>(tq_scale, tSrS, i), ds[n]);
+            }
+      }
+      /* V prefetch for GEMM 2 */
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) prefetch(prefetch_v, pVgV(_, _, _, VV, kb));
+      /* Online softmax (tA rescaling fused into the GEMM 2 VTile loop) */
+        FragSRow rescale;
+        const bool do_rescale = softmax(kb == 0, tSrS, tA_max, rescale);
+        reorder(tSrS, tArP);
+        /* Row sums of P on XMX: row_sum += P * ones, on the same rounded P as GEMM 2 */
+        CUTLASS_PRAGMA_UNROLL
+        for (int mb = 0; mb < 2; mb++) {
+          if (do_rescale) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 8; r++) row_sum[mb][r] *= sycl::group_broadcast(sg, rescale(0), mb * 8 + r);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int kp = 0; kp < KTile / 16; kp++) {
+            u16x8 a;
+            CUTLASS_PRAGMA_UNROLL
+            for (int r = 0; r < 8; r++) a[r] = sycl::bit_cast<uint16_t>(tArP(kp * 16 + mb * 8 + r));
+            dpas_f16<Element>(row_sum[mb], a, ones);
+          }
+        }
+        /* GEMM 2: A += P V, split in v */
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v, tVgV(_, _, _, VV, kb), tVrV);
+          reorder(tVrV, tArV);
+          if (do_rescale) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
+      prefetch_k4(kb + kStages);
+      barrier_wait(ScopeWorkgroup);
+    }
+    /* Epilogue layout for the sums: SG row r in lane r */
+    tA_sum(0) = 0.0f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int mb = 0; mb < 2; mb++)
+      CUTLASS_PRAGMA_UNROLL
+      for (int r = 0; r < 8; r++)
+        if (lane == mb * 8 + r) tA_sum(0) = row_sum[mb][r];
+  }
+  // One step of the blocked online softmax on scores already in the log2 domain,
+  // with lazy rescaling: the running max (and so O and the row sums) only moves
+  // when some row of the sub-group grows by more than kLazyRescale, so P stays
+  // below 2^kLazyRescale. Returns whether O must be multiplied by rescale.
+  static constexpr float kLazyRescale = 8.0f;
+  CUTLASS_DEVICE
+  bool softmax(bool first_block, FragS &tS, FragSRow &tS_max, FragSRow &rescale) {
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    auto tS_bmax = reduce<1>(tS, sycl::maximum{});
+    bool grow = false;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS_max.size(); i++) grow |= tS_bmax(i) > tS_max(i) + kLazyRescale;
+    grow = !first_block && sycl::any_of_group(sg, grow);
+    if (first_block) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) tS_max(i) = tS_bmax(i);
+    } else if (grow) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tS_max.size(); i++) {
+        ElementA new_max = sycl::max(tS_max(i), tS_bmax(i));
+        rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+        tS_max(i) = new_max;
+      }
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < tS.size(); i++)
+      tS(i) = sycl::native::exp2(tS(i) - broadcast<0>(tS_max, tS, i));
+    return grow;
+  }
+};
+template <typename Element, int HeadDim>
+struct AttentionKernel {
+  using ML = Mainloop<Element, HeadDim>;
+  using Epilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
+      ML, typename Config<HeadDim>::ShapeO, typename ML::TensorO2D>;
+  static constexpr int WGSize = ML::SGPerWG * intel::sg_size;
+  static constexpr int G = ML::G;
+  const uint16_t *q4;
+  const float *q_scale;
+  const uint32_t *k4;
+  const float *k_scale, *delta_s;
+  const Element *v;
+  Element *o;
+  int heads, q_len, kv_len, q_pad, kv_pad, q_blocks;
+  CUTLASS_DEVICE void operator()(sycl::nd_item<3> it) const {
+    const int bh = it.get_group(0), blk_q = it.get_group(1);
+    const int b = bh / heads, hd = bh % heads;
+    const int thr_id = it.get_local_id(2);
+    const int lane = thr_id % intel::sg_size, sg_id = thr_id / intel::sg_size;
+    const int64_t row_stride = int64_t(heads) * HeadDim;
+    const int row0 = blk_q * ML::QTile + sg_id * 16;
+    auto V = make_tensor(make_gmem_ptr(const_cast<Element *>(v) + int64_t(b) * kv_len * row_stride + hd * HeadDim),
+                         make_layout(make_shape(HeadDim, kv_len), make_stride(_1{}, int(row_stride))));
+    auto O = make_tensor(make_gmem_ptr(o + int64_t(b) * q_len * row_stride + hd * HeadDim),
+                         make_layout(make_shape(q_len, HeadDim), make_stride(int(row_stride), _1{})));
+    typename ML::FragSRow tq_scale;
+    tq_scale(0) = q_scale[int64_t(bh) * q_pad + row0 + lane];
+    typename ML::FragA tArA;
+    typename ML::FragARow tA_max, tA_sum;
+    ML mainloop;
+    mainloop(V, q4 + (int64_t(bh) * (q_pad / 8) + row0 / 8) * (G * 128), tq_scale,
+             k4 + int64_t(bh) * (kv_pad / 16) * (G * 128), k_scale + int64_t(bh) * kv_pad,
+             delta_s + (int64_t(bh) * q_blocks + blk_q) * kv_pad,
+             tArA, tA_max, tA_sum,
+             (kv_len + ML::KTile - 1) / ML::KTile, thr_id);
+    typename Epilogue::SharedStorage shared{};
+    Epilogue epilogue{typename Epilogue::Params{}, shared};
+    epilogue(O, tArA, tA_max, tA_sum, make_coord(blk_q, 0), thr_id);
+  }
+};
+
+struct Quantized {
+  torch::Tensor q4, q_scale, q_mean, k4, k_scale, delta_s;
+};
+template <int HeadDim>
+float softmax_scale_log2() {
+  return static_cast<float>(1.4426950408889634 / std::sqrt(static_cast<double>(HeadDim)));
+}
+// Stage 1: q4, q_scale (with log2(e) / sqrt(D) folded in), q_mean.
+template <typename Element, int HeadDim>
+std::vector<torch::Tensor> quantize_q(torch::Tensor q) {
+  constexpr int G = HeadDim / 64, BQ = Config<HeadDim>::QTile::value;
+  const int batch = q.size(0), q_len = q.size(1), heads = q.size(2);
+  const int q_pad = round_up(q_len, BQ);
+  auto f32 = q.options().dtype(torch::kFloat32);
+  // Q4 / K4 hold raw u16 / u32 words; torch has no unsigned 16/32-bit tensors.
+  std::vector<torch::Tensor> out{
+      torch::empty({batch, heads, q_pad / 8, G, 8, 16}, q.options().dtype(torch::kInt16)),
+      torch::empty({batch, heads, q_pad}, f32), torch::empty({batch, heads, q_pad / BQ, HeadDim}, f32)};
+  launch_quantize_q<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                      reinterpret_cast<const Element *>(q.data_ptr()),
+                                      reinterpret_cast<uint16_t *>(out[0].data_ptr()),
+                                      out[1].data_ptr<float>(), out[2].data_ptr<float>(), batch,
+                                      q_len, heads, q_pad, softmax_scale_log2<HeadDim>());
+  return out;
+}
+// Stage 2: the K centre [B, H, D].
+template <typename Element, int HeadDim>
+torch::Tensor k_centre(torch::Tensor k) {
+  auto k_mean = torch::empty({k.size(0), k.size(2), HeadDim}, k.options().dtype(torch::kFloat32));
+  launch_k_centre<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                    reinterpret_cast<const Element *>(k.data_ptr()),
+                                    k_mean.data_ptr<float>(), k.size(0), k.size(1), k.size(2));
+  return k_mean;
+}
+// Stage 3: k4, k_scale, delta_s (with log2(e) / sqrt(D) folded in).
+template <typename Element, int HeadDim>
+std::vector<torch::Tensor> quantize_k(torch::Tensor k, torch::Tensor k_mean, torch::Tensor q_mean) {
+  constexpr int G = HeadDim / 64;
+  const int batch = k.size(0), kv_len = k.size(1), heads = k.size(2), q_blocks = q_mean.size(2);
+  const int kv_pad = round_up(kv_len, kKvAlign);
+  auto f32 = k.options().dtype(torch::kFloat32);
+  std::vector<torch::Tensor> out{
+      torch::empty({batch, heads, kv_pad / 16, G, 8, 16}, k.options().dtype(torch::kInt32)),
+      torch::empty({batch, heads, kv_pad}, f32), torch::empty({batch, heads, q_blocks, kv_pad}, f32)};
+  launch_quantize_k<Element, HeadDim>(c10::xpu::getCurrentXPUStream().queue(),
+                                      reinterpret_cast<const Element *>(k.data_ptr()),
+                                      k_mean.data_ptr<float>(), q_mean.data_ptr<float>(),
+                                      reinterpret_cast<uint32_t *>(out[0].data_ptr()),
+                                      out[1].data_ptr<float>(), out[2].data_ptr<float>(), batch,
+                                      kv_len, heads, kv_pad, q_blocks, softmax_scale_log2<HeadDim>());
+  return out;
+}
+template <typename Element, int HeadDim>
+Quantized quantize(torch::Tensor q, torch::Tensor k) {
+  auto qq = quantize_q<Element, HeadDim>(q);
+  auto kq = quantize_k<Element, HeadDim>(k, k_centre<Element, HeadDim>(k), qq[2]);
+  return {qq[0], qq[1], qq[2], kq[0], kq[1], kq[2]};
+}
+template <typename Element, int HeadDim>
+torch::Tensor attention(Quantized const &qd, torch::Tensor v, int q_len) {
+  using Kernel = AttentionKernel<Element, HeadDim>;
+  const int batch = qd.q4.size(0), heads = qd.q4.size(1), kv_len = v.size(1);
+  const int q_pad = qd.q_scale.size(2), kv_pad = qd.k_scale.size(2), q_blocks = qd.delta_s.size(2);
+  auto o = torch::empty({batch, q_len, heads, HeadDim}, v.options());
+  Kernel kernel{reinterpret_cast<const uint16_t *>(qd.q4.data_ptr()), qd.q_scale.data_ptr<float>(),
+                reinterpret_cast<const uint32_t *>(qd.k4.data_ptr()), qd.k_scale.data_ptr<float>(),
+                qd.delta_s.data_ptr<float>(), reinterpret_cast<const Element *>(v.data_ptr()),
+                reinterpret_cast<Element *>(o.data_ptr()), heads, q_len,
+                kv_len, q_pad, kv_pad, q_blocks};
+  auto &queue = c10::xpu::getCurrentXPUStream().queue();
+  queue.submit([&](sycl::handler &h) {
+    h.parallel_for(
+        sycl::nd_range<3>({size_t(batch) * heads, size_t(q_blocks), size_t(Kernel::WGSize)},
+                          {1, 1, size_t(Kernel::WGSize)}),
+        syclex::properties{syclex::sub_group_size<intel::sg_size>, intelex::grf_size<256>},
+        [=](sycl::nd_item<3> it) { kernel(it); });
+  });
+  return o;
+}
+void check_qk(torch::Tensor const &q, torch::Tensor const &k) {
+  TORCH_CHECK(q.is_xpu() && k.is_xpu(), "inputs must be XPU tensors");
+  TORCH_CHECK(q.is_contiguous() && k.is_contiguous(), "inputs must be contiguous [B,S,H,D]");
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "expected rank-4 [B,S,H,D] tensors");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "input dtypes must match");
+  TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16,
+              "supports FP16 and BF16");
+  TORCH_CHECK(q.size(0) == k.size(0) && q.size(2) == k.size(2) && q.size(3) == k.size(3),
+              "incompatible Q/K shapes");
+  TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128, "head dimension must be 64 or 128");
+  TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 && k.size(1) > 0,
+              "batch, sequence, and head dimensions must be positive");
+}
+template <typename Fn>
+auto dispatch(torch::ScalarType dtype, int64_t head_dim, Fn &&fn) {
+  TORCH_CHECK(head_dim == 64 || head_dim == 128, "head dimension must be 64 or 128");
+  if (dtype == torch::kHalf) {
+    return head_dim == 64 ? fn(cutlass::half_t{}, std::integral_constant<int, 64>{})
+                          : fn(cutlass::half_t{}, std::integral_constant<int, 128>{});
+  }
+  TORCH_CHECK(dtype == torch::kBFloat16, "supports FP16 and BF16");
+  return head_dim == 64 ? fn(cutlass::bfloat16_t{}, std::integral_constant<int, 64>{})
+                        : fn(cutlass::bfloat16_t{}, std::integral_constant<int, 128>{});
+}
+}  // namespace sage
+torch::Tensor forward_entry(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
+  sage::check_qk(q, k);
+  TORCH_CHECK(v.is_xpu() && v.is_contiguous() && v.sizes() == k.sizes() &&
+                  v.scalar_type() == q.scalar_type(),
+              "V must match K");
+  return sage::dispatch(q.scalar_type(), q.size(3), [&](auto element, auto head_dim) {
+    using E = decltype(element);
+    constexpr int D = decltype(head_dim)::value;
+    return sage::attention<E, D>(sage::quantize<E, D>(q, k), v, static_cast<int>(q.size(1)));
+  });
+}
+}  // namespace
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("forward", &forward_entry,
+             "Fused attention with smoothed INT4 Q*K^T (quantize + attention)");
+}
+// [EVOLVE_END]

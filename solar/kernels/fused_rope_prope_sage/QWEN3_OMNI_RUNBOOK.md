@@ -28,6 +28,7 @@ Last updated 2026-11-04.
 | Base kernel the work started from (non-causal, Hq == Hkv only) | `/home/gta/omni_bench/kernel/sage_orig.sycl`, the pre-`23b7cac` version of `./sycl_tla_opt.sycl` (`git show 050d413^:src/solarwm/kernels/fused_rope_prope_sage/sycl_tla_opt.sycl`) |
 | Newer upstream kernel (staged API + in-place KV-cache packing, still no causal mask) | `./sycl_tla_opt.sycl` on branch `xpu` (commit `23b7cac`) |
 | Benchmark workspace: kernel work copy, harness, data, logs | `/home/gta/omni_bench/` (**not version-controlled**) |
+| Version-controlled copy of the harness, kernel tools, RULER generator and key results (restore steps inside) | `./qwen3_omni/` (`README.md`) |
 | **Session runbook: 64K sweep and kernel-candidate workflow** | `/home/gta/omni_bench/RUNBOOK_64K.md` |
 | **Current kernel (causal + GQA)** | `./sage_causal.sycl` (this folder) |
 | Benchmark work copy of the kernel, and its build | `/home/gta/omni_bench/kernel/sage_causal.sycl`, `.../kernel/build/sage_causal.so`; keep it identical to `./sage_causal.sycl` |

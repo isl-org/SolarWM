@@ -1,0 +1,9 @@
+{
+ "device": "Intel(R) Arc(TM) Pro B70 Graphics",
+ "bf16_gemm_tflops": 153.71351072306555,
+ "int8_gemm_tops": 291.4510176894121,
+ "read_bw_gbs": 593.8106754176246,
+ "copy_bw_gbs": 528.1465255702401,
+ "add_bw_gbs": 811.7097432350125,
+ "peak_bw_gbs": 811.7097432350125
+}
