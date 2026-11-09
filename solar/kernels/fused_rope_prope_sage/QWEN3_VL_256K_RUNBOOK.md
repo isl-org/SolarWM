@@ -28,6 +28,16 @@ Needle-in-a-haystack ramp, one prompt per length and arm (essay haystack, needle
 - Sage is about 1.20× faster on prefill attention at every length and 1.11–1.16× on TTFT. The bf16 flash baseline is strong here (about 107 TFLOPS on a 4K × 256K chunk), so the gain is smaller than on Qwen3-Omni, where the baseline was torch SDPA (about 80 TFLOPS).
 - The INT4 linear layers take about 58 s of TTFT at 256K in both arms.
 - Throughput planning: one 256K prompt through both arms takes about 8–9 minutes including decode; one 128K prompt about 3 minutes.
+- **RULER summary, Sage vs the bf16 flash baseline** (cwe, qa_2, niah_multivalue, niah_multiquery; paired prompts, median per-prompt speedups):
+
+  | context | prompts | RULER flash → Sage | TTFT speedup | attention speedup | E2E speedup |
+  |---|---|---|---|---|---|
+  | 64K | 40 | 70.8 → 70.0 (−0.7 ± 0.8) | 1.10× | 1.19× | 1.07× |
+  | 128K | 40 | 52.1 → 52.8 (+0.6 ± 2.6) | 1.13× | 1.20× | 1.11× |
+  | 256K | 12 | 22.9 → 27.1 (+4.2 ± 8.2) | 1.16× | 1.21× | 1.13× |
+
+  E2E includes answer generation, which costs the same in both arms (decode runs on SDPA); with answers of up to 120 tokens it dilutes the prefill gain most at 64K.
+- **RULER at 64K** (10 samples per task, 62.6–63.4K tokens; `qwen3_vl/results/ruler_vl_rvl64k.jsonl`): cwe 33.0 → 30.0, qa_2 50.0 → 50.0, niah_multivalue 100 → 100, niah_multiquery 100 → 100. The whole −0.7 comes from one cwe prompt (3 of 10 words); the other 39 prompts score identically. TTFT 23.2 → 21.1 s, prefill attention 11.2 → 9.3 s, E2E 36.3 → 35.2 s; peak VRAM identical (11.9 GiB).
 - **RULER at 128K** (cwe, qa_2, niah_multivalue, niah_multiquery; 10 samples each, 127–129K tokens; `qwen3_vl/results/ruler_vl_rvl128k.jsonl`):
 
   | task | flash | Sage | Sage − flash |
@@ -154,7 +164,7 @@ Environment variables read by the scripts: `QWEN3VL_INT4_DIR` (quantised checkpo
 
 ### 5.3 RULER at 128K and 256K
 
-Data: the four tasks most sensitive to Q·Kᵀ error on Qwen3-Omni (cwe, qa_2, niah_multivalue, niah_multiquery), fitted with the Qwen3-VL tokenizer and chat template. Buckets leave 2,048 tokens for generation: 129,024 (10 samples per task, 127–129K tokens) and 260,096 (3 samples per task, 256–259K tokens). cwe at 256K needs RULER's `english_words.json`, a git-lfs object (fetch it into `third_party/RULER/scripts/data/synthetic/json/` and check its SHA-256 against the pointer).
+Data: the four tasks most sensitive to Q·Kᵀ error on Qwen3-Omni (cwe, qa_2, niah_multivalue, niah_multiquery), fitted with the Qwen3-VL tokenizer and chat template. Buckets leave 2,048 tokens for generation: 63,488 (10 samples per task), 129,024 (10 samples per task, 127–129K tokens) and 260,096 (3 samples per task, 256–259K tokens). cwe at 256K needs RULER's `english_words.json`, a git-lfs object (fetch it into `third_party/RULER/scripts/data/synthetic/json/` and check its SHA-256 against the pointer).
 
 ```bash
 cd /home/gta/omni_bench/ruler; T=/home/gta/models/qwen3vl8b-w4a16/Qwen3-VL-8B-Instruct-w4g128
