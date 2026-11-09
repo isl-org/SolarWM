@@ -39,7 +39,17 @@ Needle-in-a-haystack ramp, one prompt per length and arm (essay haystack, needle
   | **all (40 paired prompts)** | **52.1** | **52.8** | **+0.6 ± 2.6** |
 
   No measurable accuracy loss. Median per-prompt speedups: TTFT 71.6 → 63.2 s (1.13×), prefill attention 45.5 → 37.9 s (1.20×), E2E 92.8 → 84.2 s (1.11×); peak VRAM identical (16.7 GiB). cwe and qa_2 are low in both arms: this INT4-weight model is weak at aggregation and multi-hop QA at 128K regardless of the attention kernel.
-- **RULER at 256K** (3 samples per task): see section 5.3.
+- **RULER at 256K** (same four tasks, 3 samples each, 256–259K tokens; `qwen3_vl/results/ruler_vl_rvl256k.jsonl`):
+
+  | task | flash | Sage | Sage − flash |
+  |---|---|---|---|
+  | cwe | 0.0 | 0.0 | 0.0 |
+  | qa_2 | 0.0 | 0.0 | 0.0 |
+  | niah_multivalue | 41.7 | 41.7 | 0.0 |
+  | niah_multiquery | 50.0 | 66.7 | +16.7 |
+  | **all (12 paired prompts)** | **22.9** | **27.1** | **+4.2 ± 8.2** |
+
+  No measurable accuracy loss (12 prompts: indicative, not conclusive). Median per-prompt speedups: TTFT 245.8 → 211.8 s (1.16×), prefill attention 186.6 → 155.0 s (1.21×), E2E 297.2 → 265.5 s (1.13×); peak VRAM 26.35 GiB allocated in both arms, 26.6 GiB reserved. The model itself degrades strongly at 256K in both arms (multi-needle 42–67 vs 85–98 at 128K; cwe and qa_2 at 0).
 
 ## 2. Model facts and memory budget
 
@@ -171,7 +181,7 @@ Each prompt runs through both arms (order alternating per sample; samples interl
 
 ## 7. Next steps
 
-1. **Finish and summarise the RULER runs** (section 5.3): per-task flash vs Sage at 128K and 256K, paired difference, and the end-to-end speedup.
+1. **More 256K samples** if the 256K accuracy comparison needs to be conclusive (3 per task now; each prompt takes about 9 minutes through both arms).
 2. **INT4 + Hadamard + Q smoothing kernel**, only if RULER shows headroom worth chasing: the rotation is exact and can be fused into the quantise stage. Expected gain over INT8 is about 9% of prefill attention (about 5% of TTFT at 256K), and it needs the RULER check above to rule out the accuracy loss INT4 showed on Qwen3-Omni.
 3. **Faster decode:** INT8-aware decode attention, or dequantise only the new tokens per layer if a per-layer bf16 cache fits at shorter contexts.
 4. **Absolute accuracy:** re-quantise with full auto-round tuning (without `--iters 0`) if RULER scores matter beyond the Sage-vs-flash comparison.
