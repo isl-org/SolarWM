@@ -28,7 +28,18 @@ Needle-in-a-haystack ramp, one prompt per length and arm (essay haystack, needle
 - Sage is about 1.20× faster on prefill attention at every length and 1.11–1.16× on TTFT. The bf16 flash baseline is strong here (about 107 TFLOPS on a 4K × 256K chunk), so the gain is smaller than on Qwen3-Omni, where the baseline was torch SDPA (about 80 TFLOPS).
 - The INT4 linear layers take about 58 s of TTFT at 256K in both arms.
 - Throughput planning: one 256K prompt through both arms takes about 8–9 minutes including decode; one 128K prompt about 3 minutes.
-- **RULER at 128K and 256K** (cwe, qa_2, niah_multivalue, niah_multiquery): see section 5.3. On the first 10 paired 128K prompts the two arms score identically (47.5 vs 47.5), with a median TTFT speedup of 1.13× and E2E 1.11×.
+- **RULER at 128K** (cwe, qa_2, niah_multivalue, niah_multiquery; 10 samples each, 127–129K tokens; `qwen3_vl/results/ruler_vl_rvl128k.jsonl`):
+
+  | task | flash | Sage | Sage − flash |
+  |---|---|---|---|
+  | cwe | 6.0 | 6.0 | 0.0 |
+  | qa_2 | 20.0 | 20.0 | 0.0 |
+  | niah_multivalue | 97.5 | 97.5 | 0.0 |
+  | niah_multiquery | 85.0 | 87.5 | +2.5 |
+  | **all (40 paired prompts)** | **52.1** | **52.8** | **+0.6 ± 2.6** |
+
+  No measurable accuracy loss. Median per-prompt speedups: TTFT 71.6 → 63.2 s (1.13×), prefill attention 45.5 → 37.9 s (1.20×), E2E 92.8 → 84.2 s (1.11×); peak VRAM identical (16.7 GiB). cwe and qa_2 are low in both arms: this INT4-weight model is weak at aggregation and multi-hop QA at 128K regardless of the attention kernel.
+- **RULER at 256K** (3 samples per task): see section 5.3.
 
 ## 2. Model facts and memory budget
 

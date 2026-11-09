@@ -49,6 +49,16 @@ Measure SDPA vs Sage at the 64K bucket (prompts of 62.5–63.5K tokens) on RULER
   | **sage** | **21.8 s (1.37×)** | **11.3 s (1.72×)** | **24.4 s (1.32×)** | **26.9 GiB** |
 
   Decode is on SDPA in both arms (235 ms/token), so the E2E gain comes from prefill.
+- **Speedup vs context length** (current kernel, 12 prompts per length; `logs/ruler_e2e_short.jsonl`, `logs/ruler_e2e_final.jsonl`):
+
+  | context | TTFT SDPA → Sage | TTFT speedup | thinker attention SDPA → Sage | attention speedup | E2E speedup | attention share of SDPA TTFT |
+  |---|---|---|---|---|---|---|
+  | 8K | 3.36 → 3.24 s | 1.04× | 0.32 → 0.21 s | 1.57× | 1.01× | 10% |
+  | 16K | 5.00 → 4.54 s | 1.10× | 1.17 → 0.73 s | 1.60× | 1.07× | 24% |
+  | 32K | 10.59 → 8.53 s | 1.24× | 5.00 → 2.92 s | 1.71× | 1.18× | 47% |
+  | 64K | 29.79 → 21.80 s | **1.37×** | 19.40 → 11.25 s | **1.72×** | **1.32×** | 65% |
+
+  Attention itself is 1.57–1.72× faster at every length; the end-to-end gain grows with context because attention's share of prefill grows (the INT4 MoE layers dominate below about 16K). Peak prefill VRAM is identical in both arms at every length.
 - **RULER accuracy at 64K** (12 tasks × 15 samples; `logs/summary_sweep64k_final.md`, `logs/ruler_sweep64k_final.jsonl`): SDPA 68.8, INT8 with Q smoothing 68.9 (+0.1 ± 2.4 paired), INT4 61.4 (−7.4 ± 4.5). The current kernel (INT8, K smoothing only) was checked on the four tasks most sensitive to Q·Kᵀ error (cwe, qa_2, niah_multivalue, niah_multiquery; `logs/ruler_sweep64k_noqsm.jsonl`): 64.2 vs SDPA 64.8 (−0.7 ± 5.4). A full 12-task sweep of the current kernel has not been run.
   - Generation is not bit-reproducible run to run even on the SDPA arm (a few predictions change between runs), so compare arms with paired statistics over many prompts.
 - **Real-activation accuracy** (`logs/accuracy_probe.json`, 3 OmniBench prompts + 8K/16K/32K text): top-1 next token matched SDPA on all 6 prompts; KL ≤ 0.004; thinker attention cosine vs SDPA: mean ≥ 0.999 over the 48 layers, worst layer ≥ 0.993.

@@ -63,6 +63,17 @@ Last updated 2026-11-04.
 | SDPA | 29.8 s | 19.4 s | 32.3 s | 26.9 GiB |
 | **Sage (current)** | **21.8 s (1.37×)** | **11.3 s (1.72×)** | **24.4 s (1.32×)** | **26.9 GiB** |
 
+**Speedup vs context length** (current kernel; 12 prompts per length, one per RULER task, median per-prompt speedup; `qwen3_omni/results/ruler_e2e_short.jsonl` and `ruler_e2e_final.jsonl`):
+
+| context | TTFT SDPA → Sage | TTFT speedup | thinker attention SDPA → Sage | attention speedup | E2E speedup | attention share of SDPA TTFT |
+|---|---|---|---|---|---|---|
+| 8K | 3.36 → 3.24 s | 1.04× | 0.32 → 0.21 s | 1.57× | 1.01× | 10% |
+| 16K | 5.00 → 4.54 s | 1.10× | 1.17 → 0.73 s | 1.60× | 1.07× | 24% |
+| 32K | 10.59 → 8.53 s | 1.24× | 5.00 → 2.92 s | 1.71× | 1.18× | 47% |
+| 64K | 29.79 → 21.80 s | **1.37×** | 19.40 → 11.25 s | **1.72×** | **1.32×** | 65% |
+
+Attention itself is 1.57–1.72× faster at every length; the end-to-end gain grows with context because attention's share of prefill grows (the INT4 MoE layers dominate below about 16K). Peak prefill VRAM is identical in both arms at every length.
+
 RULER for the current kernel was checked on the four tasks most sensitive to Q·Kᵀ error (cwe, qa_2, niah_multivalue, niah_multiquery; 60 prompts, `ruler_sweep64k_noqsm.jsonl`): 64.2 vs SDPA 64.8 (−0.7 ± 5.4) and vs INT8 with Q smoothing 65.7. Dropping Q smoothing removes the dS GEMM and a [Hq, S/256, S] fp32 buffer (1.9 GiB at 63K), so Sage needs no more VRAM than SDPA. A full 12-task sweep of the current kernel has not been run. Generation is not bit-reproducible run to run even on SDPA, so compare arms with paired statistics.
 
 **Why INT8:** on real post-RoPE activations captured at 64K (`omni_bench/scripts/capture_qkv.py`, `emulate_qk_quant.py`), attention-output cosine vs exact fp32:
