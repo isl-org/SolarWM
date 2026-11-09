@@ -168,19 +168,36 @@ Data: the four tasks most sensitive to Q·Kᵀ error on Qwen3-Omni (cwe, qa_2, n
 
 ```bash
 cd /home/gta/omni_bench/ruler; T=/home/gta/models/qwen3vl8b-w4a16/Qwen3-VL-8B-Instruct-w4g128
+../env.sh python generate.py --tokenizer $T --out_dir $PWD/data_vl --lengths 63488 \
+    --tasks cwe qa_2 niah_multivalue niah_multiquery --num_samples 10
 ../env.sh python generate.py --tokenizer $T --out_dir $PWD/data_vl --lengths 129024 \
     --tasks cwe qa_2 niah_multivalue niah_multiquery --num_samples 10
 ../env.sh python generate.py --tokenizer $T --out_dir $PWD/data_vl --lengths 260096 \
     --tasks cwe qa_2 niah_multivalue niah_multiquery --num_samples 3
 cd ..
-# about 2 h (128K, 40 prompts x 2 arms) and 1.8 h (256K, 12 prompts x 2 arms); resumable by --tag
-nohup scripts/rss_guard.sh 24 logs/ruler_vl_128k.log -- ./env.sh python vl8b/bench_ruler_vl.py \
-    --lengths 129024 --per-task 10 --tag rvl128k > /dev/null 2>&1 &
-# then: --lengths 260096 --per-task 3 --tag rvl256k  (log ruler_vl_256k.log)
-python3 vl8b/summarize_ruler_vl.py rvl128k rvl256k     # per-task scores, paired diff + CI, speedups, VRAM
+# about 45 min (64K), 2 h (128K, 40 prompts x 2 arms) and 1.8 h (256K, 12 prompts x 2 arms); resumable by --tag
+nohup scripts/rss_guard.sh 24 logs/ruler_vl_64k.log -- ./env.sh python vl8b/bench_ruler_vl.py \
+    --lengths 63488 --per-task 10 --tag rvl64k > /dev/null 2>&1 &
+# then: --lengths 129024 --per-task 10 --tag rvl128k  and  --lengths 260096 --per-task 3 --tag rvl256k
+python3 vl8b/summarize_ruler_vl.py rvl64k rvl128k rvl256k   # per-task scores, paired diff + CI, speedups, VRAM
 ```
 
 Each prompt runs through both arms (order alternating per sample; samples interleaved across tasks); rows go to `logs/ruler_vl_<tag>.jsonl` with TTFT, prefill attention time, E2E, decode time, peak VRAM, prediction and RULER score.
+
+### 5.4 Reproduce the INT4 analysis (section 4)
+
+```bash
+cd /home/gta/omni_bench
+# capture all 36 layers at 64K on the flash arm (about 9.5 GB to act_capture_vl/needle_65536)
+scripts/rss_guard.sh 24 logs/capture_vl.log -- ./env.sh python vl8b/capture_vl_qkv.py --length 65536
+# per-layer / per-head cosine of INT8 and INT4 variants vs exact fp32 (results/vl_sensitivity_64k.json)
+./env.sh python vl8b/emulate_vl_sensitivity.py --dir act_capture_vl/needle_65536 --json logs/vl_sensitivity_64k.json
+# learned rotations vs Hadamard on held-out rows (results/vl_rotation_qs.json)
+./env.sh python vl8b/learn_rotation.py --dir act_capture_vl/needle_65536 --layers 0 5 10 34 17 --q-smooth \
+    --json logs/vl_rotation_qs.json
+```
+
+The INT4 Sage timings quoted in section 4 come from the INT4 kernel at SolarWM commit `c2c1cce` (`git show c2c1cce:solar/kernels/fused_rope_prope_sage/sage_causal.sycl`, built with `SAGE_BUILD_DIR` as in `QWEN3_OMNI_RUNBOOK.md` section 6.6).
 
 ## 6. Known limitations
 

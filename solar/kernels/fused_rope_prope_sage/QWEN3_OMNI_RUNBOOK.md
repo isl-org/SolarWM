@@ -209,6 +209,34 @@ Otherwise fall back to `sdpa_attention_forward`. The causal flag comes from `mod
   - analytic FLOPs and minimum-traffic bytes (active params/token = 2.718B for the thinker text model)
 - **Run conditions:** arms alternate order per sample, with one warm-up per length, and the output is resumable JSONL.
 
+### 6.6 Reproduce the results in section 3
+
+Restore the workspace from `qwen3_omni/` (steps in `qwen3_omni/README.md`), download the model (section 6.1), and regenerate the RULER data (`qwen3_omni/ruler/README.md`; the 64K bucket is `--lengths 63488`). All commands run from `/home/gta/omni_bench` with `export CUTLASS_DIR=/home/gta/sycl_tla_opt/third_party/sycl-tla-v0.8 PY=$HOME/omni_env/bin/python`. Every GPU job goes through `scripts/rss_guard.sh` (section 5). Result files are in `qwen3_omni/results/`.
+
+The kernel used for each result is in git history; build an older one into its own directory and select it with `SAGE_BUILD_DIR`:
+
+```bash
+K=solar/kernels/fused_rope_prope_sage/sage_causal.sycl            # path inside the SolarWM repo
+git -C /home/gta/SolarWM show c2c1cce:$K > kernel/sage_int4.sycl  # INT4 Q*K^T, Q+K smoothing
+git -C /home/gta/SolarWM show c757d2d:$K > kernel/sage_int8qs.sycl # INT8 Q*K^T, Q+K smoothing
+(cd kernel && bash build.sh build_int4 sage_int4.sycl sage_causal && bash build.sh build_int8qs sage_int8qs.sycl sage_causal)
+# the current kernel (this folder's sage_causal.sycl) builds to kernel/build/ (section 6.2)
+```
+
+| result (section 3) | kernel | command (prefix GPU jobs with `scripts/rss_guard.sh 24 logs/<name>.log --`) |
+|---|---|---|
+| 64K RULER sweep, SDPA + INT4 arms (180 prompts each, `ruler_sweep64k.jsonl`) | `c2c1cce` | `SAGE_BUILD_DIR=$PWD/kernel/build_int4 ./env.sh python scripts/bench_ruler.py --lengths 63488 --per-task 15 --arms sdpa sage --tag sweep64k` (about 3.5 h) |
+| 64K RULER, INT8 + Q smoothing arm (`ruler_sweep64k_int8.jsonl`) | `c757d2d` | `SAGE_BUILD_DIR=$PWD/kernel/build_int8qs ./env.sh python scripts/bench_ruler.py --lengths 63488 --per-task 15 --arms sage --tag sweep64k_int8` (about 1.3 h) |
+| Merged table (`ruler_sweep64k_final.jsonl`, `summary_sweep64k_final.md`) | – | `python3 scripts/merge_sweeps.py sweep64k_final sweep64k:sdpa=sdpa,sage=sage_int4 sweep64k_int8:sage=sage_int8 && ./env.sh python scripts/summarize_ruler.py sweep64k_final` |
+| INT4 with layer 3 on SDPA, 4 weak tasks (`ruler_sweep64k_l3.jsonl`) | `c2c1cce` | `SAGE_BUILD_DIR=$PWD/kernel/build_int4 ./env.sh python scripts/bench_ruler.py --lengths 63488 --per-task 15 --tasks cwe qa_2 niah_multivalue niah_multiquery --arms sage_l3 --tag sweep64k_l3` |
+| Current kernel, 4 weak tasks (`ruler_sweep64k_noqsm.jsonl`) | current | `./env.sh python scripts/bench_ruler.py --lengths 63488 --per-task 15 --tasks cwe qa_2 niah_multivalue niah_multiquery --arms sage --tag sweep64k_noqsm` |
+| Speedup vs context length (`ruler_e2e_short.jsonl`, `ruler_e2e_final.jsonl`) | current | `./env.sh python scripts/bench_ruler.py --lengths 8192 16384 32768 --per-task 1 --arms sdpa sage --tag e2e_short` and `--lengths 63488 --per-task 1 --arms sdpa sage --tag e2e_final`; medians of per-prompt `sdpa / sage` ratios of `ttft_s`, `attn_ms`, `e2e_s` |
+| Standalone kernel vs SDPA (`bench_sage_causal.log`) | current | `./env.sh python kernel/bench_sage_causal.py --lens 2048 8192 16384 32768 63488 --json logs/bench_sage_causal.json` |
+| Real-activation accuracy (`accuracy_probe.json`) | any | `SAGE_BUILD_DIR=... ./env.sh python scripts/accuracy_probe.py 8192 16384 32768` (overwrites `logs/accuracy_probe.json`) |
+| INT4 vs INT8 per-layer emulation (`emulate_*.json`) | any | `./env.sh python scripts/capture_qkv.py` (cwe #0 and qa_2 #0 at 64K, 6 layers, about 7.2 GB to `act_capture/`), then `SAGE_BUILD_DIR=... ./env.sh python scripts/emulate_qk_quant.py --json logs/emulate_<name>.json` |
+
+Paired comparisons: arms run on the same prompts; compare per-prompt scores (`score` field) and report the mean difference with a 95% CI (1.96 × stdev / √n), since generation is not bit-reproducible run to run.
+
 ## 7. Next steps
 
 0. **Reconcile with the upstream kernel.** Branch `xpu` updated `./sycl_tla_opt.sycl` (`23b7cac`: SageAttention v2 optimisations with in-place KV-cache packing, a staged `quantize_q` / `pack_k` / `attention` API). Our causal + GQA changes were made on the older version. Either port them (including INT8 Q·Kᵀ) onto the new kernel, or benchmark the two against each other.
