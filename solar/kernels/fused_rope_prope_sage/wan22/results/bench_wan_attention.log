@@ -1,0 +1,4 @@
+TI2V-5B 81f/153f (window 21f)    S=  8505 H=24: SDPA      9.7 ms (   92 TF) | Sage INT8      7.2 ms (  124 TF, 1.35x) | flash bf16      7.6 ms (  117 TF, 1.27x) | Sage cos vs fp32 (4 heads) 0.99995
+I2V-A14B 81f                     S= 32760 H=40: SDPA    256.0 ms (   86 TF) | Sage INT8    193.6 ms (  114 TF, 1.32x) | flash bf16    205.4 ms (  107 TF, 1.25x) | Sage cos vs fp32 (4 heads) 0.99995
+I2V-A14B 153f                    S= 60840 H=40: SDPA    927.0 ms (   82 TF) | Sage INT8    663.0 ms (  114 TF, 1.40x) | flash bf16    708.0 ms (  107 TF, 1.31x) | Sage cos vs fp32 (4 heads) 0.99995
+[rss_guard] exit=0 peak_rss=1.9 GB min_sys_avail=25.8 GB
