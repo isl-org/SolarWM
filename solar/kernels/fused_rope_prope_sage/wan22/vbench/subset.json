@@ -1,0 +1,392 @@
+[
+ {
+  "round": 0,
+  "category": "Human Fidelity",
+  "dimension": "Human_Anatomy",
+  "prompt": "A man is playing badminton.",
+  "index": 0,
+  "seed": 1000,
+  "file": "Human_Anatomy/A man is playing badminton.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 0,
+  "category": "Human Fidelity",
+  "dimension": "Human_Identity",
+  "prompt": "A man is playing badminton.",
+  "index": 0,
+  "seed": 1003,
+  "file": "Human_Identity/A man is playing badminton.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 0,
+  "category": "Creativity",
+  "dimension": "Composition",
+  "prompt": "A whale with the wings of a bat, soaring over the ocean surface under the full moon.",
+  "index": 0,
+  "seed": 1006,
+  "file": "Composition/A whale with the wings of a bat, soaring over the ocean surface under the full moon.-0.mp4",
+  "auxiliary_info": {
+   "question": [
+    "Bat's wings",
+    "A whale"
+   ],
+   "judge": [
+    true,
+    false
+   ]
+  }
+ },
+ {
+  "round": 0,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 0,
+  "seed": 1009,
+  "file": "Diversity/A shark and a giraffe create a new species.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 0,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 1,
+  "seed": 1010,
+  "file": "Diversity/A shark and a giraffe create a new species.-1.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 0,
+  "category": "Controllability",
+  "dimension": "Camera_Motion",
+  "prompt": "Mount Fuji, zoom in.",
+  "index": 0,
+  "seed": 1015,
+  "file": "Camera_Motion/Mount Fuji, zoom in.-0.mp4",
+  "auxiliary_info": "zoom_in"
+ },
+ {
+  "round": 0,
+  "category": "Controllability",
+  "dimension": "Dynamic_Attribute",
+  "prompt": "A wall changes from yellow to grey.",
+  "index": 0,
+  "seed": 1018,
+  "file": "Dynamic_Attribute/A wall changes from yellow to grey.-0.mp4",
+  "auxiliary_info": [
+   "Initially, is the color of the wall mostly yellow? (yes or no)",
+   "Finally, is the color of the wall mostly grey? (yes or no)",
+   "Does the color of the wall change? (yes or no)"
+  ]
+ },
+ {
+  "round": 0,
+  "category": "Physics",
+  "dimension": "Mechanics",
+  "prompt": "A cork is placed on the surface of a bucket filled with water.",
+  "index": 0,
+  "seed": 1021,
+  "file": "Mechanics/A cork is placed on the surface of a bucket filled with water.-0.mp4",
+  "auxiliary_info": [
+   "Does the cork float on the surface of the water? (yes or no)"
+  ]
+ },
+ {
+  "round": 0,
+  "category": "Physics",
+  "dimension": "Multi-View_Consistency",
+  "prompt": "The camera orbits around. Sagrada Familia, the camera circles around.",
+  "index": 0,
+  "seed": 1024,
+  "file": "Multi-View_Consistency/The camera orbits around. Sagrada Familia, the camera circles around.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 0,
+  "category": "Commonsense",
+  "dimension": "Motion_Rationality",
+  "prompt": "A person is eating a slice of pizza.",
+  "index": 0,
+  "seed": 1027,
+  "file": "Motion_Rationality/A person is eating a slice of pizza.-0.mp4",
+  "auxiliary_info": [
+   "Does the person appear to be eating a slice of pizza? (yes or no)",
+   "Is the person's mouth in contact with the pizza slice? (yes or no)",
+   "After eating, is the pizza slice visibly reduced? (yes or no)",
+   "Is the pizza slice still there after eating? (yes or no)"
+  ]
+ },
+ {
+  "round": 0,
+  "category": "Commonsense",
+  "dimension": "Instance_Preservation",
+  "prompt": "Two sandy kangaroos are fighting.",
+  "index": 0,
+  "seed": 1030,
+  "file": "Instance_Preservation/Two sandy kangaroos are fighting.-0.mp4",
+  "auxiliary_info": "2.sandy kangaroo"
+ },
+ {
+  "round": 1,
+  "category": "Human Fidelity",
+  "dimension": "Human_Anatomy",
+  "prompt": "A person is brushing their teeth, then they suddenly start making breakfast.",
+  "index": 0,
+  "seed": 1001,
+  "file": "Human_Anatomy/A person is brushing their teeth, then they suddenly start making breakfast.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 1,
+  "category": "Human Fidelity",
+  "dimension": "Human_Identity",
+  "prompt": "A person is drinking tea, then they suddenly start folding the laundry.",
+  "index": 0,
+  "seed": 1004,
+  "file": "Human_Identity/A person is drinking tea, then they suddenly start folding the laundry.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 1,
+  "category": "Creativity",
+  "dimension": "Composition",
+  "prompt": "A giraffe breakdancing, spinning on its back and flipping gracefully despite its towering height.",
+  "index": 0,
+  "seed": 1007,
+  "file": "Composition/A giraffe breakdancing, spinning on its back and flipping gracefully despite its towering height.-0.mp4",
+  "auxiliary_info": {
+   "question": [
+    "A giraffe is breakdancing."
+   ],
+   "judge": [
+    false,
+    true
+   ]
+  }
+ },
+ {
+  "round": 1,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 2,
+  "seed": 1011,
+  "file": "Diversity/A shark and a giraffe create a new species.-2.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 1,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 3,
+  "seed": 1012,
+  "file": "Diversity/A shark and a giraffe create a new species.-3.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 1,
+  "category": "Controllability",
+  "dimension": "Camera_Motion",
+  "prompt": "Vase, zoom in.",
+  "index": 0,
+  "seed": 1016,
+  "file": "Camera_Motion/Vase, zoom in.-0.mp4",
+  "auxiliary_info": "zoom_in"
+ },
+ {
+  "round": 1,
+  "category": "Controllability",
+  "dimension": "Dynamic_Attribute",
+  "prompt": "A dog changes from small to big.",
+  "index": 0,
+  "seed": 1019,
+  "file": "Dynamic_Attribute/A dog changes from small to big.-0.mp4",
+  "auxiliary_info": [
+   "Does the size of the dog increase? (yes or no)"
+  ]
+ },
+ {
+  "round": 1,
+  "category": "Physics",
+  "dimension": "Mechanics",
+  "prompt": "A timelapse of air being extracted from a sealed, empty vacuum chamber.",
+  "index": 0,
+  "seed": 1022,
+  "file": "Mechanics/A timelapse of air being extracted from a sealed, empty vacuum chamber.-0.mp4",
+  "auxiliary_info": [
+   "Does the vacuum chamber deform inward? (yes or no)"
+  ]
+ },
+ {
+  "round": 1,
+  "category": "Physics",
+  "dimension": "Multi-View_Consistency",
+  "prompt": "The camera orbits around. Sundae, the camera circles around.",
+  "index": 0,
+  "seed": 1025,
+  "file": "Multi-View_Consistency/The camera orbits around. Sundae, the camera circles around.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 1,
+  "category": "Commonsense",
+  "dimension": "Motion_Rationality",
+  "prompt": "A person is drinking juice from a glass.",
+  "index": 0,
+  "seed": 1028,
+  "file": "Motion_Rationality/A person is drinking juice from a glass.-0.mp4",
+  "auxiliary_info": [
+   "Does the person appear to be drinking juice? (yes or no)",
+   "Is the person's mouth in contact with the glass? (yes or no)",
+   "After drinking, is the amount of juice visibly reduced? (yes or no)",
+   "Is the glass remaining after drinking? (yes or no)"
+  ]
+ },
+ {
+  "round": 1,
+  "category": "Commonsense",
+  "dimension": "Instance_Preservation",
+  "prompt": "A red car is moving along the road.",
+  "index": 0,
+  "seed": 1031,
+  "file": "Instance_Preservation/A red car is moving along the road.-0.mp4",
+  "auxiliary_info": "1.red car"
+ },
+ {
+  "round": 2,
+  "category": "Human Fidelity",
+  "dimension": "Human_Anatomy",
+  "prompt": "Two people are building a puzzle together.",
+  "index": 0,
+  "seed": 1002,
+  "file": "Human_Anatomy/Two people are building a puzzle together.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 2,
+  "category": "Human Fidelity",
+  "dimension": "Human_Identity",
+  "prompt": "A person is sitting on a chair, then they suddenly start cleaning the desk.",
+  "index": 0,
+  "seed": 1005,
+  "file": "Human_Identity/A person is sitting on a chair, then they suddenly start cleaning the desk.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 2,
+  "category": "Creativity",
+  "dimension": "Composition",
+  "prompt": "A giraffe, a vacuum cleaner, a skateboard, and a book are in a race. The giraffe uses its long neck to try to reach the finish line first, while the vacuum cleaner moves backwards, accidentally sucking up the skateboard. The book flies off the shelf and lands on the giraffe's back, causing it to trip and stumble.",
+  "index": 0,
+  "seed": 1008,
+  "file": "Composition/A giraffe, a vacuum cleaner, a skateboard, and a book are in a race. The giraffe uses its long neck to try to reach the finish line first, while the vacuum cleaner moves backwards,-0.mp4",
+  "auxiliary_info": {
+   "question": [
+    "A giraffe, a vacuum cleaner, a skateboard, and a book are having a race.",
+    "The giraffe tried to reach the finish line first with its long neck.",
+    "The vacuum cleaner moved backward and accidentally sucked up the skateboard.",
+    "The book flew off the shelf and landed on the giraffe's back, causing it to trip."
+   ],
+   "judge": [
+    false,
+    false
+   ]
+  }
+ },
+ {
+  "round": 2,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 4,
+  "seed": 1013,
+  "file": "Diversity/A shark and a giraffe create a new species.-4.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 2,
+  "category": "Creativity",
+  "dimension": "Diversity",
+  "prompt": "A shark and a giraffe create a new species.",
+  "index": 5,
+  "seed": 1014,
+  "file": "Diversity/A shark and a giraffe create a new species.-5.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 2,
+  "category": "Controllability",
+  "dimension": "Camera_Motion",
+  "prompt": "Laptop, zoom in.",
+  "index": 0,
+  "seed": 1017,
+  "file": "Camera_Motion/Laptop, zoom in.-0.mp4",
+  "auxiliary_info": "zoom_in"
+ },
+ {
+  "round": 2,
+  "category": "Controllability",
+  "dimension": "Dynamic_Attribute",
+  "prompt": "The wooden car body turned into a metal car body.",
+  "index": 0,
+  "seed": 1020,
+  "file": "Dynamic_Attribute/The wooden car body turned into a metal car body.-0.mp4",
+  "auxiliary_info": [
+   "Initially, is the material of the car body wooden? (yes or no)",
+   "Finally, is the material of the car body metal? (yes or no)",
+   "Does the material of the car body change? (yes or no)"
+  ]
+ },
+ {
+  "round": 2,
+  "category": "Physics",
+  "dimension": "Mechanics",
+  "prompt": "A silver pen is used to write on the rough, textured surface of a cardboard box, capturing the mark left by the pen due to friction.",
+  "index": 0,
+  "seed": 1023,
+  "file": "Mechanics/A silver pen is used to write on the rough, textured surface of a cardboard box, capturing the mark left by the pen due to friction.-0.mp4",
+  "auxiliary_info": [
+   "Does the pen contact with the cardboard box? (yes or no)",
+   "Does the mark leave where the pen contacts the cardboard box? (yes or no)"
+  ]
+ },
+ {
+  "round": 2,
+  "category": "Physics",
+  "dimension": "Multi-View_Consistency",
+  "prompt": "The camera orbits around. Camera, the camera circles around.",
+  "index": 0,
+  "seed": 1026,
+  "file": "Multi-View_Consistency/The camera orbits around. Camera, the camera circles around.-0.mp4",
+  "auxiliary_info": null
+ },
+ {
+  "round": 2,
+  "category": "Commonsense",
+  "dimension": "Motion_Rationality",
+  "prompt": "A person is turning off the fan.",
+  "index": 0,
+  "seed": 1029,
+  "file": "Motion_Rationality/A person is turning off the fan.-0.mp4",
+  "auxiliary_info": [
+   "Is the person turning off the fan? (yes or no)",
+   "Is the fan on before being turned off? (yes or no)",
+   "Does the fan visibly stop spinning or turn off when switched? (yes or no)",
+   "Is the person’s hand in contact with the fan's switch or power button? (yes or no)"
+  ]
+ },
+ {
+  "round": 2,
+  "category": "Commonsense",
+  "dimension": "Instance_Preservation",
+  "prompt": "An orange dog changes from small to big.",
+  "index": 0,
+  "seed": 1032,
+  "file": "Instance_Preservation/An orange dog changes from small to big.-0.mp4",
+  "auxiliary_info": "1.orange dog"
+ }
+]

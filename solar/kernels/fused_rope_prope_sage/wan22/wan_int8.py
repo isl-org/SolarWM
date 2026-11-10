@@ -113,9 +113,11 @@ def build_expert(int8_dir):
 
 
 def load_expert_weights(model, int8_dir, device):
-    """Materialise every parameter / buffer of `model` from the int8 shards directly on `device`."""
+    """Materialise every parameter / buffer of `model` from the shards (int8_index.json or svdq_index.json)
+    directly on `device`."""
     from safetensors.torch import load_file
-    index = json.load(open(os.path.join(int8_dir, "int8_index.json")))
+    name = "int8_index.json" if os.path.isfile(os.path.join(int8_dir, "int8_index.json")) else "svdq_index.json"
+    index = json.load(open(os.path.join(int8_dir, name)))
     state = {}
     for shard in sorted(set(index["weight_map"].values())):
         state.update(load_file(os.path.join(int8_dir, shard), device=str(device)))

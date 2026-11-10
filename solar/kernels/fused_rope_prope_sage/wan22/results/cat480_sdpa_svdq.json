@@ -1,0 +1,21 @@
+{
+ "tag": "cat480",
+ "arm": "sdpa",
+ "linear": "svdq",
+ "width": 544,
+ "height": 720,
+ "frames": 81,
+ "tokens_per_attention": 32130,
+ "steps": 40,
+ "guidance": 3.5,
+ "seed": 42,
+ "denoise_s": 1606.9,
+ "denoise_excl_load_s": 1602.3,
+ "self_attention_s": 802.1,
+ "expert_load_s": 4.7,
+ "decode_s": 23.7,
+ "total_s": 1638.0,
+ "peak_denoise_gib": 14.29,
+ "self_attention_calls": 3200,
+ "sage_build": null
+}

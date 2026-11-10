@@ -1,0 +1,3 @@
+qkv      N=15360 K= 5120 | cos vs fp32: SVDQ r32 0.99532, W4A4 r0 0.99357, bf16 1.00000 | kernel vs emulation 1.00000 | bf16  40.84 ms ( 124 TF) W8A16  44.34 ms SVDQ  35.00 ms ( 144 TOPS) -> 1.27x vs W8A16
+ffn_up   N=13824 K= 5120 | cos vs fp32: SVDQ r32 0.99525, W4A4 r0 0.99347, bf16 1.00000 | kernel vs emulation 1.00000 | bf16  36.58 ms ( 124 TF) W8A16  39.54 ms SVDQ  32.27 ms ( 141 TOPS) -> 1.23x vs W8A16
+ffn_down N= 5120 K=13824 | cos vs fp32: SVDQ r32 0.99478, W4A4 r0 0.99415, bf16 1.00000 | kernel vs emulation 1.00000 | bf16  44.30 ms ( 103 TF) W8A16  46.33 ms SVDQ  44.69 ms ( 102 TOPS) -> 1.04x vs W8A16

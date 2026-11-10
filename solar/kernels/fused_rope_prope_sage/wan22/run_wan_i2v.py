@@ -23,9 +23,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.environ.get("SAGE_BUILD_DIR", "/home/gta/omni_bench/kernel/build"))
 import sage_causal  # noqa: E402
 import wan_int8     # noqa: E402
+import wan_svdq     # noqa: E402
 
 MODEL = os.environ.get("WAN_DIR", "/home/gta/models/wan22-i2v-a14b-diffusers")
 INT8 = os.environ.get("WAN_INT8_DIR", "/home/gta/models/wan22-i2v-a14b-int8")
+SVDQ = os.environ.get("WAN_SVDQ_DIR", "/home/gta/models/wan22-i2v-a14b-svdq")
 PROMPT = ("Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline "
           "gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring "
           "crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally "
@@ -89,6 +91,24 @@ class LazyExperts:
             self.active = None
 
 
+def install_calibration(experts, prefixes):
+    """Record the per-input-channel max |x| of every block's self-attention QKV input and both FFN inputs."""
+    amax = {}
+
+    def hook(key):
+        def fn(mod, args):
+            x = args[0].detach().reshape(-1, args[0].shape[-1]).abs().amax(0).float()
+            amax[key] = torch.maximum(amax[key], x) if key in amax else x
+        return fn
+
+    for m, p in zip(experts, prefixes):
+        for i, blk in enumerate(m.blocks):
+            blk.attn1.to_q.register_forward_pre_hook(hook(f"{p}.{i}.attn1"))
+            blk.ffn.net[0].proj.register_forward_pre_hook(hook(f"{p}.{i}.ffn_up"))
+            blk.ffn.net[2].register_forward_pre_hook(hook(f"{p}.{i}.ffn_down"))
+    return amax
+
+
 def write_mp4(frames, path, fps=16):
     f, h, w, _ = frames.shape
     p = subprocess.Popen(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
@@ -109,6 +129,9 @@ def main():
     ap.add_argument("--guidance", type=float, default=3.5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="/home/gta/omni_bench/wan/outputs")
+    ap.add_argument("--linear", choices=["int8", "svdq"], default="int8",
+                    help="block linears: W8A16 (int8) or SVDQuant W4A4 for QKV + FFN (svdq)")
+    ap.add_argument("--calib-out", help="record activation channel maxima (int8 linears) to this .pt file")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     torch.xpu.set_per_process_memory_fraction(0.94)
@@ -129,8 +152,10 @@ def main():
     te = UMT5EncoderModel.from_pretrained(f"{MODEL}/text_encoder", torch_dtype=torch.bfloat16).to(dev)
     vae = AutoencoderKLWan.from_pretrained(f"{MODEL}/vae", torch_dtype=torch.float32).to(dev)
     sched = UniPCMultistepScheduler.from_pretrained(f"{MODEL}/scheduler")
-    experts = [wan_int8.build_expert(f"{INT8}/transformer"), wan_int8.build_expert(f"{INT8}/transformer_2")]
-    lazy = LazyExperts(experts, [f"{INT8}/transformer", f"{INT8}/transformer_2"], dev)
+    wdir, build = (SVDQ, wan_svdq.build_expert) if a.linear == "svdq" else (INT8, wan_int8.build_expert)
+    experts = [build(f"{wdir}/transformer"), build(f"{wdir}/transformer_2")]
+    lazy = LazyExperts(experts, [f"{wdir}/transformer", f"{wdir}/transformer_2"], dev)
+    calib = install_calibration(experts, ["transformer", "transformer_2"]) if a.calib_out else None
     boundary = json.load(open(f"{MODEL}/model_index.json"))["boundary_ratio"]
     pipe = Pipe(tokenizer=tok, text_encoder=te, vae=vae, scheduler=sched, transformer=experts[0],
                 transformer_2=experts[1], boundary_ratio=boundary)
@@ -163,6 +188,9 @@ def main():
     attn_s = sum(x.elapsed_time(y) for x, y in STATE["events"]) / 1e3
     peak = torch.xpu.max_memory_allocated() / 2**30
     lazy.unload_all()
+    if calib is not None:
+        torch.save({k: v.cpu() for k, v in calib.items()}, a.calib_out)
+        print(f"[calib] {len(calib)} channel-max vectors -> {a.calib_out}", flush=True)
     t1 = time.perf_counter()
     with torch.no_grad():
         lat = latents.to(dev, vae.dtype)
@@ -172,10 +200,10 @@ def main():
         frames = pipe.video_processor.postprocess_video(video, output_type="np")[0]
     t_decode = time.perf_counter() - t1
     frames = (np.clip(frames, 0, 1) * 255).round().astype(np.uint8)
-    base = f"{a.out}/{a.tag}_{a.arm}"
+    base = f"{a.out}/{a.tag}_{a.arm}" + ("_svdq" if a.linear == "svdq" else "")
     np.save(f"{base}.npy", frames)
     write_mp4(frames, f"{base}.mp4")
-    rec = dict(tag=a.tag, arm=a.arm, width=width, height=height, frames=a.frames, tokens_per_attention=tokens,
+    rec = dict(tag=a.tag, arm=a.arm, linear=a.linear, width=width, height=height, frames=a.frames, tokens_per_attention=tokens,
                steps=a.steps, guidance=a.guidance, seed=a.seed, denoise_s=round(t_denoise, 1),
                denoise_excl_load_s=round(t_denoise - lazy.load_s, 1),
                self_attention_s=round(attn_s, 1), expert_load_s=round(lazy.load_s, 1), decode_s=round(t_decode, 1),
