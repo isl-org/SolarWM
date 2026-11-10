@@ -13,26 +13,31 @@ Last updated 2026-11-10. Companion runbooks: `QWEN3_OMNI_RUNBOOK.md`, `QWEN3_VL_
 
 **End-to-end result** (official example image and prompt, 544×720, 81 frames, 40 UniPC steps, CFG 3.5, seed 42; 32,130 tokens per self-attention call, 3,200 calls per video; `wan22/results/cat480_{sdpa,sage}.json`):
 
-| | SDPA (default) | Sage INT8 | speedup |
+| | SDPA (default) | Sage INT8 | Sage INT4 |
 |---|---|---|---|
-| self-attention | 801.7 s | 607.5 s | **1.32×** |
-| denoising, excluding expert loads | 1648.6 s (41.2 s/step) | 1443.5 s (36.1 s/step) | **1.14×** |
-| whole run (text encode + denoise + VAE decode) | 1686.9 s | 1481.7 s | **1.14×** |
-| peak VRAM during denoising | 17.8 GiB | 17.8 GiB | — |
+| self-attention | 801.7 s | 607.5 s (**1.32×**) | 467.2 s (**1.72×**) |
+| denoising, excluding expert loads | 1648.6 s (41.2 s/step) | 1443.5 s (36.1 s/step, **1.14×**) | 1323.8 s (33.1 s/step, **1.25×**) |
+| whole run (text encode + denoise + VAE decode) | 1686.9 s | 1481.7 s (**1.14×**) | 1363.1 s (**1.24×**) |
+| peak VRAM during denoising | 17.8 GiB | 17.8 GiB | 18.0 GiB |
+
+Sage INT8 is the installed `sage_causal.sycl` (smoothed INT8 Q·Kᵀ, K smoothing). Sage INT4 is the smoothed INT4 Q·Kᵀ kernel from commit `c2c1cce` (`QWEN3_OMNI_RUNBOOK.md` 6.6), built into its own directory and selected with `SAGE_BUILD_DIR`; results in `wan22/results/cat480_int4_sage.json`.
 
 - Self-attention is 49% of denoising time with SDPA; the remaining ≈ 840 s (INT8 linears with per-call dequantisation, cross-attention, norms) is the same in both arms, which caps the end-to-end gain.
 - The in-model attention speedup matches the standalone kernel benchmark at this shape (section 3).
 
-**Quality, Sage vs SDPA, same seed** (`wan22/results/cat480_compare.json`):
+**Quality, same seed** (`wan22/results/cat480_compare.json`, `cat480_int4_vs_sdpa_compare.json`, `cat480_int4_vs_int8_compare.json`):
 
-| metric | mean | worst frame |
-|---|---|---|
-| PSNR | 26.2 dB | 23.1 dB |
-| SSIM (luma) | 0.861 | 0.787 |
-| mean abs difference | 6.1 / 255 | — |
+| pair | PSNR mean / worst | PSNR frame 0 → 80 | SSIM mean / worst | mean abs diff |
+|---|---|---|---|---|
+| INT8 vs SDPA | 26.2 / 23.1 dB | 39.0 → 23.1 dB | 0.861 / 0.787 | 6.1 / 255 |
+| INT4 vs SDPA | 20.3 / 17.2 dB | 30.4 → 17.2 dB | 0.712 / 0.638 | 15.1 / 255 |
+| INT4 vs INT8 | 20.6 / 17.7 dB | 30.4 → 17.7 dB | 0.720 / 0.666 | 14.4 / 255 |
 
-- PSNR is 39 dB on the first frame (the conditioning image) and drifts down to ≈ 23–24 dB by the last frame.
-- Visually the two videos show the same scene, subject, composition and motion; neither has artifacts, blur or colour shift. The difference maps concentrate on high-frequency edges (whiskers, fur, sunglasses rims, water texture), i.e. small spatial shifts. This is trajectory divergence: a small numerical change in early denoising steps is amplified by the sampler into a slightly different but equally valid sample. Pixel metrics count that as difference, not as degradation.
+Kernel-level error at the Wan shape (random inputs with a per-channel K bias, cosine vs bf16 SDPA): INT8 0.99995, INT4 0.986.
+
+- **INT8:** PSNR is 39 dB on the first frame (the conditioning image) and drifts down to ≈ 23–24 dB by the last frame. Visually the two videos show the same scene, subject, composition and motion; neither has artifacts, blur or colour shift. The difference maps concentrate on high-frequency edges (whiskers, fur, sunglasses rims, water texture), i.e. small spatial shifts.
+- **INT4:** frame 0 is already 30 dB (texture-level differences on the conditioning frame), and by the end the video follows a visibly different camera path (horizon lower, more spray, the cat framed slightly further right). Each frame is still clean: no artifacts, banding, smearing or colour shift, and the subject is intact. INT4 is about equally far from SDPA and from INT8, so it is a separate trajectory, not a perturbation of either. Mean gradient magnitude (a sharpness proxy, every 8th frame) is 9.46 SDPA / 9.39 INT8 / 8.99 INT4: a 5% drop for INT4 that may be content (more motion blur and spray) rather than detail loss; one video cannot separate the two.
+- Both are trajectory divergence: a numerical change in early denoising steps is amplified by the sampler into a different but valid sample. Pixel metrics count that as difference, not as degradation. The size of the divergence follows the kernel error (INT8 ≪ INT4).
 - There is no ground truth for image-to-video, so a same-seed comparison measures *divergence from the default*, not quality. Section 6 lists the controls that separate the two.
 
 ## 2. Model facts and memory budget
@@ -116,7 +121,18 @@ for arm in sdpa sage; do
   scripts/rss_guard.sh 24 logs/wan_i2v_cat480_$arm.log -- ./env.sh python wan/run_wan_i2v.py --arm $arm --tag cat480
 done
 ./env.sh python wan/compare_videos.py wan/outputs/cat480_sdpa.npy wan/outputs/cat480_sage.npy --out wan/outputs/cat480
+
+# INT4 arm (about 23 min): build the c2c1cce kernel into its own directory and select it
+mkdir -p kernel/int4_src
+git -C /home/gta/SolarWM show c2c1cce:solar/kernels/fused_rope_prope_sage/sage_causal.sycl > kernel/int4_src/sage_causal.sycl
+bash kernel/build.sh kernel/build_int4 $PWD/kernel/int4_src/sage_causal.sycl sage_causal
+SAGE_BUILD_DIR=$PWD/kernel/build_int4 scripts/rss_guard.sh 24 logs/wan_i2v_cat480_int4.log -- \
+  ./env.sh python wan/run_wan_i2v.py --arm sage --tag cat480_int4
+./env.sh python wan/compare_videos.py wan/outputs/cat480_sdpa.npy wan/outputs/cat480_int4_sage.npy --out wan/outputs/cat480_int4_vs_sdpa
+./env.sh python wan/compare_videos.py wan/outputs/cat480_sage.npy wan/outputs/cat480_int4_sage.npy --out wan/outputs/cat480_int4_vs_int8
 ```
+
+Two builds of `sage_causal` cannot be compared in one Python process: both are module `sage_causal`, and the second import silently returns the first. Run each build in its own process.
 
 Other settings: `--max-area $((720*1280))` for 720p (75,600 tokens; about 1.5 h per arm), `--image`, `--prompt`, `--frames`, `--steps`, `--guidance`, `--seed`. Another kernel build is selected with `SAGE_BUILD_DIR`; use a distinct `--tag` so outputs are not overwritten (the JSON records the build directory).
 
@@ -124,7 +140,7 @@ Other settings: `--max-area $((720*1280))` for 720p (75,600 tokens; about 1.5 h 
 
 - **Same-seed divergence is not a quality score.** To show how much of the 26 dB divergence is specific to Sage, run a control arm that is exact up to bf16 rounding (e.g. SDPA math backend or a different reduction order) and compare it with the default the same way. If it lands near the same PSNR, the divergence is the sampler's sensitivity rather than INT8 error.
 - **Reference-free quality metrics** (CLIP text–frame similarity, frame-quality or temporal-consistency scores) and more prompts / seeds are needed to report a quality delta with an uncertainty.
-- **INT4 Q·Kᵀ** (the `c2c1cce` kernel from `QWEN3_OMNI_RUNBOOK.md` 6.6) has cosine 0.986 vs SDPA at the Wan shape, against 0.99995 for INT8; an end-to-end run with it shows whether that error becomes visible in the video.
+- **INT4 vs INT8 trade-off:** INT4 is 1.24× end to end against 1.14× for INT8 and produces a clean but clearly different video (closer to a different seed than to the default). Whether it loses quality on average (sharpness, prompt adherence, temporal consistency) needs the reference-free metrics above over several prompts and seeds; on Qwen3-Omni the same INT4 kernel lost 7.4 RULER points at 64K.
 - **720p** (75,600 tokens) should show a larger end-to-end gain (kernel 1.40× at 60,840 tokens) and has not been run.
 - The INT8 linears dequantise to bf16 on every call; that cost is identical in both arms but dilutes the end-to-end speedup. A fused W8A16 GEMM would make attention a larger share of each step.
 - Wan2.2 recommends fp32 for `time_embedder`, `scale_shift_table` and the norms; this setup keeps them in bf16 (the same in both arms).

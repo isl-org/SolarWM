@@ -1,0 +1,19 @@
+{
+ "tag": "cat480_int4",
+ "arm": "sage",
+ "width": 544,
+ "height": 720,
+ "frames": 81,
+ "tokens_per_attention": 32130,
+ "steps": 40,
+ "guidance": 3.5,
+ "seed": 42,
+ "denoise_s": 1331.9,
+ "denoise_excl_load_s": 1323.8,
+ "self_attention_s": 467.2,
+ "expert_load_s": 8.1,
+ "decode_s": 23.8,
+ "total_s": 1363.1,
+ "peak_denoise_gib": 17.96,
+ "self_attention_calls": 3200
+}
