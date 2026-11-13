@@ -7,8 +7,14 @@
 #include <c10/xpu/XPUStream.h>
 #include <cute/tensor.hpp>
 #include <string>
+#include <set>
+#include <functional>
 #include "tuning_params.h"
+#include "autotune.hpp"
 
+// KF_GRF / KF_N_TILE are the legacy single-configuration knobs of the task harness. The GEMM now compiles a
+// pool of configurations (see KF_GEMM_VARIANTS) and selects among them at run time, so they are no longer used
+// by the GEMM; they remain defined so existing hyperparameter plumbing keeps building.
 #ifndef KF_GRF
 #define KF_GRF 128
 #endif
@@ -78,6 +84,8 @@ static_assert(MmaInt4::K == kGroup, "one INT4 DPAS step must span exactly one qu
 using u16x32 = vec_t<uint16_t, 32>;
 SYCL_EXTERNAL extern "C" u16x32 __builtin_IB_subgroup_block_read_flat_u16_m16k16v2(
     intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord);
+SYCL_EXTERNAL extern "C" u16x8 __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(
+    intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord);
 SYCL_EXTERNAL extern "C" u32x8 __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
     intptr_t base, int width_minus_one, int height_minus_one, int pitch_minus_one, coord2 coord);
 SYCL_EXTERNAL extern "C" void __builtin_IB_subgroup_block_write_flat_u16_m8k16v1(
@@ -131,7 +139,7 @@ inline uint32_t quant_nibble(float v, float inv_scale) {
 //   BF16 A: element m of lane l = A[m][l].  BF16 B: dword d of lane n = B[2d..2d+1][n],
 //   i.e. 32 contiguous bytes of row n of a row-major [N, K] matrix.
 //   D: element m of lane n = D[m][n].
-inline void dpas_s4(s32x8& d, MmaInt4::AVector const& a, u32x8 const& b) {
+inline void dpas_s4(s32x8& d, u16x8 const& a, u32x8 const& b) {
 #ifdef __SYCL_DEVICE_ONLY__
     asm("{\n"
         ".decl DST     v_type=G type=d  num_elts=128 alias=<%0,0>\n"
@@ -456,26 +464,36 @@ inline float quantize_tile8x64_bf16(sycl::sub_group sg, int lane, const u16x8 (&
     return scale_row[lane >> 1];
 }
 
-template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
+constexpr int kMaxRankBlocks = 8;   // LoRA rank <= 128
+
+// RB > 0: LoRA rank is exactly 16 * RB (compile-time); RB == 0: any rank up to 16 * kMaxRankBlocks at run time.
+template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT, int RB>
 inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8 (&acc)[kTilesN], int m0, int ng) {
     const int M = p.M, N = p.N;
     const int n0 = ng * kGroup;
 
     if (p.lora_act != nullptr) {
+        // lora_act tile (8 rows x 16 ranks per block) -> bf16 A operands, converted once per tile.
+        constexpr int KB = RB > 0 ? RB : kMaxRankBlocks;
+        const int nkb = RB > 0 ? RB : p.R / 16;
+        const int kb_offset = p.is_qkv ? ((n0 / (p.N / 3)) * (p.R / 16)) : 0;  // a 64-col group never straddles a split
+        u16x8 la[KB];
+        #pragma unroll
+        for (int kb = 0; kb < KB; ++kb) {
+            if (RB > 0 || kb < nkb) {
+                const auto raw = __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
+                    intptr_t(p.lora_act), p.lora_ld * 4 - 1, M - 1, p.lora_ld * 4 - 1, coord2{(kb_offset + kb) * 16, m0});
+                #pragma unroll
+                for (int m = 0; m < kTileM; ++m) la[kb][m] = f32_to_bf16(sycl::bit_cast<float>(raw[m]));
+            }
+        }
         #pragma unroll
         for (int t = 0; t < kTilesN; ++t) {
             f32x8 up = {};
-            const int col = n0 + 16 * t + lane;
-            const int kb_offset = p.is_qkv ? ((col / (p.N / 3)) * (p.R / 16)) : 0;
-            const uint16_t* b_row = p.lora_b + uint32_t(col) * uint32_t(p.R);
-            for (int kb = 0; kb < p.R / 16; ++kb) {
-                const auto la = __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
-                    intptr_t(p.lora_act), p.lora_ld * 4 - 1, M - 1, p.lora_ld * 4 - 1, coord2{(kb_offset + kb) * 16, m0});
-                u16x8 a;
-                #pragma unroll
-                for (int m = 0; m < kTileM; ++m) a[m] = f32_to_bf16(sycl::bit_cast<float>(la[m]));
-                dpas_bf16(up, a, *reinterpret_cast<const u32x8*>(b_row + kb * 16));
-            }
+            const uint16_t* b_row = p.lora_b + uint32_t(n0 + 16 * t + lane) * uint32_t(p.R);
+            #pragma unroll
+            for (int kb = 0; kb < KB; ++kb)
+                if (RB > 0 || kb < nkb) dpas_bf16(up, la[kb], *reinterpret_cast<const u32x8*>(b_row + kb * 16));
             acc[t] += up;
         }
     }
@@ -524,182 +542,364 @@ inline void gemm_epilogue(sycl::sub_group sg, int lane, const GemmArgs& p, f32x8
     }
 }
 
-template <bool HAS_QOUT, bool HAS_ROWSQ, Act ACT>
-void launch_gemm_impl(sycl::queue& q, const GemmArgs& p) {
-    constexpr int kNG = KF_N_TILE / kGroup;   // 64-column groups per sub-group
-    constexpr int kNT = kNG * kTilesN;        // 16-column DPAS tiles per sub-group
-    using namespace cute;
-    using TiledMma = typename TiledMMAHelper<MMA_Atom<MmaInt4>, Layout<Shape<Int<kTileM>, _16, _64>>,
-                                             Layout<Shape<_1, _1, _1>>>::TiledMMA;
-    const int grid_m = (p.M + kTileM - 1) / kTileM;
-    const int grid_n = p.N / KF_N_TILE;
-    // Work-group = sg_m sub-groups along M (sharing B tiles) x sg_n along N (sharing A tiles).
-    // Measured on B70: deep-K / narrow-N layers (FFN down) prefer 16 x 1, the others 4 x 4.
-    const bool tall = p.K > p.N || grid_n % 4 != 0;
-    const int sg_m = tall ? 16 : 4, sg_n = tall ? 1 : 4;
-    const sycl::range<2> local(sg_n * sg_m, kSG);
-    const sycl::range<2> global(grid_n * sg_m, ((grid_m + sg_m - 1) / sg_m) * kSG);
+// ---------------------------------------------------------------------------------------
+// GEMM configuration (compile-time, one template instantiation per candidate variant).
+//   MT    8-row DPAS blocks per sub-group along M: B tiles are reused MT times from registers
+//   NG    64-column quantization groups per sub-group along N
+//   SGM, SGN  work-group = SGM x SGN sub-groups (sharing B tiles along M / A tiles along N)
+//   SWZ   panel height (in work-groups along M) of the work-group order swizzle
+//   GRF   GRF mode, 128 or 256
+//   PIPE  1 = load the next K-group's operands while the current one is in the DPAS pipe
+//   PFD   cache prefetch distance in K-groups (even; 0 = off)
+// ---------------------------------------------------------------------------------------
+template <int MT_, int NG_, int SGM_, int SGN_, int SWZ_, int GRF_, int PIPE_, int PFD_>
+struct Cfg {
+    static constexpr int MT = MT_, NG = NG_, SGM = SGM_, SGN = SGN_, SWZ = SWZ_, GRF = GRF_, PIPE = PIPE_, PFD = PFD_;
+    static constexpr int kNT = NG_ * kTilesN;      // 16-column DPAS tiles per sub-group
+    static constexpr int tile_m = MT_ * kTileM;    // output rows per sub-group
+    static constexpr int tile_n = NG_ * kGroup;    // output columns per sub-group
+};
 
-    q.parallel_for<SVDQ_GEMM_int4<HAS_QOUT, HAS_ROWSQ, ACT>>(
+template <class C, bool HAS_QOUT, bool HAS_ROWSQ, Act ACT, int RB>
+class SVDQ_GEMM_v;
+
+template <class C>
+struct Stage {
+    u32x8 b[C::kNT];
+    u16x8 a[C::MT];
+    sycl::vec<float, C::kNT> sw;
+    float sx[C::MT];
+};
+
+template <class C, bool HAS_QOUT, bool HAS_ROWSQ, Act ACT, int RB>
+void launch_gemm_cfg(sycl::queue& q, const GemmArgs& p) {
+    constexpr int MT = C::MT, NG = C::NG, SGM = C::SGM, SGN = C::SGN, kNT = C::kNT;
+    const int grid_m = (p.M + C::tile_m - 1) / C::tile_m;
+    const int grid_n = p.N / C::tile_n;
+    const int groups_m = (grid_m + SGM - 1) / SGM;
+    const int groups_n = (grid_n + SGN - 1) / SGN;
+    const sycl::range<2> local(SGN * SGM, kSG);
+    const sycl::range<2> global(size_t(groups_n) * SGN * SGM, size_t(groups_m) * kSG);
+
+    q.parallel_for<SVDQ_GEMM_v<C, HAS_QOUT, HAS_ROWSQ, ACT, RB>>(
         sycl::nd_range<2>(global, local),
-        syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<KF_GRF>},
+        syclex::properties{syclex::sub_group_size<kSG>, intelex::grf_size<C::GRF>},
         [=](sycl::nd_item<2> item) {
             auto sg = item.get_sub_group();
             const int lane = item.get_local_id(1);
             const int sg_id = item.get_local_id(0);
-            // Work-group swizzling to improve L2/L3 cache locality for A and B.
-            const int num_groups_m = (grid_m + sg_m - 1) / sg_m;
-            const int num_groups_n = grid_n / sg_n;
-            const int raw_group_m = item.get_group(1);
-            const int raw_group_n = item.get_group(0);
-            
-            // Panel-based swizzle along M
-            constexpr int kSwizzleGroupM = 4;
-            const int linear_wg = raw_group_m * num_groups_n + raw_group_n;
-            const int pids_per_panel = kSwizzleGroupM * num_groups_n;
+
+            // Work-group swizzle: panels of SWZ work-groups along M share the B stream.
+            const int linear_wg = int(item.get_group(1)) * groups_n + int(item.get_group(0));
+            const int pids_per_panel = C::SWZ * groups_n;
             const int panel_id = linear_wg / pids_per_panel;
-            const int first_m = panel_id * kSwizzleGroupM;
-            const int panel_m_dim = sycl::min(num_groups_m - first_m, kSwizzleGroupM);
+            const int first_m = panel_id * C::SWZ;
+            const int panel_m_dim = sycl::min(groups_m - first_m, C::SWZ);
             const int in_panel = linear_wg % pids_per_panel;
             const int group_m = first_m + (in_panel % panel_m_dim);
             const int group_n = in_panel / panel_m_dim;
 
-            const int wg_m = group_m * sg_m + sg_id % sg_m;
-            const int wg_n = group_n * sg_n + sg_id / sg_m;
-            const int M = p.M, N = p.N, G = p.K / kGroup;
-            const int m0 = wg_m * kTileM;
-            const int n0 = wg_n * KF_N_TILE;
-            if (m0 >= M) return;
-
-            // A: CuTe 2D block load of the packed INT4 activations (its reorder is a no-op).
-            TiledMma mma{};
-            auto tensor_A = make_tensor(make_gmem_ptr(reinterpret_cast<const int4_t*>(p.x_q)),
-                                        make_shape(M, p.K), make_stride(p.K, _1{}));
-            auto copy_a = make_block_2d_copy_A(mma, tensor_A);
-            Tensor gA = local_tile(make_identity_tensor(tensor_A.shape()), select<0, 2>(mma.tile_mnk()), make_coord(wg_m, _));
-            auto thr_copy_a = copy_a.get_slice(lane);
-            auto tCrA = mma.get_slice(lane).partition_sg_fragment_A(gA(_, _, 0));
-            auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
-            Tensor tAgA = thr_copy_a.partition_S(gA);
+            const int wg_m = group_m * SGM + sg_id % SGM;
+            const int wg_n = group_n * SGN + sg_id / SGM;
+            const int M = p.M, N = p.N, K = p.K, G = K / kGroup;
+            const int m0 = wg_m * C::tile_m;
+            const int n0 = wg_n * C::tile_n;
+            if (m0 >= M || wg_n >= grid_n) return;
 
             const uint32_t b_stride = uint32_t(G) * 128u;
-            const uint32_t* b_src = p.w_dpas_b + uint32_t(n0 / 16) * b_stride;
-            const float* sw_ptr = p.w_scales_t + n0;
-            const uint32_t m_row = sycl::min(m0 + (lane & (kTileM - 1)), M - 1);
-            const float* xs_ptr = p.x_scales + uint32_t(m_row) * uint32_t(p.xs_row);
-            auto s_w0 = block_load<float, kNT>(sg, sw_ptr);
-            float s_x0 = *xs_ptr;
+            // Operand cursors: loads are issued for K-groups 0, 1, 2, ... in order, so each stream is a
+            // running pointer instead of an address recomputed (64-bit multiplies) per group.
+            const uint32_t* b_cur = p.w_dpas_b + uint32_t(n0 / 16) * b_stride;
+            const float* sw_cur = p.w_scales_t + n0;
+            const float* xs_cur[MT];
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                xs_cur[mt] = p.x_scales + uint32_t(sycl::min(m0 + mt * kTileM + (lane & (kTileM - 1)), M - 1)) * uint32_t(p.xs_row);
+            int a_x = 0;   // column (in 16-bit units) of the next INT4 activation block
 
-            f32x8 acc[kNG][kTilesN] = {};
-            for (int g = 0; g < G; g += 2) {
-                copy(copy_a, tAgA(_, _, _, g), tArA);
-                u32x8 b[kNT];
-                const uint32_t* b_ptr = b_src + uint32_t(g) * 128u;
+            auto load_stage = [&](int /*g*/, Stage<C>& s) {
                 #pragma unroll
-                for (int t = 0; t < kNT; ++t) b[t] = load_b_image(sg, b_ptr + uint32_t(t) * b_stride);
+                for (int mt = 0; mt < MT; ++mt)
+                    s.a[mt] = __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(
+                        intptr_t(p.x_q), K / 2 - 1, M - 1, K / 2 - 1, coord2{a_x, m0 + mt * kTileM});
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t) s.b[t] = load_b_image(sg, b_cur + uint32_t(t) * b_stride);
+                s.sw = block_load<float, kNT>(sg, sw_cur);
+                #pragma unroll
+                for (int mt = 0; mt < MT; ++mt) s.sx[mt] = *xs_cur[mt];
+                a_x += kGroup / 4;
+                b_cur += 128;
+                sw_cur += N;
+                #pragma unroll
+                for (int mt = 0; mt < MT; ++mt) xs_cur[mt] += p.xs_group;
+            };
 
-                const auto s_w = s_w0;
-                const float s_x = s_x0;
-
-                if (g + 1 < G) {
-                    sw_ptr += N;
-                    xs_ptr += p.xs_group;
+            // B image viewed as a 2D surface of 64-byte rows: tile (n16, g) = rows [(n16 G + g) 8, +8).
+            const int b_rows = (N / 16) * G * 8;
+            const int b_row0 = (n0 / 16) * G * 8;
+            auto prefetch_stage = [&](int g) {   // g even: covers K-groups g and g + 1
+#ifdef __SYCL_DEVICE_ONLY__
+                #pragma unroll
+                for (int t = 0; t < kNT; ++t)
+                    __builtin_IB_subgroup_block_read_prefetch_u16_m16k16v2(
+                        intptr_t(p.w_dpas_b), 63, b_rows - 1, 63, coord2{0, b_row0 + t * G * 8 + g * 8}, CacheControl::kL1C_L3C);
+                #pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    __builtin_IB_subgroup_block_read_prefetch_u8_m8k32v1(
+                        intptr_t(p.x_q), K / 2 - 1, M - 1, K / 2 - 1, coord2{g * 32, m0 + mt * kTileM}, CacheControl::kL1C_L3C);
+                    __builtin_IB_subgroup_block_read_prefetch_u8_m8k32v1(
+                        intptr_t(p.x_q), K / 2 - 1, M - 1, K / 2 - 1, coord2{g * 32 + 32, m0 + mt * kTileM}, CacheControl::kL1C_L3C);
                 }
-                auto s_w_next = block_load<float, kNT>(sg, sw_ptr);
-                float s_x_next = *xs_ptr;
+            #endif
+            };
+            if constexpr (C::PFD > 0) {
+                #pragma unroll
+                for (int d = 0; d < C::PFD; d += 2)
+                    if (d < G) prefetch_stage(d);
+            }
 
-                reorder(tArA, tCrA);
-                const auto& a0 = recast<MmaInt4::AVector>(tCrA)(0);
-                float sx[kTileM];
+            f32x8 acc[MT][NG][kTilesN] = {};
+            auto compute_stage = [&](const Stage<C>& s) {
                 #pragma unroll
-                for (int m = 0; m < kTileM; ++m) sx[m] = sycl::select_from_group(sg, s_x, m);
-                #pragma unroll
-                for (int ng = 0; ng < kNG; ++ng) {
-                    s32x8 c[kTilesN];
+                for (int mt = 0; mt < MT; ++mt) {
+                    float sx[kTileM];
                     #pragma unroll
-                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a0, b[ng * kTilesN + t]);
+                    for (int m = 0; m < kTileM; ++m) sx[m] = sycl::select_from_group(sg, s.sx[mt], m);
                     #pragma unroll
-                    for (int t = 0; t < kTilesN; ++t) {
-                        const float sw = s_w[ng * kTilesN + t];
+                    for (int ng = 0; ng < NG; ++ng) {
+                        s32x8 c[kTilesN];
                         #pragma unroll
-                        for (int m = 0; m < kTileM; ++m)
-                            acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx[m], acc[ng][t][m]);
+                        for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], s.a[mt], s.b[ng * kTilesN + t]);
+                        #pragma unroll
+                        for (int t = 0; t < kTilesN; ++t) {
+                            const float sw = s.sw[ng * kTilesN + t];
+                            #pragma unroll
+                            for (int m = 0; m < kTileM; ++m)
+                                acc[mt][ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx[m], acc[mt][ng][t][m]);
+                        }
                     }
                 }
+            };
 
-                if (g + 1 >= G) {
-                    s_w0 = s_w_next;
-                    s_x0 = s_x_next;
-                    break;
+            auto maybe_prefetch = [&](int g) {
+                if constexpr (C::PFD > 0) {
+                    if ((g & 1) == 0 && g + C::PFD < G) prefetch_stage(g + C::PFD);
                 }
-
-                copy(copy_a, tAgA(_, _, _, g + 1), tArA);
-                const uint32_t* b_ptr1 = b_ptr + 128u;
-                #pragma unroll
-                for (int t = 0; t < kNT; ++t) b[t] = load_b_image(sg, b_ptr1 + uint32_t(t) * b_stride);
-
-                const auto s_w1 = s_w_next;
-                const float s_x1 = s_x_next;
-
-                if (g + 2 < G) {
-                    sw_ptr += N;
-                    xs_ptr += p.xs_group;
+            };
+            if constexpr (C::PIPE == 1) {
+                Stage<C> s0, s1;
+                load_stage(0, s0);
+                for (int g = 0; g < G; g += 2) {
+                    maybe_prefetch(g);
+                    if (g + 1 < G) load_stage(g + 1, s1);
+                    compute_stage(s0);
+                    if (g + 1 >= G) break;
+                    if (g + 2 < G) load_stage(g + 2, s0);
+                    compute_stage(s1);
                 }
-                s_w0 = block_load<float, kNT>(sg, sw_ptr);
-                s_x0 = *xs_ptr;
-
-                reorder(tArA, tCrA);
-                const auto& a1 = recast<MmaInt4::AVector>(tCrA)(0);
-                float sx1[kTileM];
-                #pragma unroll
-                for (int m = 0; m < kTileM; ++m) sx1[m] = sycl::select_from_group(sg, s_x1, m);
-
-                #pragma unroll
-                for (int ng = 0; ng < kNG; ++ng) {
-                    s32x8 c[kTilesN];
-                    #pragma unroll
-                    for (int t = 0; t < kTilesN; ++t) dpas_s4(c[t], a1, b[ng * kTilesN + t]);
-                    #pragma unroll
-                    for (int t = 0; t < kTilesN; ++t) {
-                        const float sw = s_w1[ng * kTilesN + t];
-                        #pragma unroll
-                        for (int m = 0; m < kTileM; ++m)
-                            acc[ng][t][m] = sycl::fma(float(c[t][m]) * sw, sx1[m], acc[ng][t][m]);
-                    }
+            } else {
+                Stage<C> s0;
+                for (int g = 0; g < G; ++g) {
+                    maybe_prefetch(g);
+                    load_stage(g, s0);
+                    compute_stage(s0);
                 }
             }
 
             #pragma unroll
-            for (int ng = 0; ng < kNG; ++ng)
-                gemm_epilogue<HAS_QOUT, HAS_ROWSQ, ACT>(sg, lane, p, acc[ng], m0, n0 / kGroup + ng);
+            for (int mt = 0; mt < MT; ++mt) {
+                if (m0 + mt * kTileM >= M) continue;
+                #pragma unroll
+                for (int ng = 0; ng < NG; ++ng)
+                    gemm_epilogue<HAS_QOUT, HAS_ROWSQ, ACT, RB>(sg, lane, p, acc[mt][ng], m0 + mt * kTileM, n0 / kGroup + ng);
+            }
         });
 }
 
-void launch_gemm(sycl::queue& q, const GemmArgs& p) {
+// Candidate pool. Fields: MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD. The first entry is the legacy B70
+// configuration (8-row sub-group tiles, 4 x 4 work-groups) and is the fallback for every shape.
+#define KF_GEMM_VARIANTS(X) \
+    X(0,  1, 1,  4, 4, 4, 128, 0, 0) \
+    X(1,  1, 1,  4, 4, 4, 256, 1, 0) \
+    X(2,  1, 1,  8, 4, 4, 256, 1, 0) \
+    X(3,  1, 1,  4, 8, 4, 256, 1, 0) \
+    X(4,  1, 1, 16, 2, 4, 256, 1, 0) \
+    X(5,  1, 1,  8, 2, 4, 256, 1, 0) \
+    X(6,  1, 1,  4, 4, 8, 256, 1, 0) \
+    X(7,  1, 1,  4, 4, 1, 256, 1, 0) \
+    X(8,  1, 1,  4, 4, 4, 256, 1, 4) \
+    X(9,  2, 1,  4, 4, 4, 256, 0, 0) \
+    X(10, 2, 1,  8, 4, 4, 256, 0, 0) \
+    X(11, 1, 2,  4, 4, 4, 256, 0, 0) \
+    X(12, 1, 1, 16, 4, 4, 128, 0, 0) \
+    X(13, 1, 1, 16, 1, 4, 128, 0, 0) \
+    X(14, 1, 1,  8, 8, 4, 256, 1, 0)
+
+enum EpiKind : int { kEpiPlain = 0, kEpiRowSq = 1, kEpiGeluQ = 2, kNumEpi = 3 };
+using GemmFn = void (*)(sycl::queue&, const GemmArgs&);
+
+struct KernelLimits {
+    int64_t max_wg = -1;     // compiled work-group size limit on this device; -1 = unknown
+    int64_t private_mem = -1;  // compiled private (spill) bytes per work-item; -1 = unknown
+};
+using LimitsFn = KernelLimits (*)(sycl::queue&);
+
+struct GemmVariant {
+    const char* name;
+    int mt, ng, sgm, sgn, swz, grf, pipe, pfd;
+    GemmFn fn[kNumEpi];
+    LimitsFn limits[kNumEpi];
+};
+
+// Compiled-kernel resource report (device-specific work-group limit and spill size) of one instantiation.
+template <class C, bool Q, bool R, Act A, int RB>
+KernelLimits query_limits(sycl::queue& q) {
+    const auto c = kf_sycl_autotune::compiled_kernel_limits<SVDQ_GEMM_v<C, Q, R, A, RB>>(q);
+    return {c.max_work_group_size, c.private_mem_size};
+}
+
+#define KF_VARIANT_ROW(ID, MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD)                                                     \
+    {"mt" #MT "_ng" #NG "_wg" #SGM "x" #SGN "_swz" #SWZ "_grf" #GRF "_p" #PIPE "_pf" #PFD, MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD, \
+     {&launch_gemm_cfg<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, false, false, kActNone, 2>,                           \
+      &launch_gemm_cfg<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, false, true, kActNone, 2>,                            \
+      &launch_gemm_cfg<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, true, false, kActGeluTanh, 2>},                  \
+     {&query_limits<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, false, false, kActNone, 2>,                         \
+      &query_limits<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, false, true, kActNone, 2>,                          \
+      &query_limits<Cfg<MT, NG, SGM, SGN, SWZ, GRF, PIPE, PFD>, true, false, kActGeluTanh, 2>}},
+
+static const GemmVariant kGemmVariants[] = {KF_GEMM_VARIANTS(KF_VARIANT_ROW)};
+constexpr int kNumGemmVariants = int(sizeof(kGemmVariants) / sizeof(kGemmVariants[0]));
+
+// Epilogue combinations outside the tuned pool (e.g. SiLU) run on the legacy configuration.
+using LegacyCfg = Cfg<1, 1, 4, 4, 4, 128, 0, 0>;
+void launch_gemm_generic(sycl::queue& q, const GemmArgs& p) {
     const bool has_qout = p.qout != nullptr;
     const bool has_rowsq = p.row_sq != nullptr;
     const Act act = Act(p.act);
+    auto go = [&](auto qo, auto rs) {
+        constexpr bool QO = decltype(qo)::value, RS = decltype(rs)::value;
+        if (act == kActGeluTanh) return launch_gemm_cfg<LegacyCfg, QO, RS, kActGeluTanh, 0>(q, p);
+        if (act == kActSilu) return launch_gemm_cfg<LegacyCfg, QO, RS, kActSilu, 0>(q, p);
+        return launch_gemm_cfg<LegacyCfg, QO, RS, kActNone, 0>(q, p);
+    };
+    if (has_qout) { if (has_rowsq) go(std::true_type{}, std::true_type{}); else go(std::true_type{}, std::false_type{}); }
+    else { if (has_rowsq) go(std::false_type{}, std::true_type{}); else go(std::false_type{}, std::false_type{}); }
+}
 
-    if (has_qout) {
-        if (has_rowsq) {
-            if (act == kActGeluTanh) return launch_gemm_impl<true, true, kActGeluTanh>(q, p);
-            if (act == kActSilu)     return launch_gemm_impl<true, true, kActSilu>(q, p);
-            return launch_gemm_impl<true, true, kActNone>(q, p);
+// Tuned-pool epilogue family of `p`, or -1 when only the generic path implements it.
+inline int epilogue_kind(const GemmArgs& p) {
+    const bool qo = p.qout != nullptr, rs = p.row_sq != nullptr;
+    if (p.lora_act == nullptr || p.R != 32) return -1;   // pool kernels are specialized for rank-32 LoRA
+    if (!qo && !rs && p.act == kActNone) return kEpiPlain;
+    if (!qo && rs && p.act == kActNone) return kEpiRowSq;
+    if (qo && !rs && p.act == kActGeluTanh) return kEpiGeluQ;
+    return -1;
+}
+
+void launch_gemm_variant(sycl::queue& q, const GemmArgs& p, int variant) {
+    const int kind = epilogue_kind(p);
+    if (kind < 0 || variant < 0) return launch_gemm_generic(q, p);
+    kGemmVariants[variant].fn[kind](q, p);
+}
+
+
+// ---------------------------------------------------------------------------------------
+// Static dispatch (intel-gpu-kernel-dispatch): device facts -> legal candidates -> ranked
+// (default, pool) for one GEMM workload. Legality uses queried device limits and the compiled
+// kernel's own resource report; performance estimates only reorder the pool, never shrink it.
+// ---------------------------------------------------------------------------------------
+struct HwInfo {
+    std::string name, driver;
+    int64_t max_wg = -1;        // device max work-group size; -1 = unknown
+    int64_t xve_count = -1;     // vector engines (sycl gpu_eu_count); -1 = unknown
+    bool sg16 = false;          // sub-group size 16 offered
+};
+
+inline HwInfo query_hw(const sycl::queue& q) {
+    const auto d = kf_sycl_autotune::query_sycl_device_info(q);
+    HwInfo h;
+    h.name = d.name;
+    h.driver = d.driver_version;
+    h.max_wg = d.max_work_group_size;
+    h.xve_count = d.gpu_eu_count;
+    for (size_t s : d.sub_group_sizes) h.sg16 |= (s == 16);
+    return h;
+}
+
+// Workload facts that distinguish GEMM implementations.
+struct GemmShape {
+    int M, N, K, R;
+    int kind;                   // EpiKind
+};
+
+// Reasons are reported by the `gemm_pool` diagnostic; nullptr = legal.
+inline const char* variant_illegal(const GemmVariant& v, const HwInfo& hw, const GemmShape& s, const KernelLimits& lim) {
+    if (!hw.sg16) return "device does not offer sub-group size 16";
+    if (s.N % (v.ng * kGroup) != 0) return "N is not a multiple of the sub-group column tile";
+    const int64_t threads = int64_t(v.sgm) * v.sgn * kSG;
+    if (hw.max_wg < 0 || threads > hw.max_wg) return "work-group exceeds the device limit";
+    if (lim.max_wg < 0) return "compiled kernel resource report unavailable";
+    if (threads > lim.max_wg) return "work-group exceeds the compiled kernel limit";
+    return nullptr;
+}
+
+// Priority order (best first) per hardware class and shape class; legal variants missing from a list keep
+// table order after the listed ones. Inputs: hardware class from the queried XVE count, and whether the
+// reduction is deep (K > 2N), which changes B/A reuse and L3 pressure.
+//  * 96-XVE Xe3-LPG class (Panther Lake 12Xe): measured here, 3 interleaved rounds per variant and shape.
+//  * Anything else (incl. Arc Pro B70): variant 0 (the configuration tuned on B70 before this pool existed)
+//    leads, followed by the Xe3-LPG order; no measurements exist here for such devices, so the runtime
+//    autotuner makes the real choice there.
+inline std::vector<int> rank_variants(const HwInfo& hw, const GemmShape& s, std::vector<int> legal) {
+    static const int kXe3LpgDeepK[] = {1, 2, 5, 8, 7, 4, 9, 0, 13, 12, 10, 11, 3, 6};
+    static const int kXe3LpgWide[]  = {1, 6, 5, 9, 2, 8, 3, 4, 0, 7, 11, 10, 13, 12};
+    const bool xe3_lpg_class = hw.xve_count > 0 && hw.xve_count <= 128;
+    const bool deep_k = s.K > 2 * s.N;
+    const int* order = deep_k ? kXe3LpgDeepK : kXe3LpgWide;
+    const int n = int(sizeof(kXe3LpgDeepK) / sizeof(int));
+    auto pos = [&](int id) {
+        if (!xe3_lpg_class && id == 0) return -1;
+        for (int i = 0; i < n; ++i) if (order[i] == id) return i;
+        return n + id;
+    };
+    std::stable_sort(legal.begin(), legal.end(), [&](int a, int b) { return pos(a) < pos(b); });
+    return legal;
+}
+
+// Optional caller restriction of the eligible pool (policy change); empty = all variants.
+inline std::vector<int>& eligibility_restriction() {
+    static std::vector<int> allowed;
+    return allowed;
+}
+
+struct StaticSelection {
+    int default_id = -1;
+    std::vector<int> eligible;                                   // ranked, default first
+    std::vector<std::pair<int, const char*>> rejected;
+};
+
+inline StaticSelection static_select(sycl::queue& q, const HwInfo& hw, const GemmShape& s) {
+    StaticSelection sel;
+    std::vector<int> legal;
+    for (int i = 0; i < kNumGemmVariants; ++i) {
+        const auto& v = kGemmVariants[i];
+        if (s.kind < 0) { if (i == 0) legal.push_back(i); continue; }   // epilogue outside the tuned pool: legacy only
+        const KernelLimits lim = v.limits[s.kind](q);
+        if (const char* why = variant_illegal(v, hw, s, lim)) sel.rejected.push_back({i, why});
+        else legal.push_back(i);
+    }
+    if (const auto& allowed = eligibility_restriction(); !allowed.empty()) {
+        std::vector<int> kept;
+        for (int id : legal) {
+            if (std::find(allowed.begin(), allowed.end(), id) != allowed.end()) kept.push_back(id);
+            else sel.rejected.push_back({id, "excluded by the caller's eligibility restriction"});
         }
-        if (act == kActGeluTanh) return launch_gemm_impl<true, false, kActGeluTanh>(q, p);
-        if (act == kActSilu)     return launch_gemm_impl<true, false, kActSilu>(q, p);
-        return launch_gemm_impl<true, false, kActNone>(q, p);
+        legal = kept;
     }
-
-    if (has_rowsq) {
-        if (act == kActGeluTanh) return launch_gemm_impl<false, true, kActGeluTanh>(q, p);
-        if (act == kActSilu)     return launch_gemm_impl<false, true, kActSilu>(q, p);
-        return launch_gemm_impl<false, true, kActNone>(q, p);
-    }
-
-    if (act == kActGeluTanh) return launch_gemm_impl<false, false, kActGeluTanh>(q, p);
-    if (act == kActSilu)     return launch_gemm_impl<false, false, kActSilu>(q, p);
-    return launch_gemm_impl<false, false, kActNone>(q, p);
+    if (legal.empty()) throw std::runtime_error("no legal SVDQuant GEMM variant for this device and shape");
+    sel.eligible = rank_variants(hw, s, legal);
+    sel.default_id = sel.eligible.front();
+    return sel;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -850,6 +1050,125 @@ int parse_act(const std::string& act) {
 
 }  // namespace
 
+int env_variant() {
+    const char* e = std::getenv("KF_VARIANT");
+    return e ? std::atoi(e) : -1;
+}
+
+bool autotune_enabled() {
+    const char* e = std::getenv("KF_AUTOTUNE");
+    return !(e && std::atoi(e) == 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// Runtime selection (runtime-autotune): the static pool of `static_select` is validated and timed as
+// complete operations (GEMM + RMSNorm pass) by the native SyclRuntimeAutotuner; the winner is cached
+// on disk (keyed by source/build, device/driver, workload, policy, pool) and memoized in-process.
+// ---------------------------------------------------------------------------------------
+struct SelectionRecord {
+    std::string workload, winner;
+    double elapsed_ms = 0.0;
+    bool from_cache = false, tuned = false;
+    std::vector<std::string> pool;
+    std::map<std::string, double> median_ms;   // cold searches: finalists' median time of the full operation
+};
+SelectionRecord g_last_selection;
+std::mutex g_select_mu;
+int g_epoch = 0;   // bumped when the eligibility restriction changes: memoized winners are scoped to it
+
+int g_last_used = -1;   // variant id used by the most recent tuned-pool call
+std::unordered_map<std::string, int> g_selected;   // workload -> variant id (retained winner per exact workload)
+
+std::string build_identity() {
+    std::string sig = std::string(__DATE__) + __TIME__;
+    for (int i = 0; i < kNumGemmVariants; ++i) sig += kGemmVariants[i].name;
+    return "svdq-w4a4-gemm-" + kf_sycl_autotune::fnv1a64(sig);
+}
+
+std::string workload_key(const GemmArgs& p, int kind, bool x_int4) {
+    std::ostringstream o;
+    o << "E" << g_epoch << "_M" << p.M << "_N" << p.N << "_K" << p.K << "_R" << (p.lora_act ? p.R : 0) << "_epi" << kind << "_act" << p.act
+      << "_bias" << (p.bias != nullptr) << "_qkv" << p.is_qkv << "_xint4" << x_int4 << "_bf16out";
+    return o.str();
+}
+
+bool outputs_match(const torch::Tensor& got, const torch::Tensor& ref) {
+    if (!got.is_floating_point()) {   // packed INT4: a rounding tie may flip a rare nibble
+        const double bad = (got != ref).to(torch::kFloat32).mean().item<double>();
+        return bad <= 1e-3;
+    }
+    return torch::allclose(got.to(torch::kFloat32), ref.to(torch::kFloat32), 2e-2, 2e-2);
+}
+
+// run(variant) launches the complete operation (GEMM + post passes) into the preallocated `outs`.
+void run_tuned(sycl::queue& q, const GemmArgs& p, bool x_int4, const std::function<void(int)>& run,
+               const std::vector<torch::Tensor>& outs) {
+    if (const int forced = env_variant(); forced >= 0 && forced < kNumGemmVariants) return run(forced);
+    const int kind = epilogue_kind(p);
+    if (kind < 0) return run(-1);   // epilogue combination outside the tuned pool (legacy implementation)
+    const std::string wl = workload_key(p, kind, x_int4);
+    {
+        std::lock_guard<std::mutex> lock(g_select_mu);
+        auto it = g_selected.find(wl);
+        if (it != g_selected.end()) { g_last_used = it->second; run(it->second); return; }
+    }
+    const HwInfo hw = query_hw(q);
+    const StaticSelection sel = static_select(q, hw, GemmShape{p.M, p.N, p.K, p.lora_act ? p.R : 0, kind});
+    auto remember = [&](int id, const std::string& winner, double ms, bool cached, bool tuned) {
+        std::lock_guard<std::mutex> lock(g_select_mu);
+        g_selected[wl] = id;
+        g_last_used = id;
+        g_last_selection = {wl, winner, ms, cached, tuned, {}, {}};
+        for (int v : sel.eligible) g_last_selection.pool.push_back(kGemmVariants[v].name);
+    };
+    if (!autotune_enabled() || sel.eligible.size() < 2) {
+        remember(sel.default_id, kGemmVariants[sel.default_id].name, 0.0, false, false);
+        return run(sel.default_id);
+    }
+
+    // Fixed oracle for validation: the static default's output (itself checked against the torch
+    // reference by the task tests); every variant accumulates in the same K order.
+    run(sel.default_id);
+    q.wait_and_throw();
+    std::vector<torch::Tensor> refs;
+    for (const auto& o : outs) refs.push_back(o.clone());
+    auto validate = [&]() {
+        for (size_t i = 0; i < outs.size(); ++i)
+            if (!outputs_match(outs[i], refs[i])) return false;
+        return true;
+    };
+
+    using namespace kf_sycl_autotune;
+    std::vector<SyclVariantSpec> variants;
+    for (int id : sel.eligible) {
+        const auto& v = kGemmVariants[id];
+        variants.push_back({v.name,
+                            {{"id", id}, {"mt", v.mt}, {"ng", v.ng}, {"sgm", v.sgm}, {"sgn", v.sgn},
+                             {"swz", v.swz}, {"grf", v.grf}, {"pipe", v.pipe}, {"pfd", v.pfd}},
+                            nullptr, [&run, id] { run(id); }});
+    }
+    StaticPolicy policy = [&](const std::string&) {
+        std::vector<std::string> names;
+        for (const auto& v : variants) names.push_back(v.name);
+        return std::make_pair(names.front(), names);
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        const TuneResult r = SyclRuntimeAutotuner::instance().select_and_launch(
+            q, build_identity(), wl, variants, validate, default_cache_dir(), 2, 5, policy, "svdq-policy-v1",
+            "icpx-fsycl-aot sg16 per-variant-grf");
+        q.wait_and_throw();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        remember(r.parameters.at("id"), r.winner_name, ms, r.from_cache, true);
+        for (const auto& [name, s] : r.median_seconds) g_last_selection.median_ms[name] = s * 1e3;
+    } catch (const std::exception&) {
+        // Selection itself failed (e.g. unwritable cache dir, every candidate rejected): the static default
+        // is a legal, validated implementation, so keep the operation working.
+        remember(sel.default_id, kGemmVariants[sel.default_id].name, 0.0, false, false);
+        run(sel.default_id);
+    }
+}
+
 py::object torch_svdquant_w4a4_gemm(
     torch::Tensor x,
     torch::Tensor w_dpas_b,
@@ -894,6 +1213,7 @@ py::object torch_svdquant_w4a4_gemm(
                     "XPU x_scales [M, K/64] must be provided when x is INT4");
         x_q = x;
         x_scales = x_scales_opt->to(torch::kFloat32);  // no-op for float32; any strides are accepted
+        if (x_scales.stride(0) != 1) x_scales = x_scales.t().contiguous().t();  // group-major: a sub-group's 8 row scales are contiguous
         if (has_lora && !x_lora_opt.has_value()) {
             TORCH_CHECK(x_bf16_opt.has_value() && lora_a_opt.has_value(),
                         "LoRA on INT4 input needs x_lora, or x_bf16 and lora_a");
@@ -957,9 +1277,13 @@ py::object torch_svdquant_w4a4_gemm(
     p.K = K;
     p.act = parse_act(activation);
     p.is_qkv = false;
-    launch_gemm(q, p);
-
-    if (norm_w_opt.has_value()) launch_rmsnorm(q, p.out, p.row_sq, bf16_ptr(*norm_w_opt), M, N, norm_eps);
+    const uint16_t* norm_ptr = norm_w_opt.has_value() ? bf16_ptr(*norm_w_opt) : nullptr;
+    std::vector<torch::Tensor> outs{out};
+    if (fuse_quant_out) { outs.push_back(qout); outs.push_back(oscales); }
+    run_tuned(q, p, x_is_int4, [&](int v) {
+        launch_gemm_variant(q, p, v);
+        if (norm_ptr != nullptr) launch_rmsnorm(q, p.out, p.row_sq, norm_ptr, M, N, norm_eps);
+    }, outs);
 
     if (fuse_quant_out) return py::make_tuple(out, qout, oscales);
     return py::cast(out);
@@ -1012,13 +1336,14 @@ py::tuple torch_svdquant_w4a4_qkv_gemm(
     p.K = K;
     p.act = kActNone;
     p.is_qkv = true;
-    launch_gemm(q, p);
-
-    // Apply fused RMSNorm to Q and K in a single kernel launch
     check_bf16(norm_q_w, "norm_q_w");
     check_bf16(norm_k_w, "norm_k_w");
     const int row_sq_parts = N / kGroup;
-    launch_rmsnorm_qk(q, p.out, N, p.row_sq, row_sq_parts, bf16_ptr(norm_q_w), bf16_ptr(norm_k_w), M, N_per, norm_eps);
+    run_tuned(q, p, true, [&](int v) {
+        launch_gemm_variant(q, p, v);
+        // Fused RMSNorm of the Q and K slices in a single launch
+        launch_rmsnorm_qk(q, p.out, N, p.row_sq, row_sq_parts, bf16_ptr(norm_q_w), bf16_ptr(norm_k_w), M, N_per, norm_eps);
+    }, {out});
 
     auto out_q = out.narrow(1, 0, N_per);
     auto out_k = out.narrow(1, N_per, N_per);
@@ -1031,6 +1356,98 @@ py::tuple torch_quantize_activation_int4(torch::Tensor x, c10::optional<torch::T
     auto r = run_prologue(c10::xpu::getCurrentXPUStream().queue(), x, lora_a, true, smooth_inv, rho);
     if (lora_a.has_value()) return py::make_tuple(r.x_q, r.x_scales, r.lora_act);
     return py::make_tuple(r.x_q, r.x_scales);
+}
+
+py::dict variant_params(int id) {
+    const auto& v = kGemmVariants[id];
+    py::dict d;
+    d["mt"] = v.mt; d["ng"] = v.ng; d["sgm"] = v.sgm; d["sgn"] = v.sgn;
+    d["swz"] = v.swz; d["grf"] = v.grf; d["pipe"] = v.pipe; d["pfd"] = v.pfd;
+    return d;
+}
+
+py::dict gemm_pool_info(int M, int N, int K, int R, int kind) {
+    sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+    const HwInfo hw = query_hw(q);
+    const StaticSelection sel = static_select(q, hw, GemmShape{M, N, K, R, kind});
+    py::dict d;
+    d["device"] = hw.name;
+    d["driver"] = hw.driver;
+    d["xve_count"] = hw.xve_count;
+    d["default"] = kGemmVariants[sel.default_id].name;
+    py::list pool, rej;
+    for (int v : sel.eligible) pool.append(kGemmVariants[v].name);
+    for (const auto& r : sel.rejected) rej.append(py::make_tuple(kGemmVariants[r.first].name, r.second));
+    d["pool"] = pool;
+    d["rejected"] = rej;
+    py::list pool_p, rej_p;   // integer configurations, same order as pool / rejected
+    for (int v : sel.eligible) pool_p.append(variant_params(v));
+    for (const auto& r : sel.rejected) rej_p.append(variant_params(r.first));
+    d["pool_params"] = pool_p;
+    d["rejected_params"] = rej_p;
+    return d;
+}
+
+py::dict last_selection_info() {
+    std::lock_guard<std::mutex> lock(g_select_mu);
+    py::dict d;
+    d["workload"] = g_last_selection.workload;
+    d["winner"] = g_last_selection.winner;
+    d["from_cache"] = g_last_selection.from_cache;
+    d["tuned"] = g_last_selection.tuned;
+    d["select_ms"] = g_last_selection.elapsed_ms;
+    d["pool"] = g_last_selection.pool;
+    d["median_ms"] = g_last_selection.median_ms;
+    return d;
+}
+
+void clear_selection_memo() {
+    std::lock_guard<std::mutex> lock(g_select_mu);
+    g_selected.clear();
+    kf_sycl_autotune::SyclRuntimeAutotuner::instance().clear_memory_cache();
+}
+
+py::dict selection_stats() {
+    std::lock_guard<std::mutex> lock(g_select_mu);
+    // Counted by the tuner at its real search/validate/benchmark boundaries; candidates are named, so map to ids.
+    const auto s = kf_sycl_autotune::SyclRuntimeAutotuner::instance().stats();
+    auto ids = [](const std::set<std::string>& names) {
+        std::vector<int> out;
+        for (int i = 0; i < kNumGemmVariants; ++i)
+            if (names.count(kGemmVariants[i].name)) out.push_back(i);
+        return out;
+    };
+    py::dict d;
+    d["searches"] = s.searches; d["benchmarks"] = s.benchmarks; d["validations"] = s.validations;
+    d["benchmarked"] = ids(s.benchmarked);
+    d["validated"] = ids(s.validated);
+    return d;
+}
+
+void reset_selection_stats() {
+    std::lock_guard<std::mutex> lock(g_select_mu);
+    kf_sycl_autotune::SyclRuntimeAutotuner::instance().reset_stats();
+}
+
+void set_eligible(std::vector<int> ids) {
+    std::lock_guard<std::mutex> lock(g_select_mu);
+    eligibility_restriction() = ids;
+    ++g_epoch;
+    g_selected.clear();
+}
+
+int last_used_variant() { std::lock_guard<std::mutex> lock(g_select_mu); return g_last_used; }
+
+py::list gemm_variant_params() {
+    py::list l;
+    for (int i = 0; i < kNumGemmVariants; ++i) l.append(variant_params(i));
+    return l;
+}
+
+py::list gemm_variant_names() {
+    py::list l;
+    for (int i = 0; i < kNumGemmVariants; ++i) l.append(kGemmVariants[i].name);
+    return l;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1069,6 +1486,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("norm_k_w") = py::none(),
           py::arg("norm_eps") = 1e-5,
           "Fused Q+K+V SVDQuant GEMM (N=9216): single launch with piecewise RMSNorm on Q and K.");
+    m.def("gemm_pool", &gemm_pool_info, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("R") = 32, py::arg("kind") = 0,
+          "Static dispatch for one GEMM workload: default and legal pool (kind 0 plain, 1 RMSNorm partials, 2 gelu + INT4 output).");
+    m.def("last_selection", &last_selection_info, "Result of the most recent runtime selection.");
+    m.def("clear_selection_memo", &clear_selection_memo, "Forget in-process winners (disk cache is kept).");
+    m.def("selection_stats", &selection_stats, "Counters of what runtime selection actually did (searches, measurements, validations).");
+    m.def("reset_selection_stats", &reset_selection_stats);
+    m.def("last_used_variant", &last_used_variant, "Variant id used by the most recent tuned-pool call.");
+    m.def("set_eligible", &set_eligible, py::arg("ids"), "Restrict the eligible pool to these variant ids (empty = all).");
+    m.def("gemm_variant_params", &gemm_variant_params, "Integer configuration of every compiled variant.");
+    m.def("gemm_variants", &gemm_variant_names, "Names of the compiled GEMM variants.");
     m.def("quantize_activation_int4", &torch_quantize_activation_int4,
           py::arg("x"),
           py::arg("lora_a") = py::none(),
