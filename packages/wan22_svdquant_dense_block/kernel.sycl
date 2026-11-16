@@ -1087,7 +1087,7 @@ std::string build_identity() {
 
 std::string workload_key(const GemmArgs& p, int kind, bool x_int4) {
     std::ostringstream o;
-    o << "E" << g_epoch << "_M" << p.M << "_N" << p.N << "_K" << p.K << "_R" << (p.lora_act ? p.R : 0) << "_epi" << kind << "_act" << p.act
+    o << "E" << g_epoch << "_Mb" << kf_sycl_autotune::bucket_dim(p.M) << "_N" << p.N << "_K" << p.K << "_R" << (p.lora_act ? p.R : 0) << "_epi" << kind << "_act" << p.act
       << "_bias" << (p.bias != nullptr) << "_qkv" << p.is_qkv << "_xint4" << x_int4 << "_bf16out";
     return o.str();
 }

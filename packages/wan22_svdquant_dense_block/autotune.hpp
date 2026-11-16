@@ -17,9 +17,9 @@
 #include <iomanip>
 #include <limits>
 #include <map>
-#include <set>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -91,12 +91,11 @@ CompiledKernelLimits compiled_kernel_limits(const sycl::queue& q) {
 
 inline int64_t bucket_dim(int64_t m) {
     if (m <= 16) return std::max<int64_t>(1, m);
-    if (m <= 512) {
-        int64_t p = 16;
-        while (p < m) p <<= 1;
-        return p;
-    }
-    return ((m + 255) / 256) * 256;
+    uint64_t v = static_cast<uint64_t>(m - 1);
+    int log2_v = 0;
+    while (v >>= 1) ++log2_v;
+    int64_t step = int64_t{1} << (log2_v - 1);
+    return ((m + step - 1) / step) * step;
 }
 
 inline std::string fnv1a64(const std::string& value) {
@@ -183,7 +182,8 @@ public:
         const StaticPolicy& policy = nullptr,
         const std::string& policy_version = "",
         const std::string& compiler_flags = "",
-        SelectionSettings selection = {})
+        SelectionSettings selection = {},
+        const std::function<void()>& reset_fn = nullptr)
     {
         if (variants.size() < 2) {
             throw std::invalid_argument("SyclRuntimeAutotuner requires at least 2 candidate variants");
@@ -248,6 +248,7 @@ public:
         if (std::find(eligible.begin(), eligible.end(), cached_idx) == eligible.end()) cached_idx = -1;
         if (cached_idx >= 0) {
             try {
+                if (reset_fn) reset_fn();
                 sync_fn();
                 variants[cached_idx].launch();
                 sync_fn();
@@ -261,6 +262,10 @@ public:
             }
         }
         if (cached_idx >= 0) {
+            if (reset_fn) {
+                reset_fn();
+                sync_fn();
+            }
             variants[cached_idx].launch();
             return make_result(cached_idx, variants[cached_idx], 0.0, true);
         }
@@ -272,6 +277,7 @@ public:
         double incumbent_sec = std::numeric_limits<double>::infinity();
         auto measure = [&](int index) {
             const auto& variant = variants[index];
+            if (reset_fn) reset_fn();
             sync_fn();
             variant.launch();
             sync_fn();
@@ -281,12 +287,32 @@ public:
                 ++stats_.validations;
                 stats_.validated.insert(variant.name);
             }
-            for (int warmup = 1; warmup < warmup_iters; ++warmup) variant.launch();
+            for (int warmup = 1; warmup < warmup_iters; ++warmup) {
+                if (reset_fn) {
+                    reset_fn();
+                    sync_fn();
+                }
+                variant.launch();
+            }
             sync_fn();
-            auto start = std::chrono::steady_clock::now();
-            for (int iteration = 0; iteration < bench_iters; ++iteration) variant.launch();
-            sync_fn();
-            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / bench_iters;
+            double elapsed = 0.0;
+            if (!reset_fn) {
+                auto start = std::chrono::steady_clock::now();
+                for (int iteration = 0; iteration < bench_iters; ++iteration) variant.launch();
+                sync_fn();
+                elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() / bench_iters;
+            } else {
+                double total_sec = 0.0;
+                for (int iteration = 0; iteration < bench_iters; ++iteration) {
+                    reset_fn();
+                    sync_fn();
+                    auto start = std::chrono::steady_clock::now();
+                    variant.launch();
+                    sync_fn();
+                    total_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                }
+                elapsed = total_sec / bench_iters;
+            }
             {
                 std::lock_guard<std::mutex> lock(mu_);
                 ++stats_.benchmarks;
@@ -348,6 +374,10 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             winner_cache_[composite_key] = best_idx;
         }
+        if (reset_fn) {
+            reset_fn();
+            sync_fn();
+        }
         variants[best_idx].launch();
         TuneResult result = make_result(best_idx, variants[best_idx], best_sec, false);
         result.screen_seconds = screen_seconds;
@@ -368,7 +398,8 @@ public:
         const StaticPolicy& policy = nullptr,
         const std::string& policy_version = "",
         const std::string& compiler_flags = "",
-        SelectionSettings selection = {})
+        SelectionSettings selection = {},
+        const std::function<void()>& reset_fn = nullptr)
     {
         SyclDeviceInfo info = query_sycl_device_info(q);
         return select_and_launch(
@@ -384,7 +415,8 @@ public:
             policy,
             policy_version,
             compiler_flags,
-            selection);
+            selection,
+            reset_fn);
     }
 #endif
 
