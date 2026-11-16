@@ -89,6 +89,57 @@ winner. On Panther Lake 12Xe the same variant (`mt1_ng1_wg4x4_swz4_grf256_p1_pf0
 winner for all five task shapes, within 0.5% of the best measured variant on each; variant 0 (the previous tuned configuration) was
 6-27% slower per shape. Arc Pro B70 was not available: it starts from variant 0 and relies on the runtime autotuner.
 
+## Using the OpenCL kernel from another codebase (e.g. OpenVINO)
+
+`opencl/svdquant_w4a4_v_layer.cl` (results and limits: [opencl_porting.md](opencl_porting.md)) implements one operation:
+`y = bf16( INT4-GEMM( quantize(x), W ) + LoRA + bias )` with bf16 `x`. Not ported: INT4 input (FFN-down), RMSNorm, GELU
+and fused output quantization, the fused QKV GEMM, and other LoRA ranks (rank 32 is fixed). It was run through PyOpenCL
+on Panther Lake with `M` 900 to 1215, `K` 3072 and `N` 3072 / 14336; OpenVINO itself was **not** tried.
+
+**Device requirements** (check at load, otherwise fall back): an Intel GPU with OpenCL 3.0, sub-group size 16, and the
+extensions `cl_intel_subgroup_matrix_multiply_accumulate`, `cl_intel_subgroup_2d_block_io`, `cl_intel_subgroups` and
+`cl_intel_required_subgroup_size`.
+
+**Tensors** (all row-major and contiguous, buffer base 64-byte aligned; bf16 is passed as raw 16-bit `ushort`):
+
+| Tensor | Type | Shape | Notes |
+| --- | --- | --- | --- |
+| `x` | bf16 | `[M, K]` | `M >= 1`, `K` a multiple of 64 |
+| `w_dpas_b` | int32 | `[N/16, K/64, 8, 16]` | pre-packed once at model load: `qdq_utils.convert_int4_weights_to_dpas_b` on packed `[N, K/2]` int8 (two signed INT4 per byte, even element in the low nibble) |
+| `w_scale` | float32 | `[K/64, N]` | `qdq_utils.convert_w_scales_to_dpas` (group-64 scales; E8M0 input is decoded there), `N` a multiple of 64 |
+| `lora_a`, `lora_b` | bf16 | `[32, K]`, `[N, 32]` | |
+| `bias` | bf16 | `[N]` | |
+| `out` | bf16 | `[M, N]` | |
+| workspaces | uint8, float32, float32 | `xq [M, K/2]`, `xs [K/64, M]`, `lora_act [M, 32]` | per call; reusable for any `M` up to the allocated one |
+
+Activations are quantized inside the kernel (symmetric group-64, scale `amax / 7`, values rounded half away from zero and
+clamped to `[-8, 7]`, same packing as the weights).
+
+**Build and launch.** Build the program from the `.cl` source with `-cl-std=CL3.0 -DKF_SGM=<a> -DKF_SGN=<b> -DKF_PIPE=<p>
+-DKF_GRF=<g>` and, when `KF_GRF=256`, `-cl-intel-256-GRF-per-thread` (the `AUTOTUNE_METADATA` block at the top of the file
+lists the parameters). Enqueue three kernels on one in-order queue; scalar arguments are `int32`:
+
+1. `quantize_x_group64(x, xq, xs, M, K)`: global `(K/64, M)`, local `NULL`.
+2. `lora_a_dpas(x, lora_a, lora_act, M, K)`: global `(16 * ceil(M/8), 1)`, local `(16, 1)`.
+3. `gemm_int4_lora_bias(xq, w_dpas_b, w_scale, xs, lora_act, lora_b, bias, out, M, N, K/64)`: local `(16*SGN, SGM)`, global
+   `(ceil(ceil(N/64)/SGN) * 16*SGN, ceil(ceil(M/8)/SGM) * SGM)`. The kernel declares this work-group size, so the launch must match.
+
+**Choosing the variant.** On Panther Lake the measured best is `SGM 4, SGN 1, PIPE 0, GRF 128` for `N = K` shapes and
+`SGM 8, SGN 1, PIPE 0, GRF 128` for `N > K` (`opencl/static_priority_ocl.json`, keyed by hardware class `xve<compute units>`
+and shape class: `deep_k` if `K > 2N`, `wide` if `N > K`, else `square`; only `square` and `wide` were measured). Other
+devices and `deep_k` have no measurement: build the
+candidates, drop those whose compiled `CL_KERNEL_WORK_GROUP_SIZE` is below `16*SGM*SGN` (8 x 8 sub-groups fail), and time
+the rest (`opencl/sweep_ocl.py`). A Python host can use `opencl/ocl_svdquant.py` (static dispatch and autotuning) as is.
+Build only the chosen variant: all 64 candidates take about 12 s to compile.
+
+**Host integration.**
+- Buffers must belong to the same OpenCL context as the program. Device pointers from another runtime (torch XPU) are not
+  usable: the queue errors and the output stays zero. Inside a framework that owns its context (OpenVINO GPU plugin), create
+  the program on that context and queue and bind the framework's own `cl_mem` buffers.
+- The operation is three kernels with three workspaces. If the host mechanism allows only one kernel per operation (check
+  OpenVINO's documentation for custom GPU operations), split it into operations or allocate the workspaces as extra buffers.
+- Expect agreement with the SYCL kernel to about one bf16 step, not bit equality (the LoRA-A summation order differs).
+
 ## Development tools (`dev/`)
 
 - `ptl_oracle.py`: pytest plugin replacing the Triton oracle with an equivalent torch implementation (the Triton
