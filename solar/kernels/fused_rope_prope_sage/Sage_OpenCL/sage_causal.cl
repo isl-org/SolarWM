@@ -46,18 +46,18 @@
 #endif
 
 #define SAGE_SG 16
-#define SAGE_Q_ROWS 8
+#define SAGE_Q_ROWS 16
 #define SAGE_K_COLS 16
+#define SAGE_K_TILE (SAGE_HEAD_DIM == 128 ? 32 : 64)
 #define SAGE_DPAS_K32 32
 #define SAGE_D_TILES (SAGE_HEAD_DIM / SAGE_K_COLS)
 #define SAGE_MEAN_STRIDE 512
 #define SAGE_MEAN_TILE 64
 #define SAGE_MEAN_FULL 2048
 #define SAGE_LOG2E_RSQRTD (1.4426950408889634f / sqrt((float)SAGE_HEAD_DIM))
-
-#if SAGE_HEAD_DIM != 64 && SAGE_HEAD_DIM != 128
-#error "SAGE_HEAD_DIM must be 64 or 128"
-#endif
+#define SAGE_LAZY_RESCALE 8.0f
+#define SAGE_Q_TILE (SAGE_HEAD_DIM == 128 ? 256 : 128)
+#define SAGE_Q_SUBGROUPS (SAGE_Q_TILE / 16)
 
 static inline float sage_input_to_float(ushort bits) {
 #if SAGE_INPUT_BF16
@@ -118,7 +118,9 @@ __kernel void sage_k_centre(__global const ushort *k,
     k_mean[(size_t)bh * SAGE_HEAD_DIM + channel] = sum / (float)sampled_rows;
 }
 
-/* Per-token symmetric INT8 Q quantization. Padding rows are explicitly zeroed. */
+/* Match the SYCL 16-row subgroup quantizer and A-operand register image. */
+__attribute__((intel_reqd_sub_group_size(SAGE_SG)))
+__attribute__((reqd_work_group_size(SAGE_Q_TILE, 1, 1)))
 __kernel void sage_quantize_q(__global const ushort *q,
                               __global char *q8,
                               __global float *q_scale,
@@ -126,44 +128,52 @@ __kernel void sage_quantize_q(__global const ushort *q,
                               const int q_len,
                               const int heads,
                               const int q_pad) {
-    const size_t token = get_global_id(0);
-    const size_t token_count = (size_t)batch * heads * q_pad;
-    if (token >= token_count) return;
+    const int bh = get_group_id(0), qb = get_group_id(1);
+    const int b = bh / heads, h = bh - b * heads;
+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
+    const int row0 = qb * SAGE_Q_TILE + sg * 16;
+    const int ch = SAGE_HEAD_DIM / 16, groups = SAGE_HEAD_DIM / 32;
+    float x[16][SAGE_HEAD_DIM / 16], maxima[16];
 
-    const int bh = (int)(token / q_pad);
-    const int row = (int)(token - (size_t)bh * q_pad);
-    const int b = bh / heads;
-    const int h = bh - b * heads;
-    __global char *dst = q8 + token * SAGE_HEAD_DIM;
-    if (row >= q_len) {
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const int row = row0 + r;
+        const int valid = row < q_len;
+        const int load_row = min(row, q_len - 1);
+        const size_t base = ((size_t)b * q_len + load_row) * heads * SAGE_HEAD_DIM
+                          + (size_t)h * SAGE_HEAD_DIM + lane * ch;
+        maxima[r] = 0.0f;
         #pragma unroll
-        for (int d = 0; d < SAGE_HEAD_DIM; ++d) dst[d] = 0;
-        q_scale[token] = 0.0f;
-        return;
+        for (int c = 0; c < ch; ++c) {
+            x[r][c] = valid ? sage_input_to_float(q[base + c]) : 0.0f;
+            maxima[r] = fmax(maxima[r], fabs(x[r][c]));
+        }
     }
 
-    const size_t src_base = ((size_t)b * q_len + row) * heads * SAGE_HEAD_DIM
-                          + (size_t)h * SAGE_HEAD_DIM;
-    float values[SAGE_HEAD_DIM];
-    float amax = 0.0f;
+    __global ushort *q8_words = (__global ushort *)q8;
+    const size_t out_base = ((size_t)bh * (q_pad / 8) + row0 / 8) * groups * 128;
     #pragma unroll
-    for (int d = 0; d < SAGE_HEAD_DIM; ++d) {
-        values[d] = sage_input_to_float(q[src_base + d]);
-        amax = fmax(amax, fabs(values[d]));
+    for (int r = 0; r < 16; ++r) {
+        const float amax = sub_group_reduce_max(maxima[r]);
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        if (lane == 0)
+            q_scale[(size_t)bh * q_pad + row0 + r] =
+                (amax / 127.0f) * SAGE_LOG2E_RSQRTD;
+        #pragma unroll
+        for (int c = 0; c < ch; c += 2) {
+            const int d = lane * ch + c;
+            const int g = d / 32, a_lane = (d % 32) / 2;
+            const char2 pair = (char2)(sage_quantize_value(x[r][c], inv),
+                                       sage_quantize_value(x[r][c + 1], inv));
+            q8_words[out_base + (r / 8) * groups * 128 + g * 128
+                     + (r % 8) * 16 + a_lane] = as_ushort(pair);
+        }
     }
-    const float inv_scale = amax > 0.0f ? 127.0f / amax : 0.0f;
-    #pragma unroll
-    for (int d = 0; d < SAGE_HEAD_DIM; ++d)
-        dst[d] = sage_quantize_value(values[d], inv_scale);
-
-    /* Move the 1/sqrt(D) softmax factor and log2(e) conversion into the Q scale. */
-    q_scale[token] = (amax / 127.0f) * SAGE_LOG2E_RSQRTD;
 }
 
-/*
- * Quantize centered K and immediately pack DPAS B operands. For each 16-key tile
- * and 32-channel group, dword d (0..7) owns channels 4d..4d+3 and lane n owns key n.
- */
+/* Match the SYCL 16-key subgroup quantizer and K B-operand register image. */
+__attribute__((intel_reqd_sub_group_size(SAGE_SG)))
+__attribute__((reqd_work_group_size(128, 1, 1)))
 __kernel void sage_quantize_k(__global const ushort *k,
                               __global const float *k_mean,
                               __global uint *k8_packed,
@@ -172,90 +182,65 @@ __kernel void sage_quantize_k(__global const ushort *k,
                               const int kv_len,
                               const int kv_heads,
                               const int kv_pad) {
-    const size_t token = get_global_id(0);
-    const size_t token_count = (size_t)batch * kv_heads * kv_pad;
-    if (token >= token_count) return;
+    const int group = get_group_id(0);
+    const int blocks = (kv_pad / 16 + 7) / 8;
+    const int bh = group / blocks, block = group - bh * blocks;
+    const int b = bh / kv_heads, h = bh - b * kv_heads;
 
-    const int bh = (int)(token / kv_pad);
-    const int row = (int)(token - (size_t)bh * kv_pad);
-    const int b = bh / kv_heads;
-    const int h = bh - b * kv_heads;
-    const size_t mean_base = (size_t)bh * SAGE_HEAD_DIM;
-    float values[SAGE_HEAD_DIM];
-    float amax = 0.0f;
+    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
+    const int tile = block * 8 + sg;
+    const int row0 = tile * 16;
+    if (row0 >= kv_pad) return;
 
-    if (row < kv_len) {
-        const size_t src_base = ((size_t)b * kv_len + row) * kv_heads * SAGE_HEAD_DIM
-                              + (size_t)h * SAGE_HEAD_DIM;
+    const int ch = SAGE_HEAD_DIM / 16, groups = SAGE_HEAD_DIM / 32;
+    float mean[SAGE_HEAD_DIM / 16], x[16][SAGE_HEAD_DIM / 16], maxima[16];
+    #pragma unroll
+    for (int c = 0; c < ch; ++c)
+        mean[c] = k_mean[(size_t)bh * SAGE_HEAD_DIM + lane * ch + c];
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const int row = row0 + r;
+        const int valid = row < kv_len;
+        const int load_row = min(row, kv_len - 1);
+        const size_t base = ((size_t)b * kv_len + load_row) * kv_heads * SAGE_HEAD_DIM
+                          + (size_t)h * SAGE_HEAD_DIM + lane * ch;
+        maxima[r] = 0.0f;
         #pragma unroll
-        for (int d = 0; d < SAGE_HEAD_DIM; ++d) {
-            values[d] = sage_input_to_float(k[src_base + d]) - k_mean[mean_base + d];
-            amax = fmax(amax, fabs(values[d]));
+        for (int c = 0; c < ch; ++c) {
+            x[r][c] = valid ? sage_input_to_float(k[base + c]) - mean[c] : 0.0f;
+            maxima[r] = fmax(maxima[r], fabs(x[r][c]));
         }
-    } else {
-        #pragma unroll
-        for (int d = 0; d < SAGE_HEAD_DIM; ++d) values[d] = 0.0f;
     }
 
-    const float inv_scale = amax > 0.0f ? 127.0f / amax : 0.0f;
-    k_scale[token] = amax / 127.0f;
-    const int key_tile = row / SAGE_K_COLS;
-    const int key_lane = row % SAGE_K_COLS;
-    const int channel_groups = SAGE_HEAD_DIM / SAGE_DPAS_K32;
-    const size_t tile_base = ((size_t)bh * (kv_pad / SAGE_K_COLS) + key_tile)
-                           * channel_groups * 8 * SAGE_K_COLS;
-
+    uint words[16][SAGE_HEAD_DIM / 64];
     #pragma unroll
-    for (int g = 0; g < channel_groups; ++g) {
+    for (int r = 0; r < 16; ++r) {
+        const float amax = sub_group_reduce_max(maxima[r]);
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        if (lane == 0) k_scale[(size_t)bh * kv_pad + row0 + r] = amax / 127.0f;
         #pragma unroll
-        for (int dword = 0; dword < 8; ++dword) {
-            const int d = g * SAGE_DPAS_K32 + dword * 4;
-            uint packed = 0u;
+        for (int i = 0; i < ch / 4; ++i) {
+            uint word = 0u;
             #pragma unroll
             for (int c = 0; c < 4; ++c)
-                packed |= ((uint)((uchar)sage_quantize_value(values[d + c], inv_scale))) << (8 * c);
-            k8_packed[tile_base + (size_t)(g * 8 + dword) * SAGE_K_COLS + key_lane] = packed;
+                word |= ((uint)((uchar)sage_quantize_value(x[r][i * 4 + c], inv))) << (8 * c);
+            words[r][i] = word;
         }
     }
-}
 
-/* Pack adjacent rows of V into dwords in the layout expected by BF16/FP16 DPAS B. */
-__kernel void sage_pack_v(__global const ushort *v,
-                          __global uint *v_packed,
-                          const int batch,
-                          const int kv_len,
-                          const int kv_heads,
-                          const int kv_pad) {
-    const int d = get_global_id(0);
-    const int bh = get_global_id(1);
-    const int pair = get_global_id(2);
-    if (d >= kv_heads * SAGE_HEAD_DIM || bh >= batch) return;
-    if (pair >= kv_pad / 2) return;
-
-    const int h = d / SAGE_HEAD_DIM;
-    const int channel = d - h * SAGE_HEAD_DIM;
-    const int row0 = pair * 2;
-    float lo = 0.0f, hi = 0.0f;
-    if (row0 < kv_len) {
-        const size_t base = ((size_t)bh * kv_len + row0) * kv_heads * SAGE_HEAD_DIM
-                          + (size_t)h * SAGE_HEAD_DIM + channel;
-        lo = sage_input_to_float(v[base]);
-        if (row0 + 1 < kv_len)
-            hi = sage_input_to_float(v[base + (size_t)kv_heads * SAGE_HEAD_DIM]);
-    }
-    const size_t out = (((size_t)bh * kv_heads + h) * (kv_pad / 2) + pair)
-                     * SAGE_HEAD_DIM + channel;
-    v_packed[out] = (uint)sage_float_to_pv_bits(lo)
-                  | ((uint)sage_float_to_pv_bits(hi) << 16);
+    const size_t out_base = ((size_t)bh * (kv_pad / 16) + tile) * groups * 128;
+    #pragma unroll
+    for (int i = 0; i < ch / 4; ++i)
+        #pragma unroll
+        for (int r = 0; r < 16; ++r)
+            k8_packed[out_base + (lane * (ch / 4) + i) * 16 + r] = words[r][i];
 }
 
 /*
- * One subgroup owns 8 Q rows. Its lane owns one column of every 8x16 INT8 score tile.
- * P and V use the same 8-row fragment, so the rounded P values feed FP16/BF16 DPAS
- * directly without a global score/probability buffer.
+ * SYCL-equivalent FMHA mainloop: 16 query rows/subgroup, large Q work-group tile.
  */
 __attribute__((intel_reqd_sub_group_size(SAGE_SG)))
-__attribute__((reqd_work_group_size(SAGE_SG, 1, 1)))
+__attribute__((reqd_work_group_size(SAGE_SG * SAGE_Q_SUBGROUPS, 1, 1)))
 __kernel void sage_attention(__global const char *q8,
                              __global const float *q_scale,
                              __global const uint *k8_packed,
@@ -270,122 +255,204 @@ __kernel void sage_attention(__global const char *q8,
                              const int q_pad,
                              const int kv_pad,
                              const int causal) {
-    const int q_tile = get_group_id(0);
+    const int q_block = get_group_id(0);
     const int bhq = get_group_id(1);
     if (bhq >= batch * heads_q) return;
 
-    const int b = bhq / heads_q;
-    const int hq = bhq - b * heads_q;
-    const int heads_per_kv = heads_q / heads_kv;
-    const int hkv = hq / heads_per_kv;
-    const int bhkv = b * heads_kv + hkv;
-    const int lane = get_sub_group_local_id();
-    const int q0 = q_tile * SAGE_Q_ROWS;
-    const int key_tiles = (kv_len + SAGE_K_COLS - 1) / SAGE_K_COLS;
+    const int b = bhq / heads_q, hq = bhq - b * heads_q;
+    const int hkv = hq / (heads_q / heads_kv), bhkv = b * heads_kv + hkv;
+    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
+    const int q0 = q_block * SAGE_Q_TILE + sg * 16;
     const int causal_offset = kv_len - q_len;
+    int k_blocks = (kv_len + SAGE_K_TILE - 1) / SAGE_K_TILE;
+    /* Persistent A operands: two 8-row fragments over all channel groups. */
+    short8 qa[2][SAGE_HEAD_DIM / SAGE_DPAS_K32];
+    float qscale[16], row_max[16], row_sum[16];
+    float8 accum[2][SAGE_D_TILES];
 
-    float row_max[8], row_sum[8];
-    float8 accum[SAGE_D_TILES];
     #pragma unroll
-    for (int m = 0; m < SAGE_Q_ROWS; ++m) {
+    for (int m = 0; m < 16; ++m) {
+        const int row = min(q0 + m, q_len - 1);
+        qscale[m] = q_scale[(size_t)bhq * q_pad + row];
         row_max[m] = -INFINITY;
         row_sum[m] = 0.0f;
     }
     #pragma unroll
-    for (int dt = 0; dt < SAGE_D_TILES; ++dt) accum[dt] = (float8)(0.0f);
-
-    for (int kt = 0; kt < key_tiles; ++kt) {
-        int8 score_i = (int8)(0);
-        const int key = kt * SAGE_K_COLS + lane;
-        const float key_scale = key < kv_len
-                              ? k_scale[(size_t)bhkv * kv_pad + key]
-                              : 0.0f;
-
-        /* INT8 QK DPAS, K-depth 32. Each subgroup call contributes one key column. */
+    for (int g = 0; g < SAGE_HEAD_DIM / SAGE_DPAS_K32; ++g)
         #pragma unroll
-        for (int g = 0; g < SAGE_HEAD_DIM / SAGE_DPAS_K32; ++g) {
-            short8 qa;
+        for (int m = 0; m < 16; ++m) {
+            const int row = min(q0 + m, q_len - 1);
+            const size_t base = ((size_t)bhq * (q_pad / 8) + row / 8)
+                              * (SAGE_HEAD_DIM / SAGE_DPAS_K32) * 128
+                              + g * 128 + (row % 8) * 16 + lane;
+            ((short *)&qa[m / 8][g])[m % 8] = q0 + m < q_len
+                ? ((__global const short *)q8)[base] : (short)0;
+        }
+    #pragma unroll
+    for (int hpart = 0; hpart < 2; ++hpart)
+        #pragma unroll
+        for (int dt = 0; dt < SAGE_D_TILES; ++dt)
+            accum[hpart][dt] = (float8)(0.0f);
+
+    const int v_width_bytes = SAGE_HEAD_DIM * (int)sizeof(ushort);
+    const int v_height = kv_pad;
+    const int v_pitch = heads_kv * SAGE_HEAD_DIM * (int)sizeof(ushort);
+    __global const char *v_bytes = (__global const char *)v_packed;
+    #pragma unroll
+    for (int stage = 0; stage < 2; ++stage)
+        if (stage < k_blocks && lane < 8)
+            intel_sub_group_block_prefetch_ui(
+                k8_packed + (size_t)bhkv * (kv_pad / 16)
+                    * (SAGE_HEAD_DIM / 32) * 128
+                + stage * 128 + lane * 16);
+
+     for (int kb = 0; kb < k_blocks; ++kb) {
+        const int need_mask = kb * SAGE_K_TILE + SAGE_K_TILE - 1 > q0 + causal_offset;
+        float score[SAGE_K_TILE / 16][16];
+        #pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            score[0][m] = -INFINITY;
+            score[1][m] = -INFINITY;
+        }
+
+        /* Pass 1: score fragments only long enough to compute the tile maximum. */
+         #pragma unroll
+         for (int nb = 0; nb < SAGE_K_TILE / SAGE_K_COLS; ++nb) {
+            const int kt = kb * (SAGE_K_TILE / SAGE_K_COLS) + nb;
+            const int key = kt * 16 + lane;
+            const float ks = key < kv_len ? k_scale[(size_t)bhkv * kv_pad + key] : 0.0f;
+            int8 qk[2] = {(int8)(0), (int8)(0)};
             #pragma unroll
-            for (int m = 0; m < SAGE_Q_ROWS; ++m) {
-                const int row = min(q0 + m, q_len - 1);
-                const size_t qbase = ((size_t)bhq * q_pad + row) * SAGE_HEAD_DIM
-                                   + g * SAGE_DPAS_K32 + lane * 2;
-                char2 qpair = (q0 + m < q_len)
-                            ? (char2)(q8[qbase], q8[qbase + 1])
-                            : (char2)(0, 0);
-                ((short *)&qa)[m] = as_short(qpair);
+            for (int g = 0; g < SAGE_HEAD_DIM / SAGE_DPAS_K32; ++g) {
+                int8 kbv;
+                const size_t kbase = (((size_t)bhkv * (kv_pad / 16) + kt)
+                                     * (SAGE_HEAD_DIM / 32) + g) * 128;
+                kbv = as_int8(intel_sub_group_block_read_ui8(k8_packed + kbase));
+                qk[0] = intel_sub_group_i8_i8_matrix_mad_k32(qa[0][g], kbv, qk[0]);
+                qk[1] = intel_sub_group_i8_i8_matrix_mad_k32(qa[1][g], kbv, qk[1]);
             }
-            int8 kb;
-            const size_t kbase = (((size_t)bhkv * (kv_pad / SAGE_K_COLS) + kt)
-                                 * (SAGE_HEAD_DIM / SAGE_DPAS_K32) + g)
-                                * 8 * SAGE_K_COLS + lane;
             #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                ((int *)&kb)[j] = as_int(k8_packed[kbase + j * SAGE_K_COLS]);
-            score_i = intel_sub_group_i8_i8_matrix_mad_k32(qa, kb, score_i);
-        }
-
-        float score[8], probability[8], rescale[8], new_sum[8];
-        #pragma unroll
-        for (int m = 0; m < SAGE_Q_ROWS; ++m) {
-            const int qrow = q0 + m;
-            score[m] = (float)((int *)&score_i)[m] * key_scale;
-            if (qrow < q_len && key < kv_len) {
-                score[m] *= q_scale[(size_t)bhq * q_pad + qrow];
-                if (causal && key > qrow + causal_offset) score[m] = -INFINITY;
-            } else {
-                score[m] = -INFINITY;
+            for (int m = 0; m < 16; ++m) {
+                score[nb][m] = (float)((int *)&qk[m / 8])[m % 8] * ks * qscale[m];
+                if (q0 + m >= q_len || key >= kv_len) score[nb][m] = -INFINITY;
             }
-        }
+            if (causal && need_mask)
+                #pragma unroll
+                for (int m = 0; m < 16; ++m)
+                    if (key > q0 + m + causal_offset) score[nb][m] = -INFINITY;
+         }
 
+         float rescale[16], block_max[16], probability[SAGE_K_TILE / 16][16];
+         int grow = 0;
+         #pragma unroll
+         for (int m = 0; m < 16; ++m) {
+             block_max[m] = score[0][m];
+             #pragma unroll
+             for (int nb = 1; nb < SAGE_K_TILE / 16; ++nb)
+                 block_max[m] = fmax(block_max[m], score[nb][m]);
+         }
+         #pragma unroll
+         for (int m = 0; m < 16; ++m) {
+             block_max[m] = sub_group_reduce_max(block_max[m]);
+             grow |= block_max[m] > row_max[m] + SAGE_LAZY_RESCALE;
+         }
+         grow = kb == 0 || sub_group_any(grow);
+         #pragma unroll
+         for (int m = 0; m < 16; ++m) {
+             const float next_max = grow ? fmax(row_max[m], block_max[m]) : row_max[m];
+             rescale[m] = kb == 0 ? 0.0f
+                        : (grow ? exp2(row_max[m] - next_max) : 1.0f);
+             if (grow) row_max[m] = next_max;
+             #pragma unroll
+             for (int nb = 0; nb < SAGE_K_TILE / 16; ++nb)
+                 probability[nb][m] = isfinite(score[nb][m])
+                                   ? exp2(score[nb][m] - next_max) : 0.0f;
+           }
+
+        short8 pa[SAGE_K_TILE / 16][2];
         #pragma unroll
-        for (int m = 0; m < SAGE_Q_ROWS; ++m) {
-            const float tile_max = sub_group_reduce_max(score[m]);
-            const float next_max = fmax(row_max[m], tile_max);
-            rescale[m] = isfinite(row_max[m]) ? exp2(row_max[m] - next_max) : 0.0f;
-            probability[m] = isfinite(score[m]) ? exp2(score[m] - next_max) : 0.0f;
-            new_sum[m] = row_sum[m] * rescale[m] + sub_group_reduce_add(probability[m]);
-            row_max[m] = next_max;
-            row_sum[m] = new_sum[m];
-        }
-
-        short8 pa;
-        #pragma unroll
-        for (int m = 0; m < SAGE_Q_ROWS; ++m)
-            ((short *)&pa)[m] = as_short(sage_float_to_pv_bits(probability[m]));
-
-        /* P*V: P remains in the same subgroup fragment used by the score DPAS. */
-        #pragma unroll
-        for (int dt = 0; dt < SAGE_D_TILES; ++dt) {
-            #pragma unroll
-            for (int m = 0; m < SAGE_Q_ROWS; ++m)
-                ((float *)&accum[dt])[m] *= rescale[m];
-
-            int8 vb;
-            const size_t vbase = ((size_t)bhkv * (kv_pad / 2) + kt * 8)
-                               * SAGE_HEAD_DIM + dt * SAGE_K_COLS + lane;
-            #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                ((int *)&vb)[j] = as_int(v_packed[vbase + j * SAGE_HEAD_DIM]);
-#if SAGE_INPUT_BF16
-            accum[dt] = intel_sub_group_bf16_bf16_matrix_mad_k16(pa, vb, accum[dt]);
-#else
-            accum[dt] = intel_sub_group_f16_f16_matrix_mad_k16(pa, vb, accum[dt]);
+        for (int m = 0; m < 16; ++m) {
+             ((short *)&pa[0][m / 8])[m % 8] = as_short(sage_float_to_pv_bits(probability[0][m]));
+             ((short *)&pa[1][m / 8])[m % 8] = as_short(sage_float_to_pv_bits(probability[1][m]));
+#if SAGE_HEAD_DIM == 64
+             ((short *)&pa[2][m / 8])[m % 8] = as_short(sage_float_to_pv_bits(probability[2][m]));
+             ((short *)&pa[3][m / 8])[m % 8] = as_short(sage_float_to_pv_bits(probability[3][m]));
 #endif
+         }
+
+        #pragma unroll
+        for (int hpart = 0; hpart < 2; ++hpart) {
+            float8 sum = (float8)(0.0f);
+            #pragma unroll
+            for (int r = 0; r < 8; r++)
+                ((float *)&sum)[r] = row_sum[hpart * 8 + r] * rescale[hpart * 8 + r];
+            #pragma unroll
+            for (int nb = 0; nb < SAGE_K_TILE / 16; ++nb) {
+#if SAGE_INPUT_BF16
+                sum = intel_sub_group_bf16_bf16_matrix_mad_k16(
+                    pa[nb][hpart], (int8)(0x3F803F80u), sum);
+#else
+                sum = intel_sub_group_f16_f16_matrix_mad_k16(
+                    pa[nb][hpart], (int8)(0x3C003C00u), sum);
+#endif
+            }
+            #pragma unroll
+            for (int r = 0; r < 8; r++) row_sum[hpart * 8 + r] = ((float *)&sum)[r];
+        }
+
+        if (grow)
+            #pragma unroll
+            for (int dt = 0; dt < SAGE_D_TILES; ++dt)
+                #pragma unroll
+                for (int hpart = 0; hpart < 2; ++hpart)
+                    #pragma unroll
+                    for (int r = 0; r < 8; r++)
+                        ((float *)&accum[hpart][dt])[r] *= rescale[hpart * 8 + r];
+
+        #pragma unroll
+        for (int vv = 0; vv < SAGE_HEAD_DIM / 16; ++vv) {
+            #pragma unroll
+            for (int nb = 0; nb < SAGE_K_TILE / 16; ++nb) {
+                const int key0 = kb * SAGE_K_TILE + nb * 16;
+                const int2 coord = (int2)(vv * 16, key0);
+                const uint8 transformed_v = intel_subgroup_block_read_transform_u16_k16(
+                    (__global void *)((__global ushort *)v_packed
+                                     + ((size_t)b * kv_pad * heads_kv + hkv) * SAGE_HEAD_DIM),
+                    v_width_bytes - 1, v_height - 1, v_pitch - 1, coord);
+                const int8 vb = as_int8(transformed_v);
+                #pragma unroll
+                for (int hpart = 0; hpart < 2; ++hpart) {
+#if SAGE_INPUT_BF16
+                    accum[hpart][vv] = intel_sub_group_bf16_bf16_matrix_mad_k16(
+                        pa[nb][hpart], vb, accum[hpart][vv]);
+#else
+                    accum[hpart][vv] = intel_sub_group_f16_f16_matrix_mad_k16(
+                        pa[nb][hpart], vb, accum[hpart][vv]);
+#endif
+                }
+            }
         }
     }
 
     /* Final row normalization. Each lane owns output columns dt*16+lane. */
+    float inv_row_sum[16];
     #pragma unroll
-    for (int dt = 0; dt < SAGE_D_TILES; ++dt) {
+    for (int m = 0; m < 16; ++m)
+        inv_row_sum[m] = row_sum[m] > 0.0f ? 1.0f / row_sum[m] : 0.0f;
+
+     #pragma unroll
+     for (int hpart = 0; hpart < 2; ++hpart)
         #pragma unroll
-        for (int m = 0; m < SAGE_Q_ROWS; ++m) {
-            const int row = q0 + m;
-            if (row < q_len && row_sum[m] > 0.0f) {
-                const size_t dst = ((size_t)b * q_len + row) * heads_q * SAGE_HEAD_DIM
-                                 + (size_t)hq * SAGE_HEAD_DIM + dt * SAGE_K_COLS + lane;
-                out[dst] = sage_float_to_pv_bits(((float *)&accum[dt])[m] / row_sum[m]);
+        for (int dt = 0; dt < SAGE_D_TILES; ++dt)
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int m = hpart * 8 + r;
+                const int row = q0 + m;
+                if (row < q_len && row_sum[m] > 0.0f) {
+                    const size_t dst = ((size_t)b * q_len + row) * heads_q * SAGE_HEAD_DIM
+                                     + (size_t)hq * SAGE_HEAD_DIM + dt * 16 + lane;
+                    out[dst] = sage_float_to_pv_bits(
+                        ((float *)&accum[hpart][dt])[r] * inv_row_sum[m]);
+                }
             }
-        }
-    }
 }

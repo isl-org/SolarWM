@@ -1,10 +1,13 @@
 # SageAttention Causal Inference — Intel OpenCL Port
 
-This directory contains an OpenCL C implementation of SageAttention-style causal inference derived from the SYCL kernel previously located at `solar/kernels/fused_rope_prope_sage/sage_causal.sycl`.
+This directory contains an OpenCL C port targeting the exact behavior and data-layout contract of `solar/kernels/fused_rope_prope_sage/sage_causal.sycl`.
 
 ## Files
 
-- `sage_causal.cl` — Intel OpenCL 3.0 kernels for quantization, packing, and attention.
+- `sage_causal.cl` — Intel OpenCL 3.0 quantization and attention kernels.
+- `bench_opencl.cpp` — native OpenCL runner with event timing, fixed fixtures, and dump support.
+- `compare_sycl.py` — direct output-bit comparison with the installed SYCL extension.
+- `check_intermediates.py` — validation for centering, quantization, packing, and score intermediates.
 
 ## Scope
 
@@ -114,19 +117,9 @@ The packed shape is represented as:
 [B, Hkv, SkvPad / 16, D / 32, 8, 16] uint
 ```
 
-### 4. Pack V for P·V DPAS
+### 4. Stream attention blocks
 
-`sage_pack_v` packs two adjacent FP16/BF16 V values into each `uint`, producing the B-operand structure expected by FP16/BF16 DPAS:
-
-```text
-[B, Hkv, SkvPad / 2, D] uint
-```
-
-Padding rows contain zeros.
-
-### 5. Stream attention blocks
-
-One 16-lane subgroup owns 8 query rows. For every 16-key tile it:
+One 16-lane subgroup owns 16 query rows. Each D=128 work-group has 16 subgroups, so the Q tile is 256 rows; D=64 uses 8 subgroups and a 128-row Q tile. For every 32-key block (64 keys at D=64) it:
 
 1. Computes an INT8 DPAS score fragment:
 
@@ -153,7 +146,8 @@ One 16-lane subgroup owns 8 query rows. For every 16-key tile it:
 
 5. Rescales existing P·V accumulators when the running maximum increases.
 6. Accumulates P·V with FP16/BF16 DPAS and FP32 accumulators.
-7. Normalizes after the KV loop:
+7. Loads raw V through Intel's 2D transform block read, which produces the VNNI packing required by P·V DPAS without a separate `sage_pack_v` stage.
+8. Normalizes after the KV loop:
 
    $$
    O_i=\frac{\sum_j P_{ij}V_j}{\sum_j P_{ij}}
@@ -173,14 +167,13 @@ No complete score or probability matrix is materialized in global memory.
 | `q_scale` | `[B,Hq,SqPad]` | `float` | Q reconstruction/log2-attention scale |
 | `k8_packed` | `[B,Hkv,SkvPad/16,D/32,8,16]` | `uint` | INT8 DPAS-packed K |
 | `k_scale` | `[B,Hkv,SkvPad]` | `float` | K reconstruction scale |
-| `v_packed` | `[B,Hkv,SkvPad/2,D]` | `uint` | FP16/BF16 DPAS-packed V |
+| V | `[B,Skv,Hkv,D]` | FP16/BF16 bits in `ushort` | Raw V; transformed on load |
 | output | `[B,Sq,Hq,D]` | FP16/BF16 bits in `ushort` | Attention result |
 
 Required padding:
 
-- `SqPad` is rounded up from `Sq` to a multiple of 8 because the attention tile has 8 Q rows.
-- `SkvPad` is rounded up from `Skv` to a multiple of 16 because K and V packing use 16-key/2-row packing.
-- Allocating `SkvPad` as a multiple of 16 also keeps DPAS K/V tile launches uniform.
+- `SqPad` is rounded up to the full Q tile: 256 rows for D=128 or 128 rows for D=64.
+- `SkvPad` is rounded up from `Skv` to a multiple of 64, covering the K tile and 16-key packed-K fragments.
 
 Shape constraints:
 
@@ -205,40 +198,31 @@ One work-group handles one batch/KV-head. Each local work-item owns one channel.
 ### 2. `sage_quantize_q`
 
 ```text
-global = (B * Hq * SqPad)
-local  = unspecified/implementation-selected
+global = (B * Hq * QTile, SqPad / QTile)
+local  = (QTile, 1)
 ```
 
-One work-item handles one query token.
+One work-group quantizes one Q tile; each 16-lane subgroup owns 16 rows.
 
 ### 3. `sage_quantize_k`
 
 ```text
-global = (B * Hkv * SkvPad)
-local  = unspecified/implementation-selected
+global = (B * Hkv * ceil(SkvPad / 128) * 128)
+local  = (128)
 ```
 
-One work-item handles one key token and writes its portion of the packed K layout.
+Eight 16-lane subgroups process up to eight 16-key tiles per work-group and write the packed K layout.
 
-### 4. `sage_pack_v`
+### 4. `sage_attention`
 
 ```text
-global = (Hkv * D, B, SkvPad / 2)
-local  = implementation-selected
+global = (ceil(Sq / QTile) * QTile, B * Hq) work-items
+local  = (QTile, 1)
 ```
 
-Each work-item packs two adjacent V rows for one batch/head/channel.
+The work-group size is 256 for D=128 and 128 for D=64. One required 16-lane subgroup per 16 Q rows performs the DPAS mainloop.
 
-### 5. `sage_attention`
-
-```text
-global = (ceil(Sq / 8) * 16, B * Hq)
-local  = (16, 1)
-```
-
-A required subgroup size of 16 is essential because the DPAS interfaces produce 8 rows by 16 columns per call.
-
-The host should enqueue or retain an ordering dependency between stages 1 and 3, and between quantization/packing and stage 5. In-order OpenCL queues already preserve this order; out-of-order queues need events.
+The host should enqueue or retain an ordering dependency between stages 1 and 3, and between quantization and stage 4. In-order OpenCL queues already preserve this order; out-of-order queues need events.
 
 ## Compile-Time Configuration
 
@@ -329,20 +313,17 @@ Head dimension and input precision are macros rather than runtime values. This p
 
 ## Differences from the SYCL Version
 
-This OpenCL port intentionally prioritizes a clear and buildable baseline. It does not reproduce every low-level optimization in `sage_causal.sycl`.
+The OpenCL port now follows the exact SYCL data layouts and arithmetic path, but is still implemented in OpenCL C rather than CUTLASS templates or inline Gen ISA.
 
 Current differences include:
 
 - OpenCL subgroup DPAS builtins instead of inline Gen ISA aliases and `.decl` blocks
-- Straightforward per-token quantization rather than subgroup-packed quantization kernels with every token resident in registers
-- Direct online-softmax rescaling on each K tile rather than the SYCL lazy-rescale threshold
-- No explicit K/V prefetch loop or double-buffer software pipeline
-- No explicit 256-GRF launch property
-- No large 128/256-row Q work-group tile; this port uses 8-row subgroup tiles
-- No integrated CUTLASS epilogue
-- No Python/PyTorch launcher included in this folder
+- OpenCL source-level transformations rely on IGC rather than SYCL/CUTLASS compile-time tensor layouts
+- No effective explicit K/V software pipeline is retained; OpenCL exposes no equivalent 2D V prefetch intrinsic for the transformed load path
+- The 256-GRF property is supplied by the host as `-cl-intel-256-GRF-per-thread` rather than embedded in the kernel
+- No integrated CUTLASS epilogue or Python/PyTorch launcher in this directory
 
-These differences make the OpenCL version easier to inspect and validate, while retaining the main SageAttention architecture and Intel XMX compute path.
+The retained B70 launch uses 16 subgroups for D=128 and 8 for D=64. Native GQA maps each Q head to `Hq / Hkv` KV-head groups. The benchmark uses raw `[B,S,H,D]` V input; the V 2D base starts at the selected batch/KV-head channel while its pitch remains `Hkv * D` elements.
 
 ## Validation Performed
 
@@ -371,25 +352,52 @@ max relative error: 0.629368 (dominated by values close to zero)
 
 The low absolute error is the more useful indicator here because BF16 output quantization and INT8 score approximation amplify relative error near zero.
 
-The existing compiler reported spills in some initial D=128 quantization/attention variants. All variants still compiled successfully, but performance tuning should begin by inspecting these spills and either:
+The native benchmark is built and run without PyTorch:
 
-- increasing register allocation where supported,
-- reducing private per-work-item storage,
-- splitting quantization work across subgroups,
-- or introducing bounded preprocessing tiles.
+```bash
+g++ -O2 -std=c++17 bench_opencl.cpp -lOpenCL -o /tmp/bench_opencl
+/tmp/bench_opencl --sq 2048 --sk 2048 --hq 32 --hkv 4 --large-grf --warmup 12 --iters 40
+python compare_sycl.py --sq 256 --sk 257 --hq 8 --hkv 4 /tmp/opencl-fixture
+```
+
+### Exactness
+
+Direct comparisons use identical dumped binary Q/K/V fixtures and the installed `sage_causal.so`:
+
+- `Sq=256, Skv=257, Hq=8, Hkv=1`, BF16, causal: 0 differing bits / 262144.
+- `Sq=256, Skv=257, Hq=8, Hkv=4`, BF16, causal: 0 differing bits / 262144.
+
+The Hkv>1 test specifically validates the raw V base and interleaved-head pitch. `check_intermediates.py` also validates K centering, Q/K scales, packed Q/K operands, and raw DPAS scores.
+
+### Performance and ISA snapshot
+
+On Arc Pro B70 with BF16, D=128, 32 Q heads, 4 KV heads, causal `S=2048`, and 256-GRF mode, the retained version measured approximately:
+
+```text
+k_centre   0.087 ms
+quant_q    0.078 ms
+quant_k    0.017 ms
+attention  1.461 ms
+total      1.643 ms
+```
+
+The reference SYCL kernel is approximately 0.50 ms end-to-end in this environment, so the OpenCL port remains slower. Replicating CUTLASS/TLA source and lowering details produced a useful reduction but did not close the gap:
+
+- Coalesced K8 subgroup loads: 160 → 112 `load.ugm` instructions and spill 1280 → 1152 bytes.
+- Hoisted row reciprocals: 131 → 19 `math.inv` instructions.
+- Attention shader: about 19.6K → 14.6K ISA lines.
+- Retained 2K timing improved from about 1.74 ms to 1.64–1.65 ms total, depending on run conditions.
+
+VTune still reports roughly 100% theoretical occupancy; throughput is therefore primarily limited by generated instruction volume and dependency structure rather than launch occupancy.
 
 ## Suggested Next Optimization Steps
 
-1. Add subgroup-oriented Q/K quantization to reduce private arrays and global traffic.
-2. Add `-cl-intel-256-GRF-per-thread` as an optional build variant and compare spills.
-3. Add explicit two-stage K/V software prefetching or block-read scheduling.
-4. Add lazy online-softmax rescaling with a tested threshold.
-5. Increase V tiles per subgroup after measuring register pressure.
-6. Specialize or tile D=64 and D=128 launch configurations independently.
-7. Add malformed-shape checks and extension checks to the host launcher.
-8. Benchmark edge sizes, GQA ratios, causal/non-causal paths, and sequence lengths.
-9. Compare end-to-end latency and numerical quality against `sage_causal.sycl` or a full-precision FlashAttention baseline.
-10. Add permanent CPU-reference tests to the repository rather than relying on an external temporary harness.
+1. Reduce exp2/conversion expansion and compare probability-fragment layouts.
+2. Analyze the remaining D=128 spill set rather than broadly shrinking the kernel tile.
+3. Reproduce CUTLASS's V 2D copy scheduling only where OpenCL can emit the same block messages.
+4. Re-check exactness for D=64, FP16, and non-causal cases after any arithmetic-layout change.
+5. Add malformed-shape and extension checks to a permanent launcher.
+6. Keep strict Hkv=1 and Hkv>1 bit-comparison fixtures in the regression workflow.
 
 ## Important Numerical Notes
 
