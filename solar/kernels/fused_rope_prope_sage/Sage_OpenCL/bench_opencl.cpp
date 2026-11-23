@@ -38,6 +38,8 @@ struct Options {
     bool large_grf = false;
     int debug_scores = 0;
     std::string dump_prefix;
+    std::string load_prefix;
+    bool out_only = false;    // --dump writes only PREFIX.opencl.bits  // read PREFIX.{q,k,v}.bits instead of random inputs
 };
 
 Options parse_args(int argc, char **argv) {
@@ -61,6 +63,8 @@ Options parse_args(int argc, char **argv) {
         else if (arg == "--check") o.check = true;
         else if (arg == "--large-grf") o.large_grf = true;
         else if (arg == "--debug-scores") o.debug_scores = get_int();
+        else if (arg == "--out-only") o.out_only = true;
+        else if (arg == "--load") { if (++i >= argc) throw std::runtime_error("missing load prefix"); o.load_prefix = argv[i]; }
         else if (arg == "--dump") { if (++i >= argc) throw std::runtime_error("missing dump prefix"); o.dump_prefix = argv[i]; }
         else throw std::runtime_error("unknown argument: " + arg);
     }
@@ -136,7 +140,7 @@ struct Runner {
     cl_program program{};
     cl_device_id device{};
     cl_kernel centre{}, quant_q{}, quant_k{}, attention{}, debug_kernel{}, debug_v_kernel{};
-    cl_mem q{}, k{}, v{}, km{}, q8{}, qs{}, k8{}, ks{}, out{};
+    cl_mem q{}, k{}, v{}, km{}, q8{}, qs{}, k8{}, ks{}, out{}, qb{}, kbnd{};
     cl_mem debug{};
     std::vector<uint16_t> q_host, k_host, v_host;
     size_t q_pad, kv_pad;
@@ -194,7 +198,7 @@ struct Runner {
 
     ~Runner() {
         for (cl_kernel x : {centre, quant_q, quant_k, attention, debug_kernel, debug_v_kernel}) if (x) clReleaseKernel(x);
-        for (cl_mem x : {q, k, v, km, q8, qs, k8, ks, out, debug}) if (x) clReleaseMemObject(x);
+        for (cl_mem x : {q, k, v, km, q8, qs, k8, ks, out, qb, kbnd, debug}) if (x) clReleaseMemObject(x);
         if (program) clReleaseProgram(program);
         if (queue) clReleaseCommandQueue(queue);
         if (context) clReleaseContext(context);
@@ -218,6 +222,8 @@ struct Runner {
         qs = buffer(static_cast<size_t>(o.batch) * o.q_heads * q_pad * sizeof(float));
         k8 = buffer(static_cast<size_t>(o.batch) * o.kv_heads * (kv_pad / 16) * (o.head_dim / 32) * 8 * 16 * sizeof(uint32_t));
         ks = buffer(static_cast<size_t>(o.batch) * o.kv_heads * kv_pad * sizeof(float));
+        qb = buffer(static_cast<size_t>(o.batch) * o.q_heads * q_pad * sizeof(float));          // q_bound
+        kbnd = buffer(static_cast<size_t>(o.batch) * o.kv_heads * (kv_pad / 16) * sizeof(float));  // k_bound
         out = buffer(qn * sizeof(uint16_t));
         const size_t debug_count = o.debug_scores > 0 ? o.debug_scores : 1;
         debug = buffer(debug_count * 2 * 16 * 16 * sizeof(int));
@@ -239,7 +245,18 @@ struct Runner {
     void set_inputs() {
         const size_t qn = static_cast<size_t>(o.batch) * o.q_len * o.q_heads * o.head_dim;
         const size_t kn = static_cast<size_t>(o.batch) * o.kv_len * o.kv_heads * o.head_dim;
-        q_host = random_input(qn); k_host = random_input(kn); v_host = random_input(kn);
+        if (o.load_prefix.empty()) {
+            q_host = random_input(qn); k_host = random_input(kn); v_host = random_input(kn);
+        } else {
+            auto load = [&](const char *name, size_t n) {
+                std::vector<uint16_t> x(n);
+                std::ifstream f(o.load_prefix + "." + name + ".bits", std::ios::binary);
+                if (!f.read(reinterpret_cast<char *>(x.data()), n * 2))
+                    throw std::runtime_error(o.load_prefix + "." + name + ".bits: short or missing");
+                return x;
+            };
+            q_host = load("q", qn); k_host = load("k", kn); v_host = load("v", kn);
+        }
         CL_CHECK(clEnqueueWriteBuffer(queue, q, CL_FALSE, 0, qn * 2, q_host.data(), 0, nullptr, nullptr));
         CL_CHECK(clEnqueueWriteBuffer(queue, k, CL_FALSE, 0, kn * 2, k_host.data(), 0, nullptr, nullptr));
         CL_CHECK(clEnqueueWriteBuffer(queue, v, CL_FALSE, 0, kn * 2, v_host.data(), 0, nullptr, nullptr));
@@ -255,10 +272,12 @@ struct Runner {
         set_kernel_arg(quant_q, q, 0); set_kernel_arg(quant_q, q8, 1); set_kernel_arg(quant_q, qs, 2);
         set_kernel_arg(quant_q, o.batch, 3); set_kernel_arg(quant_q, o.q_len, 4);
         set_kernel_arg(quant_q, o.q_heads, 5); set_kernel_arg(quant_q, static_cast<int>(q_pad), 6);
+        set_kernel_arg(quant_q, qb, 7);
 
         set_kernel_arg(quant_k, k, 0); set_kernel_arg(quant_k, km, 1); set_kernel_arg(quant_k, k8, 2);
         set_kernel_arg(quant_k, ks, 3); set_kernel_arg(quant_k, o.batch, 4); set_kernel_arg(quant_k, o.kv_len, 5);
         set_kernel_arg(quant_k, o.kv_heads, 6); set_kernel_arg(quant_k, static_cast<int>(kv_pad), 7);
+        set_kernel_arg(quant_k, kbnd, 8);
 
         set_kernel_arg(attention, q8, 0); set_kernel_arg(attention, qs, 1); set_kernel_arg(attention, k8, 2);
         set_kernel_arg(attention, ks, 3); set_kernel_arg(attention, v, 4); set_kernel_arg(attention, out, 5);
@@ -266,12 +285,13 @@ struct Runner {
         set_kernel_arg(attention, o.kv_len, 8); set_kernel_arg(attention, o.q_heads, 9);
         set_kernel_arg(attention, o.kv_heads, 10); set_kernel_arg(attention, static_cast<int>(q_pad), 11);
         set_kernel_arg(attention, static_cast<int>(kv_pad), 12); set_kernel_arg(attention, o.causal ? 1 : 0, 13);
+        set_kernel_arg(attention, qb, 14); set_kernel_arg(attention, kbnd, 15);
     }
 
     std::vector<double> run_once() {
         cl_event events[4]{};
-        size_t cglobal = static_cast<size_t>(o.batch) * o.kv_heads * o.head_dim;
-        size_t clocal = static_cast<size_t>(o.head_dim);
+        size_t cglobal = static_cast<size_t>(o.batch) * o.kv_heads * 256;  // 16 subgroups per (b, kv head)
+        size_t clocal = 256;
         CL_CHECK(clEnqueueNDRangeKernel(queue, centre, 1, nullptr, &cglobal, &clocal, 0, nullptr, &events[0]));
         const size_t qtile = o.head_dim == 128 ? 256 : 128;
         const size_t qglobal[2] = {static_cast<size_t>(o.batch) * o.q_heads * qtile, q_pad / qtile};
@@ -397,6 +417,7 @@ struct Runner {
             if (!f) throw std::runtime_error("cannot write " + o.dump_prefix + suffix);
             f.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
         };
+        if (!o.out_only) {
         write(".q.bits", q_host.data(), q_host.size() * sizeof(q_host[0]));
         write(".k.bits", k_host.data(), k_host.size() * sizeof(k_host[0]));
         write(".v.bits", v_host.data(), v_host.size() * sizeof(v_host[0]));
@@ -416,6 +437,7 @@ struct Runner {
         if (o.debug_scores > 0)
             dump_buffer(debug, ".vprobe.u32", 16 * 8 * sizeof(int));
         dump_buffer(debug, ".debug.i32", 16 * sizeof(int));
+        }
         std::vector<uint16_t> output(static_cast<size_t>(o.batch) * o.q_len * o.q_heads * o.head_dim);
         CL_CHECK(clEnqueueReadBuffer(queue, out, CL_TRUE, 0, output.size() * sizeof(output[0]),
                                      output.data(), 0, nullptr, nullptr));
